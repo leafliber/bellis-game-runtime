@@ -10,10 +10,8 @@ Bellis 的游戏运行时：负责游戏画面采集、感知（OCR、VLM 等）
 
 ## 当前状态
 
-尚无代码，也尚无现行设计。`docs/inherited/` 保存从 Bellis v0.8 冻结设计中移交过来的游戏控制材料，供重新设计时参考，不是本仓库的规范。每个模块的技术路线须经维护者审核后才写入正式设计。
+尚无代码，当前阶段是 [G0 工程骨架与实时核闭环](docs/plan/G0.md)。总体架构、管理模型、阶段划分与各模块的技术路线都已批准，见[技术基线](docs/plan/tech-baseline.md)；部分细节待[真机探针](docs/plan/spikes.md)实测后确定，需要 Bellis 配合的改动见 [Bellis P3 契约提案](docs/plan/bellis-p3-proposals.md)。
 
-## 目录
+## 文档
 
-```text
-docs/inherited/   从 Bellis 移交的游戏控制设计（只读参考）
-```
+从[文档索引](docs/README.md)开始，那里写明了每份文档的分工与阅读顺序。Agent 的工作规则见 [AGENTS.md](AGENTS.md)。

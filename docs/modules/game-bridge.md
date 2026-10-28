@@ -1,0 +1,107 @@
+# 游戏桥（Game Runtime 侧）
+
+Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏桥插件见 [Bellis 游戏桥](https://github.com/leafliber/bellis/blob/main/docs/modules/game-bridge.md)；需要 Bellis 配合的契约改动见 [Bellis P3 契约提案](../plan/bellis-p3-proposals.md)。G3 与 Bellis P3 同步实现；G0–G2 以独立运行开发与验收。
+
+## 职责
+
+- 维护语义连接与控制连接，完成认证与握手。
+- 把局面、决策点与候选、已发生的动作与健康报给 Bellis。
+- 执行 Bellis 的目标、决定、停止与暂缓推进。
+- 不接 Bellis 时，提供独立运行的操作员入口。
+
+## 不负责
+
+- **选择与解说。** 由 Bellis 决策模型负责。
+- **长期记忆。** Game Runtime 不直连 Iris；需要写入的游戏事实交给 Bellis，经其记忆插件与隐私网关写入，且只能是摘要。
+
+## 连接
+
+（GR-05）两条连接都以 Bellis 宿主为服务端，走 `bellis-channel/1`（[本机通道](core-protocol.md#本机通道)）。
+
+| 连接 | 客户端 | 承载 |
+| --- | --- | --- |
+| 语义连接 | 主进程，角色 `game-runtime.main` | 目标、局面、决策点与候选、暂缓推进、已发生的动作、健康 |
+| 控制连接 | 实时核，角色 `game-runtime.core` | 只有输入许可续约、停止、输入已释放与实时核健康，其它消息一律拒绝 |
+
+- 实时核直接从 Bellis 取得令牌与到期时间并自行核对，许可不经主进程转发；主进程只能让输入停下，不能让输入继续。
+- 控制连接不在时，Bellis 游戏桥插件不申请也不续约 `game.input`。
+- 主进程与实时核都从 SecretStore 读取 Bellis 本次会话的连接信息（Bellis R-23）。
+
+## 契约
+
+- 以 Bellis `packages/protocol`（TypeBox，Bellis D-21）为唯一的源（GD-03）。本仓库在 `vendor/bellis-protocol/` 锁定某个 Bellis 提交的生成物（JSON Schema 与 Pydantic 模型），附来源提交与摘要；`uv run check` 核对锁定副本未被改动。
+- 改动先在 Bellis 合入，本仓库再更新锁定的生成物；两边 CI 各自校验。
+- 握手比较主版本，不兼容时 Bellis 的游戏桥插件停在 WAITING 并说明原因。
+- 控制连接上的消息在实时核中的 Rust 类型，首选用 typify 从锁定的 JSON Schema 生成，不可行时手写，并以锁定的 Schema 与 Bellis 的 fixture 在 CI 中双向校验。
+
+## 消息
+
+命名沿用 Bellis：命令用 `对象.动作`，事件用 `对象.过去式`。字段以 Bellis 冻结的契约为准。
+
+| 方向 | 消息 | Game Runtime 的处理 |
+| --- | --- | --- |
+| 下行 | `goal.submit` | planner 据此与剧情状态拆出当前目标（[规划](narrative-planner.md#规划)） |
+| 下行 | `decision.resolve` | 在新帧上重新定位并核对实例后执行（[决策点](step-control.md#决策点)） |
+| 下行 | `lease.renew`、`input.stop` | 只走控制连接，由实时核处理 |
+| 下行 | `pacing.hold`、`pacing.release` | 见下文 |
+| 上行 | `situation.observed` | 局面摘要（[规划](narrative-planner.md#规划)），带看点标记与配音忙闲 |
+| 上行 | `decision_point.opened` | 选项、是否计时与截止时间，附候选 |
+| 上行 | `action.committed` | 实际发生的动作 |
+| 上行 | `input.released` | 只走控制连接 |
+| 上行 | `health.reported` | 首动作时间、帧龄、队列深度、风险分、被拒的动作、模式切换、前置条件确认状态 |
+
+## 决策点
+
+- 无计时的选项：Bellis 决定直接自选或开观众投票；Game Runtime 停在该决策点，直到收到 `decision.resolve`。
+- 有计时的选项：Bellis 在截止前自选；到余量线仍未回复，Game Runtime 执行排第一的候选，并上报实际结果（Bellis D-07）。
+- 坏结局、卡住与重读的上报见[坏结局与重来](narrative-planner.md#坏结局与重来)。
+
+## 看点与暂缓推进
+
+（GR-20）两边都由确定性代码处理，不额外调用 LLM。
+
+**看点标记**随 `situation.observed` 上报：
+
+- 类型：章节与审判的开始与结束、新证据、新证词、矛盾或疑点、反转、坏结局、卡住。
+- 每条含类型、一句摘要、重要程度（高、中）与发生时刻；同一件事只标一次；摘要不带原文段落。
+- 由快路径、planner 的批量更新（至多滞后一个间隔）或坏结局处理给出（[看点标记](narrative-planner.md#看点标记)）。
+- 标记只是数据，是否解说与频率由 Bellis 决定。
+
+**暂缓推进**：
+
+- Bellis 发 `pacing.hold`（编号、原因、到期时间，到期时间必填）与 `pacing.release`；多个 hold 以最晚到期为准。
+- hold 有效时逐步控制器不执行推进类与导航类动作；选择类动作、计时决策与余量线照常。
+- 本地另有最长暂缓时间（缺省 30 秒，可配置），到上限即恢复并上报，Bellis 故障时不会把游戏卡住。
+- hold 走语义连接，只能让动作暂停，不产生输入，不影响输入许可。
+
+**配音忙闲**（忙、闲或未知，[感知](perception.md#配音检测)）随 `situation.observed` 上报，供 Bellis 选择等游戏配音结束再开口。
+
+## 开播前置条件
+
+游戏适配包声明须由操作员确认的前置条件（[动作风险](step-control.md#动作风险)的第四道防线）。Game Runtime 在握手与健康上报中给出条目与是否已确认；Bellis 开播预检要求全部已确认才允许进入 M1–M3（提案 P-08）。
+
+## 监督模式
+
+| Bellis 状态或事件 | Game Runtime 的行为 |
+| --- | --- |
+| M0 仿真 | 回放本地录制的帧，输入走假后端；录制只存本地；[离线回放基准](offline-tools.md#离线回放基准)也在这一模式下运行 |
+| M1、M2 | 真实输入，按输入许可执行（初值约 500ms、每 250ms 内续约，Bellis D-34） |
+| 安全停止、维护态 | 不授予输入许可，实时核不发出任何输入；感知可以继续只读运行 |
+| 急停 | Bellis 吊销许可并下发停止；实时核释放全部输入后上报已释放 |
+| 真人接管（上报） | 实时核本地撤权、释放全部输入并上报；Bellis 切到人工模式；交还控制只能由操作员执行（[接管与急停](realtime-core.md#接管与急停)） |
+| 本地急停热键或风险分超阈值（上报） | 实时核释放全部输入并上报；Bellis 按安全事件处理 |
+
+## 独立运行
+
+不接 Bellis 的独立运行用于开发与受监督的真机测试（G0–G2）：输入许可来自 Game Runtime 自带的操作员入口，只在测试许可下使用，不用于直播；决策点由操作员给出结果。G0 只用测试用的本地许可源驱动假输入后端；操作员入口与测试许可的形式在 G2 开工前登记审核。
+
+## 验收
+
+| 阶段 | 内容 |
+| --- | --- |
+| G3 | 同 Bellis P3：私有测试直播间中完整推进一段剧情；无计时选项的投票或自选、有计时选项的自选都正确执行；许可过期即释放；急停后全部输入释放的时延实测；与 Bellis 宿主真机互通 |
+| 原神阶段 | 按探索与剧情 → 解谜 → 战斗分步扩展契约与验收 |
+
+## 技术路线
+
+已批准：GD-03、GR-05、GR-20、GR-28；继承 Bellis D-07、D-27、D-31、D-34、R-23。Bellis 侧见提案 P-01–P-08。
