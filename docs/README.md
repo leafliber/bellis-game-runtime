@@ -28,13 +28,13 @@ Agent 的工作规则只在 [AGENTS.md](../AGENTS.md)。
 | [实时核](modules/realtime-core.md) | 实时核 | G0（采集、假输入后端），G1 音频，G2 真实输入 |
 | [核协议与本机通道](modules/core-protocol.md) | 主进程与实时核之间 | G0 |
 | [主进程插件内核](modules/plugin-kernel.md) | 主进程内核 | G0 |
-| [感知](modules/perception.md) | 普通插件 | G1；界面元素检测在第二款游戏 |
+| [感知](modules/perception.md) | 普通插件 | G1；G2 画面状态；界面元素检测在第二款游戏 |
 | [模型接入](modules/models.md) | 普通插件 | G2 |
 | [剧情记录与规划](modules/narrative-planner.md) | 普通插件 | G1 剧情记录，G2 规划 |
-| [逐步控制](modules/step-control.md) | 关键平面（控制产出者） | G2 |
-| [游戏适配包](modules/game-adapter.md) | 关键平面 | G1 必需部分，G2 快路径 |
+| [逐步控制](modules/step-control.md) | 关键平面（控制产出者） | G2；技能库在原神阶段 |
+| [游戏适配包](modules/game-adapter.md) | 关键平面 | G1 声明格式与必需部分，G2 快路径 |
 | [游戏桥（Game Runtime 侧）](modules/game-bridge.md) | 主进程与实时核对 Bellis | G3；独立运行在 G0–G2 |
-| [离线工具](modules/offline-tools.md) | 不在直播进程 | G1 录制，G2 回放基准 |
+| [离线工具](modules/offline-tools.md) | 不在直播进程 | G0 合成游戏，G1 录制，G2 回放基准 |
 
 ## 游戏
 

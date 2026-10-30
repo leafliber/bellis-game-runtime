@@ -35,7 +35,8 @@
 | `ocr@1`、`scene@1`、`voice-activity@1` | 感知插件 | [感知](perception.md) |
 | `vlm@1` | 模型接入插件 | [模型接入](models.md) |
 | `narrative@1`、`planner@1` | 剧情记录与规划插件 | [剧情记录与规划](narrative-planner.md) |
-| `policy@1` | 策略后端（逐步控制器、以后的连续策略） | [逐步控制](step-control.md) |
+| `policy@1` | 策略后端（逐步控制器、以后的连续策略），契约见[策略后端契约](step-control.md#策略后端契约) | [逐步控制](step-control.md) |
+| `skills@1` | 技能库（原神阶段） | [技能](step-control.md#技能) |
 
 ## 权限
 

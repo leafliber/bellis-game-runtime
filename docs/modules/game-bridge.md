@@ -44,7 +44,7 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 | 下行 | `decision.resolve` | 在新帧上重新定位并核对实例后执行（[决策点](step-control.md#决策点)） |
 | 下行 | `lease.renew`、`input.stop` | 只走控制连接，由实时核处理 |
 | 下行 | `pacing.hold`、`pacing.release` | 见下文 |
-| 上行 | `situation.observed` | 局面摘要（[规划](narrative-planner.md#规划)），带看点标记与配音忙闲 |
+| 上行 | `situation.observed` | 局面摘要（[规划](narrative-planner.md#规划)），画面类型取自[通用分类](perception.md#画面状态)，带看点标记与配音忙闲 |
 | 上行 | `decision_point.opened` | 选项、是否计时与截止时间，附候选 |
 | 上行 | `action.committed` | 实际发生的动作 |
 | 上行 | `input.released` | 只走控制连接 |
