@@ -1,0 +1,66 @@
+{
+  "producer": {
+    "id": "continuous-policy",
+    "generation": 4
+  },
+  "seq": 1,
+  "base_frame": 1500,
+  "start_ns": 6000000000,
+  "deadline_ns": 6100000000,
+  "steps": [
+    {
+      "offset_ns": 0,
+      "held": [
+        {
+          "type": "key",
+          "scan_code": 17
+        },
+        {
+          "type": "mouse_button",
+          "button": "right"
+        },
+        {
+          "type": "axis",
+          "axis": "camera_yaw",
+          "value": 0.25
+        }
+      ],
+      "actions": [
+        {
+          "type": "mouse_move",
+          "id": 10,
+          "dx": 12,
+          "dy": -3
+        }
+      ]
+    },
+    {
+      "offset_ns": 33333333,
+      "held": [
+        {
+          "type": "key",
+          "scan_code": 57419
+        }
+      ],
+      "actions": [
+        {
+          "type": "key_press",
+          "id": 11,
+          "scan_code": 57
+        },
+        {
+          "type": "scroll",
+          "id": 12,
+          "x": 100,
+          "y": 200,
+          "notches": -1
+        }
+      ]
+    },
+    {
+      "offset_ns": 66666666,
+      "held": [],
+      "actions": []
+    }
+  ]
+}

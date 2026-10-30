@@ -1,0 +1,8 @@
+{
+  "target": {
+    "type": "window",
+    "process_name": "synthetic-game.exe",
+    "window_class": null,
+    "title": "Synthetic Game"
+  }
+}

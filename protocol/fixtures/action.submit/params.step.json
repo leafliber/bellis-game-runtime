@@ -1,0 +1,25 @@
+{
+  "producer": {
+    "id": "step-control",
+    "generation": 3
+  },
+  "seq": 7,
+  "base_frame": 1200,
+  "start_ns": 5000000000,
+  "deadline_ns": 5500000000,
+  "steps": [
+    {
+      "offset_ns": 0,
+      "held": [],
+      "actions": [
+        {
+          "type": "click",
+          "id": 1,
+          "x": 640,
+          "y": 360,
+          "button": "left"
+        }
+      ]
+    }
+  ]
+}

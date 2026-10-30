@@ -1,0 +1,19 @@
+{
+  "producer": {
+    "id": "step-control",
+    "generation": 3
+  },
+  "block_seq": 7,
+  "outcomes": [
+    {
+      "type": "executed",
+      "id": 1,
+      "at_ns": 5000120000
+    },
+    {
+      "type": "dropped",
+      "id": 2,
+      "reason": "superseded"
+    }
+  ]
+}

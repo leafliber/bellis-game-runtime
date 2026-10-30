@@ -1,0 +1,9 @@
+{
+  "now_ns": 5700000000,
+  "capture": "capturing",
+  "inputs_held": false,
+  "producer": {
+    "id": "step-control",
+    "generation": 3
+  }
+}
