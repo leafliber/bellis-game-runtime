@@ -28,10 +28,17 @@
 | GS-01 探测：列出可见的顶层窗口及其进程、类名与标题 | `cargo run --release -p capture --bin capture-probe -- --list` |
 | GS-01 探测：采一个窗口 N 秒，报告帧率、帧龄、丢帧、变换版本与黄色边框 | `cargo run --release -p capture --bin capture-probe -- --process <进程名> --title <标题> --seconds <N>` |
 | GS-01 探测：采自建的已知图案窗口，另报从重画到采集的时延 | `cargo run --release -p capture --bin capture-probe -- --pattern-window --animate` |
+| GS-03 探针：编译提权一侧、生成计划任务 XML 与注册命令 | `uv run gs03 prepare` |
+| GS-03 探针：非提权一侧（开通道与帧环、写凭据、等提权一侧连上并核对） | `uv run gs03 host` |
+| GS-03 探针：打印计划任务注册、读回、触发与注销命令 | `uv run gs03 task-command` |
+| GS-03 探针：读回核对已注册的计划任务 | `uv run gs03 check-task` |
+| GS-03 探针：非提权一侧尝试改写管理员安装目录里的文件 | `uv run gs03 install-check <目录> <文件名>` |
+| GS-03 探针：清理（删凭据，打印注销任务与清理安装目录的命令） | `uv run gs03 cleanup` |
 
 探测程序另有 `--class <类名>`、`--keep-border`（保留黄色边框作对照）、`--min-update-interval-ms <N>`（会话的最小帧间隔）、`--borderless` 与 `--dpi-unaware`（图案窗口的样式）；`--help` 列出全部选项。
 
 pytest 缺省不选标 `manual` 的真机手动测试，命令行写 `-m manual` 才运行。
+GS-03 的每一步在哪种终端里执行什么，由 `uv run gs03 <子命令>` 自己打印；需要管理员权限的动作（注册计划任务、把程序放进管理员目录）只打印命令，由维护者在管理员终端里执行，探针不提权。结果报告写入不入库的 `reports/gs03/`。
 
 `uv run check --linux` 首次运行要构建镜像。容器不写回仓库：虚拟环境、cargo target 与工具缓存放在每个检出目录各自的 `bellis-game-runtime-check-work-<路径摘要>` 卷里，uv 与 cargo 的下载缓存放在共用的 `bellis-game-runtime-check-uv-cache`、`bellis-game-runtime-check-cargo-registry` 卷里。这些卷都只是缓存，删掉只会让下次检查重新下载与编译；工作树删掉后它的卷会留下，用 `docker volume ls --filter name=bellis-game-runtime-check` 列出后 `docker volume rm` 清理。
 
