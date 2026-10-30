@@ -17,6 +17,7 @@
 | 只跑 Python 测试 | `uv run pytest` |
 | 只跑 Rust 测试 | `cargo test --workspace` |
 | 格式化 | `uv run ruff format`；`cargo fmt --all` |
+| 改了 `core/crates/core-protocol` 后重新生成 `protocol/` 的生成物 | `uv run generate` |
 | 给某个 Python 包加依赖 | `uv add --package <发行名> <依赖>` |
 | 核对 `uv.lock` 未过期 | `uv lock --check` |
 | 打开合成游戏的窗口 | `uv run synthetic-game` |

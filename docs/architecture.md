@@ -164,11 +164,11 @@ Game Runtime 为 Bellis 提供游戏能力：采集画面与声音、读懂画�
 | `runtime/` | Python uv 项目：主进程与插件 |
 | `games/<id>/` | 游戏适配包：声明文件与钩子（GR-31） |
 | `tools/` | 离线工具与合成游戏夹具 |
-| `protocol/` | 核协议生成物：JSON Schema 与 Pydantic |
+| `protocol/` | 核协议的生成物（JSON Schema、Pydantic 模型、帧环偏移表、示例消息）与 Python 包 `core_protocol` |
 | `vendor/bellis-protocol/` | 锁定的 Bellis 游戏桥生成物，附来源提交与摘要 |
 | `docs/` | 文档，分工见[文档索引](README.md) |
 
-统一检查入口为 `uv run check`，在仓库根目录运行：根目录放一个最小的 `pyproject.toml`，以 uv workspace 纳入 `runtime/` 与 `tools/`，`check` 脚本由工作区成员 `tools/check/` 提供；它依次运行 `ruff format --check`、`ruff check`、pyright、`cargo fmt --check`、clippy、`cargo test`、pytest 与生成物核对，每一项都运行，最后汇总，任一项失败即以非零退出；cargo 排在 pytest 之前，因为 pytest 要用 cargo 编译出的程序；`uv run check --linux` 在本机 Docker 的 Linux 容器里跑同一检查，覆盖非 Windows 的代码路径；提交前与合并 PR 前都在本机运行这两条，不用托管 CI（GR-29）。
+统一检查入口为 `uv run check`，在仓库根目录运行：根目录放一个最小的 `pyproject.toml`，以 uv workspace 纳入 `runtime/`、`tools/` 与 `protocol/`，`check` 脚本由工作区成员 `tools/check/` 提供；它依次运行 `ruff format --check`、`ruff check`、pyright、`cargo fmt --check`、clippy、`cargo test`、pytest 与生成物核对，每一项都运行，最后汇总，任一项失败即以非零退出；cargo 排在 pytest 之前，因为 pytest 要用 cargo 编译出的程序；`uv run check --linux` 在本机 Docker 的 Linux 容器里跑同一检查，覆盖非 Windows 的代码路径；提交前与合并 PR 前都在本机运行这两条，不用托管 CI（GR-29）。
 
 ## 平台
 
