@@ -6,7 +6,21 @@
 
 ## 常用命令
 
-尚无代码。统一检查入口为 `uv run check`（GR-29），G0 第 1 步建立后在这里补全命令清单。
+在仓库根目录运行；cargo 命令在 `core/` 下运行。检查项与顺序见[仓库与目录](docs/architecture.md#仓库与目录)。
+
+| 用途 | 命令 |
+| --- | --- |
+| 按 `uv.lock` 同步 Python 依赖 | `uv sync` |
+| 安装 `rust-toolchain.toml` 锁定的 Rust 工具链 | `rustup toolchain install` |
+| 完整检查 | `uv run check` |
+| 在本机 Docker 的 Linux 容器里跑同一检查 | `uv run check --linux` |
+| 只跑 Python 测试 | `uv run pytest` |
+| 只跑 Rust 测试 | `cargo test --workspace` |
+| 格式化 | `uv run ruff format`；`cargo fmt --all` |
+| 给某个 Python 包加依赖 | `uv add --package <发行名> <依赖>` |
+| 核对 `uv.lock` 未过期 | `uv lock --check` |
+
+`uv run check --linux` 首次运行要构建镜像。容器不写回仓库：虚拟环境、cargo target 与工具缓存放在每个检出目录各自的 `bellis-game-runtime-check-work-<路径摘要>` 卷里，uv 与 cargo 的下载缓存放在共用的 `bellis-game-runtime-check-uv-cache`、`bellis-game-runtime-check-cargo-registry` 卷里。这些卷都只是缓存，删掉只会让下次检查重新下载与编译；工作树删掉后它的卷会留下，用 `docker volume ls --filter name=bellis-game-runtime-check` 列出后 `docker volume rm` 清理。
 
 ## 从哪里开始
 

@@ -41,7 +41,7 @@
 
 | 编号 | 模块 | 路线 | 批准日期 |
 | --- | --- | --- | --- |
-| GR-01 | Rust 工具链 | stable 工具链，版本由 `rust-toolchain.toml` 锁定，具体版本在实时核首个实现时确定并写回本行；cargo fmt、clippy、test 纳入完整检查；Windows API 用微软维护的 `windows` crate；Windows 专有代码用 `cfg` 隔离并提供假实现 | 2026-10-27，修订 2026-10-31 |
+| GR-01 | Rust 工具链 | stable 工具链，`rust-toolchain.toml` 锁定 1.99.1；cargo fmt、clippy、test 纳入完整检查；Windows API 用微软维护的 `windows` crate；Windows 专有代码用 `cfg` 隔离并提供假实现 | 2026-10-27，修订 2026-10-31 |
 | GR-02 | 主进程插件内核 | 自写最小的 Python 实现，概念与用词沿用 Bellis 插件内核；只做清单、服务目录与 WAITING 原因、生命周期与有限次退避重试、可撤销注册、profile 与 patch、控制产出者的 QUIESCING；热替换、事件分发与 sidecar 代理需要时再加；实时核不归它管。详见[插件内核](../modules/plugin-kernel.md) | 2026-10-27 |
 | GR-03 | 核协议的 Schema 源 | Rust 类型为源（serde），schemars 生成 JSON Schema 2020-12，datamodel-code-generator 生成 Pydantic 模型，生成物与源一起提交并检查未过期；消息为 `bellis-channel/1` 帧内的 JSON-RPC 2.0；帧环头部以 Rust `#[repr(C)]` 结构为源，以测试核对偏移。详见[核协议与本机通道](../modules/core-protocol.md#核协议) | 2026-10-27 |
 | GR-04 | 游戏适配包的位置 | 放在本仓库 `games/<id>/`，版本库只收声明文件与钩子代码（格式见 GR-31）；从游戏派生的模板、截图、录制与模型制品存于本地数据目录，以版本与摘要引用；出现不同的授权或合规边界、外部贡献或不同的发布节奏时再拆仓库。详见[游戏适配包](../modules/game-adapter.md#位置与版本库边界) | 2026-10-27，修订 2026-10-30 |
