@@ -4,6 +4,7 @@
 """
 
 import pytest
+
 from synthetic_game import (
     PIXEL_FORMAT,
     Click,

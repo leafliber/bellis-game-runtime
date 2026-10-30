@@ -12,6 +12,7 @@ from collections.abc import Iterator
 
 import pytest
 from fontTools.ttLib import TTFont
+
 from synthetic_game.font_subset import (
     FAMILY_NAME,
     FONT_SHA256,

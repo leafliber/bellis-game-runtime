@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from game_runtime.channel import ChannelCredentials, session_credentials
 
 REPO_ROOT = Path(__file__).resolve().parents[3]

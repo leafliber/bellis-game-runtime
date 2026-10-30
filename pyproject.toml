@@ -15,6 +15,8 @@ dev = [
 line-length = 100
 target-version = "py312"
 extend-exclude = ["docs/inherited"] # 移交的旧设计只作参考，不改动
+# 工作区自己的包按第一方排序 import。
+src = ["runtime/src", "protocol/src", "tools/*/src"]
 
 [tool.ruff.lint]
 select = [

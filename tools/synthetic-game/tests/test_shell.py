@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import pytest
+
 from synthetic_game import (
     EffectKind,
     GameConfig,

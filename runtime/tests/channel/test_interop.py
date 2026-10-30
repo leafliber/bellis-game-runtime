@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from game_runtime.channel import (
     ChannelCredentials,
     ChannelError,
