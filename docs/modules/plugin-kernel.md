@@ -91,7 +91,7 @@
 | FAILED | 激活失败 | 退避到时回 WAITING 再试；重试用尽或配置不合法时停在这里，操作员停用再启用才重来 |
 
 - 全部状态变化都在一个串行的调和任务里进行，每一轮先续完已收到确认的 QUIESCING，再按 profile 逆序停用，最后按 profile 顺序激活。依赖某个提供方服务的条目先于提供方停用；它还在 QUIESCING 时提供方保持 ACTIVE 并说明原因，等它完成再停。
-- 操作员与宿主的接口是 `add`（加入 profile 展开后的条目）、`enable`、`disable`、`set_control_producer` 与 `settled`（等调和结束），插件拿不到。
+- 操作员与宿主的接口是 `add`（加入 profile 展开后的条目）、`enable`、`disable`、`set_control_producer`、`settled`（等调和结束）与 `shutdown`（停止内核，见下文），插件拿不到。
 - 状态或原因每次变化都经 `on_transition` 通知宿主，`status` 与 `snapshot` 给出当前的状态与原因，健康上报以此为来源。
 
 **原因。** 每条原因有机器可读的 `code`、涉及的对象 `subject`（服务、权限或条目）与给人读的 `message`。因条件不再满足而停用时，QUIESCING 的原因就是相应的 WAITING 原因。
@@ -122,7 +122,7 @@
 | --- | --- | --- |
 | `activate_timeout` | 10 | 取消激活，按激活失败处理 |
 | `quiesce_timeout` | 5 | 插件的 `quiesce` 记录告警后继续停用；提交资格已由内核收回，不影响下文的顺序 |
-| `release_timeout` | 5 | 控制产出者保持 QUIESCING 并上报，继续等确认，见下文 |
+| `release_timeout` | 5 | 控制产出者保持 QUIESCING 并上报，继续等确认；停止内核时上报后撤销注册继续停止。见下文 |
 | `disposer_timeout` | 2 | 取消该撤销函数并记录，继续撤销其余注册 |
 | `retry_delays` | 1、2、4 | 共重试 3 次，连同首次共激活 4 次 |
 
@@ -142,9 +142,11 @@
 3. **等到输入已释放的确认：** 等 `CoreControl.wait_released` 返回。作废请求送达失败只记录，仍等确认。
 4. **撤销注册：** 确认到达且 `quiesce` 结束后，按后注册先撤销的顺序撤销。
 
-`CoreControl` 是实时核一侧的接口，只有上面两项，第 8 步接到核连接上，测试用假实现。实时核按[失效与释放](../architecture.md#失效与释放)的规则自行释放后（断连后退出、重启后先释放），实现也应据此完成等待。
+`CoreControl` 是实时核一侧的接口，只有上面两项。真实实现是核连接的 `CoreLink`（`runtime/src/game_runtime/core_link/`）：`invalidate_generation` 发 `producer.revoke`，请求写出后返回；`wait_released` 在 `producer.revoke` 的回应、新实例的 `input.released(core_start)` 或实时核释放后以 0 退出时完成，细节见[释放](realtime-core.md#释放)。测试也用假实现。
 
 **等确认超时。** 从请求作废起 `release_timeout` 内没有确认时，条目保持 QUIESCING，原因为 `release-timeout`，记录告警并通知宿主；不撤销注册，也不放弃等待，确认到达后再撤销注册并完成停用。等待期间新的控制产出者不激活，它依赖的提供方也不停用。没有确认就撤销注册会违反上面的顺序；此时提交资格已失效，主进程不再提交该代次的动作块，已提交的动作块到有效截止时刻即被实时核释放（[动作块](core-protocol.md#动作块)）。`wait_released` 抛错时同样保持 QUIESCING，原因为 `release-failed`，不自动恢复，由操作员处理；主进程退出时实时核按生命线释放输入。
+
+**停止内核。** 主进程停止时宿主调用 `shutdown`，再按 R-06 停止实时核（[停止](realtime-core.md#停止)）。`shutdown` 让全部条目不再应当运行，在调和任务里按 profile 逆序停用，此后不再激活任何条目，也不再接受 `add`；条目的启用开关不变，DISPOSED 的原因是 `disabled`（“内核已停止”）。控制产出者照常走完 QUIESCING；等确认超时或失败时照常以 `release-timeout` 或 `release-failed` 上报，然后记录告警、撤销注册继续停止，它依赖的提供方随后停用。停止前已卡在 QUIESCING 的控制产出者不再计时，同样撤销注册。这里不再等确认，是因为接下来实时核停止时也会释放全部输入：`core.stop` 先释放再回应；实时核不应答时关 stdin，它读到 EOF 释放后退出；最后才强制终止。
 
 ## profile
 
@@ -187,7 +189,7 @@ profile 与 patch 是 JSON 文件，格式同 Bellis（`packages/protocol` 的 `
 
 | 阶段 | 内容 |
 | --- | --- |
-| G0 | 依赖缺失时停在 WAITING 并说明原因，恢复后激活；未授予权限即不激活；FAILED 有限次退避重试；控制产出者的 QUIESCING 按顺序完成，等到输入已释放才撤销注册 |
+| G0 | 依赖缺失时停在 WAITING 并说明原因，恢复后激活；未授予权限即不激活；FAILED 有限次退避重试；控制产出者的 QUIESCING 按顺序完成，等到输入已释放才撤销注册，与真实实时核联调同样成立；停止内核时按 profile 逆序停用，等确认超时上报后继续 |
 
 ## 技术路线
 
