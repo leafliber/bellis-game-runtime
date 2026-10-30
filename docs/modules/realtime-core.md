@@ -33,7 +33,8 @@ Rust 写的独立进程，是游戏侧的安全核：采集画面与声音，并
 2. 以 `subprocess.Popen` 和参数列表拉起 `realtime-core`：不经 shell，不用 `DETACHED_PROCESS`、`CREATE_BREAKAWAY_FROM_JOB` 或 `start_new_session`；stdin 是管道，stdout 与 stderr 继承主进程。
 3. 环境变量按 Bellis 的 `baseEnvironment` 只取系统必需的（Windows 的 `SYSTEMROOT`、`PATH` 等，POSIX 的 `HOME`、`PATH` 等），其余不继承；凭据按 Bellis 的 `ChildEnv` 放在 `BELLIS_CHANNEL_PATH`（地址）、`BELLIS_CHANNEL_KEY`（base64url 密钥）与 `BELLIS_ROLE`（角色，固定为 `game-runtime.core`）里。时限经命令行参数 `--heartbeat-timeout-ms`、`--health-interval-ms` 给出。
 4. Windows 上以 `CREATE_SUSPENDED` 创建，放进 Job Object 并交出 job 句柄之后才恢复运行，见下文。
-5. 实时核连上后发 `core.hello`；主进程只接受角色为 `game-runtime.core` 的第一个连接，核对协议版本，不相等即以 -32001 回错并断开。收到 `input.released(core_start)` 才算就绪，此后开始发心跳。从拉起到就绪超过 `start_timeout` 或实例在就绪前退出，即按停止顺序终止它并报 `CoreStartError`。
+5. 实时核连上后发 `core.hello`；主进程只接受角色为 `game-runtime.core` 的第一个连接，核对协议版本，不相等即以 -32001 回错并断开。收到 `input.released(core_start)` 才算就绪。从拉起到就绪超过 `start_timeout` 或实例在就绪前退出，即按停止顺序终止它并报 `CoreStartError`。
+6. 配置了采集（`CoreLinkOptions.capture`）时先挂接帧环、再设定采集目标，被拒绝即按停止顺序终止它并报 `CoreStartError`（[帧环的挂接](core-protocol.md#读写规则)）。之后开始发心跳。
 
 实例退出后宿主可以再 `start`，即重启。是否自动重启、退避多久：unsupported，由宿主决定，见[失效与释放](../architecture.md#失效与释放)中的“实时核崩溃”。
 
@@ -62,7 +63,7 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 | 2. 关 stdin | 关闭 stdin 管道 | 2 秒 | 读到 EOF，释放后以 0 退出 |
 | 3. 强制终止 | Windows 上 `TerminateJobObject`，其它平台 `SIGKILL` | 5 秒，只作上报的界限 | 被终止，不释放 |
 
-第 1、2 步的时限取 Bellis `ManagedProcess` 的缺省值；实时核的释放与回应在毫秒内完成，2 秒是给卡住的实时核留的余量。请求失败（连接已断、超时、对端报错）不影响后续步骤。
+第 1、2 步的时限取 Bellis `ManagedProcess` 的缺省值；实时核的释放与回应在毫秒内完成，2 秒是给卡住的实时核留的余量。请求失败（连接已断、超时、对端报错）不影响后续步骤。实时核退出后 `stop` 销毁帧环；强制终止后仍未确认退出时保留。
 
 ### 生命线与 panic
 
@@ -110,9 +111,10 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 | 线程 | 做什么 |
 | --- | --- |
 | 主线程 | 释放、连接、握手、发 `core_start`，启动其余线程，然后等会话结束 |
-| `RpcPeer` 读线程 | `producer.heartbeat`、`producer.revoke`、`core.stop` 的处理函数：只动控制状态并发通知，很快返回，不向主进程发请求 |
+| `RpcPeer` 读线程 | `producer.heartbeat`、`producer.revoke`、`core.stop`、`frame_ring.attach`、`capture.set_target` 的处理函数：只动控制状态、发通知或把命令交给采集线程，很快返回，不向主进程发请求 |
 | 心跳看门狗 | 等到截止时刻即释放 |
 | 健康 | 握手后立即发一次 `core.health`，之后按周期发 |
+| 采集 | 取帧写进帧环，见[采集主循环](#采集主循环) |
 | 两条生命线 | 一个等核连接关闭，一个读 stdin 直到 EOF |
 
 `core.stop` 以 `Handlers::request_then` 登记（见[错误处理](core-protocol.md#错误处理)）：回应写出之后才通知主线程结束会话，否则退出会丢掉回应。日志写 stderr，写失败丢弃，不 panic。
@@ -189,6 +191,39 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 
 实测 WGC 只在窗口内容变化时出帧：内容静止的窗口在开始采集后不再出帧，帧龄一直增长；只移动窗口而不重画，通常也不出帧。窗口重画了相同的内容也算变化：合成游戏的外壳按 30 Hz 重画静止的画面时，WGC 持续出帧（[窗口外壳](offline-tools.md#窗口外壳)）。这与[失效与释放](../architecture.md#失效与释放)中“采集冻结”按帧龄判定的关系 PENDING。
 
+### 采集主循环
+
+实时核怎样把采集源接到帧环上，代码在 `core/crates/realtime-core/src/frames.rs`。主进程一侧的挂接顺序与单写方规则见[读写规则](core-protocol.md#读写规则)。
+
+- **处理函数**：`frame_ring.attach` 与 `capture.set_target` 在 `RpcPeer` 的读线程上核对参数。前者以 `FrameRingWriter::attach` 打开并核对帧环；后者核对窗口识别规则与平台是否支持，假显示面在这里先打开一次。核对通过就把写入方或目标作为命令交给采集线程，随即回应；错误码见 [`capture.set_target`](core-protocol.md#消息集)。
+- **采集线程**独占写入方与采集源，帧环在实时核里只有这一个写方。WGC 采集源不是 `Send`，目标以“建立采集源的方法”交给采集线程，采集源在采集线程上创建与使用，继承进程的 DPI 声明；WGC 采集源用缺省配置：请求去掉[黄色采集边框](#黄色采集边框)，最小帧间隔用系统值。
+- **一轮**：等命令，至多等到下一轮；没有采集源时按目标建立；`next_frame` 至多等 50 ms，命令因此至多等这么久才处理；取到帧就写进帧环，记下它在帧环中的帧号与采集时刻。
+- **挂接与设定目标**的先后不限，两者都到了才建立采集源。再次设定目标时先停掉旧的采集源，再按新目标立即建立，不等重新识别的间隔。再次挂接换成新的帧环，最近写入的一帧随之清空。
+- **写不进帧环的帧**（比帧环的最大尺寸大等）丢弃，帧环不受影响，最近写入的一帧不变。
+- 状态变化写 stderr 的日志；同样的问题（找不到窗口、写不进帧环等）只记一次，恢复出帧时再记一次。
+
+| 状态（`core.health.capture`） | 含义 |
+| --- | --- |
+| `idle` | 还没有挂接帧环或设定采集目标 |
+| `searching` | 有帧环与目标，没有采集源：找不到窗口，或采集源已失效，正在定期重新识别 |
+| `capturing` | 有采集源；可恢复的情形下暂时没有新帧 |
+
+| 从 | 事件 | 到 | 之后 |
+| --- | --- | --- | --- |
+| `idle` | 帧环与目标都到了，建立采集源成功 | `capturing` | 取帧 |
+| `idle` | 同上，建立失败：`WindowNotFound`、`AmbiguousWindow` 等 | `searching` | 每 500 ms 重新识别 |
+| `searching` | 重新识别并建立成功 | `capturing` | 取帧 |
+| `capturing` | 可恢复的错误：`WindowMinimized`、`ExclusiveFullscreen` | `capturing` | 保留采集源，每 100 ms 再取帧；没有新帧，帧龄增长 |
+| `capturing` | 不可恢复的错误：`WindowClosed`、`Os`、假采集源的 `InvalidFrame` 等 | `searching` | 丢掉采集源，500 ms 后重新识别 |
+| `searching`、`capturing` | 再次设定目标 | 建立成功为 `capturing`，否则 `searching` | 旧的采集源先停掉 |
+| 任何 | 会话结束 | — | 停掉采集源，至多等 500 ms；等不到也照常退出 |
+
+这些间隔是 `frames.rs` 里的常量，只在测试与真机测试中跑过，未按真实游戏调整。
+
+**帧龄的依据。** 采集线程每写进一帧，就把它在帧环中的帧号与采集时刻记进 `FrameStatus`；控制状态持有它，`core.health` 的 `latest_frame` 也报它。[权威规则](../architecture.md#权威)的“帧未超过动作允许的年龄”在第 8 步据它判断：没有新帧时（采集冻结、最小化、窗口关闭、写不进帧环）它不前进，帧龄随之增长。它只记本实例写的帧：新实例写出第一帧之前为 `null`，帧环里旧实例写的帧不算。
+
+**释放与采集解耦。** `FrameStatus` 有自己的锁。采集线程只在更新它的一瞬间持锁，取帧与写帧时不持锁，也从不碰控制状态的锁；[释放](#释放)只用控制状态的锁，所以采集线程卡在 WGC 里或写帧失败都不影响释放。控制状态需要在锁内读 `FrameStatus` 时，锁序是先控制状态、后 `FrameStatus`。
+
 ### 时钟
 
 实时核与主进程读同一个单调时钟，核协议中以 `_ns` 结尾的时刻、帧环的采集时刻与 `core.health.now_ns` 都是它的纳秒读数。主进程读 `time.perf_counter_ns()`；实时核读 `mono-clock` crate 的 `now_ns()`，不用 `std::time::Instant`：
@@ -230,7 +265,7 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 - 按识别条件匹配可见、未隐藏（cloaked）的顶层窗口：进程映像文件名（不含目录，不区分大小写）、窗口类名（精确）、标题（精确），给出的条件须全部满足。游戏的条件为进程名加窗口类或标题；G0 由配置给出，G1 起来自游戏适配包。
 - 空条件不匹配任何窗口。没有符合的窗口即没有帧；多于一个时报错，不猜测。
 - 进程映像路径以 `PROCESS_QUERY_LIMITED_INFORMATION` 查询，这一权限可以跨完整性级别打开进程；提权游戏的识别 PENDING 实测。
-- 只在建立采集源时识别一次；窗口关闭后须重新识别并新建采集源。
+- 只在建立采集源时识别一次；窗口关闭后须重新识别并新建采集源，由[采集主循环](#采集主循环)完成。
 
 ### 不支持的情形与报错
 
@@ -271,6 +306,22 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 - 真机测试标 `#[ignore]`，不进 `uv run check`：自建已知图案窗口（带边框、无边框、不感知 DPI），核对客户区像素与几何、移动与缩放后的变换版本、遮挡、最小化与关闭、不唯一的窗口与黄色边框。
 - 探测程序 `capture-probe` 供 GS-01 使用，报告帧率、帧龄、帧间隔、丢帧、变换版本的变化与边框处理；用法见 [AGENTS.md](../../AGENTS.md)。
 - DPI 缩放在采集期间变化：PENDING，须维护者在系统设置中改变缩放后实测。
+
+采集主循环，`uv run check` 中运行，Windows 本机与 Linux 容器都真跑 `realtime-core`：
+
+| 测试 | 内容 |
+| --- | --- |
+| `realtime-core` 的单元测试（`frames.rs`、`control.rs`） | 以按脚本出帧或报错的采集源与记录帧的替身，核对上表的每条转换、重新识别的间隔、新目标先停旧源、写不进帧环的帧、再次挂接、采集线程的停止；窗口识别规则的核对，非 Windows 上 `window` 不支持；采集一侧一直占着 `FrameStatus` 的锁时每条释放的路径照样完成 |
+| `runtime/tests/core_link/test_core.py` | 测试扮演主进程：挂接后仍是 `idle`、设定目标后进入 `capturing`，帧环里的帧与 `latest_frame` 一致；新目标取代旧的，旧显示面的帧不再进入帧环；帧环与假显示面不符回 -32002，窗口规则不全回 -32602，被拒绝的请求不改变状态；`window` 目标在 Windows 上找不到窗口时 `searching`，在 Linux 上回 -32003 |
+| `runtime/tests/core_link/test_capture.py` | 与 `CoreLink` 联调：合成游戏 → 假显示面 → 假采集源 → 帧环，主进程读到的帧与 `SyntheticGame.frame()` 一致，点击后随之变化；假显示面停止显示后帧龄持续增长、`latest_frame` 不前进、仍是 `capturing`；杀掉实时核再拉起后挂接同一帧环，帧号续写不回退；`stop` 在实时核退出后销毁帧环；目标被拒时启动失败；采集配置的校验 |
+
+真机手动测试 `runtime/tests/core_link/test_capture_window.py`，标 pytest 的 `manual`，不进 `uv run check`，命令见 [AGENTS.md](../../AGENTS.md)：先以 `CoreLink` 拉起实时核、设定合成游戏外壳的 `window` 目标，再启动外壳。实测（Windows 11，175% 缩放，1280×720 的外壳）：
+
+- 窗口出现之前 `searching`，出现之后 `capturing`。
+- 帧环里的帧与外壳的缓冲除底部两角外逐像素一致；两角半径 15 个物理像素内有 84 个像素不同，alpha 为 47–242（缓冲为 255），是 Windows 11 的圆角（见[边缘](#客户区与变换版本)）。
+- 外壳按 30 Hz 重画时 30.0 fps，主进程每 2 ms 读一次时没有漏看的帧号；两次运行中读到时的帧龄中位数约 10 ms，最大 19 ms 与 35 ms。
+- 移动窗口后变换版本由 1 变为 2，像素不变。
+- 最小化后 1 秒内没有新帧、仍是 `capturing`，还原后继续出帧；关闭窗口后回到 `searching`。
 
 ## 音频采集
 
