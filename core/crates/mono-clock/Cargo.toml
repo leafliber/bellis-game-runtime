@@ -1,0 +1,16 @@
+[package]
+name = "mono-clock"
+version = "0.0.0"
+description = "主进程与实时核共用的单调时钟：与 Python time.perf_counter_ns() 同一刻度的纳秒读数"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Performance"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

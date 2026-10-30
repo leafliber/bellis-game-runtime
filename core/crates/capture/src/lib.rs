@@ -9,7 +9,7 @@ mod selector;
 #[cfg(windows)]
 pub mod win;
 
-pub use clock::{hundred_ns_to_ns, qpc_ticks_to_ns};
+pub use clock::hundred_ns_to_ns;
 pub use geometry::{
     CropBox, CropError, Point, Rect, Size, Transform, TransformTracker, WindowGeometry, client_crop,
 };
