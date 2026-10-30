@@ -114,6 +114,7 @@ class Kernel:
         self._generation = 0
         self._instances = 0
         self._dirty = False
+        self._closing = False
         self._loop: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -124,6 +125,8 @@ class Kernel:
 
         先校验整批，全部合格才加入。
         """
+        if self._closing:
+            raise RuntimeError("内核已停止")
         ids = set(self._entries)
         batch: list[_Entry] = []
         for resolved in entries:
@@ -180,6 +183,18 @@ class Kernel:
         self._request()
         await self.settled()
 
+    async def shutdown(self) -> None:
+        """停止内核：按 profile 逆序停用全部条目，此后不再激活任何条目。
+
+        控制产出者照常走完 QUIESCING；等输入已释放的确认超时或失败时，照常以 `release-timeout`
+        或 `release-failed` 上报，然后记录告警、撤销它的注册继续停止，因为接下来实时核停止时
+        也会释放全部输入。停止前已卡在 QUIESCING 的控制产出者同样处理。
+        宿主随后按 R-06 停止实时核。
+        """
+        self._closing = True
+        self._request()
+        await self.settled()
+
     @property
     def control_producer(self) -> str | None:
         """被指定为控制产出者的条目 id；它可能还没有激活。"""
@@ -222,15 +237,17 @@ class Kernel:
                 entry.state is State.QUIESCING
                 and instance is not None
                 and instance.release is not None
-                and instance.release.done()
             ):
-                await self._after_release(entry, instance)
+                if instance.release.done():
+                    await self._after_release(entry, instance)
+                elif self._closing:
+                    await self._abandon_release(entry, instance)
 
         for entry in reversed(entries):
             if entry.state is not State.ACTIVE:
                 continue
-            if not entry.enabled:
-                await self._unload(entry, (_disabled(entry),))
+            if not self._wanted(entry):
+                await self._unload(entry, (self._disabled(entry),))
                 continue
             blockers = self._blockers(entry)
             if blockers:
@@ -239,10 +256,10 @@ class Kernel:
                 self._set(entry, State.ACTIVE, ())
 
         for entry in entries:
-            if not entry.enabled:
+            if not self._wanted(entry):
                 if entry.state in (State.WAITING, State.FAILED):
                     self._cancel_retry(entry)
-                    self._set(entry, State.DISPOSED, (_disabled(entry),))
+                    self._set(entry, State.DISPOSED, (self._disabled(entry),))
                 continue
             if entry.state is State.DISPOSED:
                 entry.attempts = 0
@@ -483,6 +500,8 @@ class Kernel:
                 ),
             )
             instance.release.add_done_callback(self._release_done)
+            if self._closing:
+                await self._abandon_release(entry, instance)
             return
         await self._after_release(entry, instance)
 
@@ -548,17 +567,32 @@ class Kernel:
             if entry.reasons != (reason,):
                 logger.error("%s %s", instance.id, reason.message)
             self._set(entry, State.QUIESCING, (reason,))
+            if self._closing:
+                await self._abandon_release(entry, instance)
             return
+        await self._finish_unload(entry, instance)
+
+    async def _abandon_release(self, entry: _Entry, instance: _Instance) -> None:
+        """停止内核时不再等确认：已上报的 QUIESCING 原因保留到 UNLOADING，撤销注册后继续停止。"""
+        grant = instance.grant
+        logger.warning(
+            "停止内核：%s 没有得到代次 %s 输入已释放的确认，撤销其注册继续停止；"
+            "实时核停止时会释放全部输入",
+            instance.id,
+            "?" if grant is None else grant.generation,
+        )
+        if instance.release is not None:
+            instance.release.cancel()
         await self._finish_unload(entry, instance)
 
     async def _finish_unload(self, entry: _Entry, instance: _Instance) -> None:
         self._set(entry, State.UNLOADING, entry.reasons)
         await self._dispose(instance.registrations, instance.id)
         entry.instance = None
-        if entry.enabled:
+        if self._wanted(entry):
             self._set(entry, State.WAITING, self._blockers(entry))
         else:
-            self._set(entry, State.DISPOSED, (_disabled(entry),))
+            self._set(entry, State.DISPOSED, (self._disabled(entry),))
 
     async def _dispose(self, registrations: Registrations, owner: str) -> None:
         """按后注册先撤销的顺序运行撤销函数；单个失败或超时记录后继续撤销其余注册。"""
@@ -575,6 +609,15 @@ class Kernel:
             logger.exception("%s 的一项注册撤销失败，继续撤销其余注册", owner)
 
     # 其它
+
+    def _wanted(self, entry: _Entry) -> bool:
+        """条目是否应当运行：启用且内核未在停止。"""
+        return entry.enabled and not self._closing
+
+    def _disabled(self, entry: _Entry) -> Reason:
+        if self._closing and entry.enabled:
+            return Reason(ReasonCode.DISABLED, entry.id, "内核已停止")
+        return _disabled(entry)
 
     def _set(self, entry: _Entry, state: State, reasons: tuple[Reason, ...]) -> None:
         if entry.state is state and entry.reasons == reasons:
