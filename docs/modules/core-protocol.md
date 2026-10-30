@@ -120,7 +120,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - 消息走 `bellis-channel/1` 帧，内容为 JSON-RPC 2.0（同 Bellis D-21）。实时核是通道客户端，主进程是服务端；两边都可以发请求与通知。
 - 握手校验协议版本；两端同仓库同发布，仍然校验。
 
-核连接承载：动作块、控制产出者心跳与代次、执行回执、输入已释放的确认、实时核健康，以及帧环挂接、采集目标与正常停止。
+核连接承载：动作块、控制产出者心跳与代次、执行回执、输入已释放的确认、实时核健康，以及帧环挂接、采集目标与正常停止。输入许可不经核连接：主进程只能让输入停下，不能让输入继续；许可的语义见[输入许可](#输入许可)，G0 唯一的许可源在只用于测试的[测试设备连接](#测试设备连接)上。
 
 ### 约定
 
@@ -128,14 +128,15 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - 结构体拒绝未知字段，缺少必需字段即拒绝；可以为空的字段显式写 `null`。整数的范围按其 Rust 类型（`u16`、`u32`、`u64`、`i32`），越界即拒绝。
 - 联合类型统一以 `type` 字段为内部标签，每个分支是一个具名结构体，Rust 与 Python 用同一名字。
 - 以 `_ns` 结尾的时刻字段是实时核单调时钟的纳秒读数，与帧环的采集时刻同一时钟；`offset_ns` 是相对起始时刻的纳秒数。主进程以 `time.perf_counter_ns()` 读同一时钟（Windows 上是 QPC，Linux 上是 `CLOCK_MONOTONIC`），已在 Windows 与 Linux 上实测核对，见[时钟](realtime-core.md#时钟)。
-- 方法名到 params 与 result 类型的对应只有一处源：Rust 的 `core_protocol::methods`。它导出到 Schema 的 `x-methods`（每个方法的方向与 params、result 的 `$ref`，通知的 `result` 为 `null`），再生成为 Python 的 `core_protocol.methods`。
-- 错误用 JSON-RPC 2.0 的标准错误码（解析失败、无效请求、方法不存在、参数无效），另有两个自定义错误码：
+- 方法名到 params 与 result 类型的对应只有一处源：Rust 的 `core_protocol::methods`。它导出到 Schema 的 `x-methods`（每个方法的方向与 params、result 的 `$ref`，通知的 `result` 为 `null`），再生成为 Python 的 `core_protocol.methods`（`METHODS`）。测试设备连接上的方法单独成组：`x-test-device-methods`，Python 的 `TEST_DEVICE_METHODS`。
+- 错误用 JSON-RPC 2.0 的标准错误码（解析失败、无效请求、方法不存在、参数无效），另有以下自定义错误码：
 
 | 错误码 | 名字 | 含义 |
 | --- | --- | --- |
 | -32001 | `protocol_version_mismatch` | `core.hello` 的协议版本与主进程的不相等 |
 | -32002 | `frame_ring_mismatch` | `frame_ring.attach` 打不开共享内存，或帧环头部与参数不符；`capture.set_target` 的假显示面同样 |
 | -32003 | `capture_unsupported` | `capture.set_target` 的目标在这个平台或系统上不支持：非 Windows 上的 `window`，或系统不支持 WGC |
+| -32004 | `lease_refused` | 只用于测试：`test_lease.grant` 不被接受，见[输入许可](#输入许可) |
 
 ### 会话
 
@@ -146,7 +147,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 5. 更换控制产出者（[QUIESCING](plugin-kernel.md#生命周期)）：停止提交动作块 → `producer.revoke`，等到它的回应，即输入已释放的确认 → 撤销注册。
 6. 正常停止：主进程发 `core.stop`；实时核释放全部输入，发 `input.released`，回应写出后退出。这是 Bellis R-06 停止顺序中的 RPC 一步。
 
-心跳周期 100 ms、心跳超时 500 ms，`core.health` 周期 1 秒、主进程判定失联 3 秒，都可配置；依据与真实输入下的实测（PENDING，G2）见[时限](realtime-core.md#时限)。
+心跳周期 100 ms、心跳超时 500 ms，`core.health` 周期 1 秒、主进程判定失联 3 秒，动作允许的帧龄 500 ms，都可配置；依据与真实输入下的实测（PENDING，G2）见[时限](realtime-core.md#时限)。
 
 ### 消息集
 
@@ -163,7 +164,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `input.released` | 实时核 → 主进程 | 通知 | `InputReleasedParams` | 输入已释放的确认 |
 | `core.health` | 实时核 → 主进程 | 通知 | `CoreHealthParams` | 实时核健康，也是主进程判断实时核存活的依据 |
 
-输入许可的消息在实现输入许可（G0 的测试许可源）时加入。
+输入许可的消息不在核连接上，见[测试设备连接](#测试设备连接)。
 
 **`core.hello`**
 
@@ -195,32 +196,50 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 **控制产出者**：`Producer` 由身份 `id` 与代次 `generation` 组成。代次由主进程分配，在一个实时核的生命期内严格递增；实时核记住当前代次与已作废的最高代次。
 
 - 心跳或动作块的代次不大于已作废的代次，或小于当前代次：拒绝。代次等于当前代次而身份不同：拒绝。
-- 代次大于当前代次：先释放全部输入（`producer_changed`），再以它为当前代次。没有当前产出者时（启动后、当前代次被作废后）直接以它为当前代次，不需要释放。
+- 代次大于当前代次：先释放全部输入（`producer_changed`），再以它为当前代次。没有当前产出者时（启动后、当前代次被作废后）直接以它为当前代次，不需要释放。以动作块切换的新代次还没有心跳，心跳到达之前它的动作不发（权威检查的第二个条件）；主进程在一个代次的第一块之前先发一次心跳（[提交动作块](plugin-kernel.md#提交动作块)）。
 - `producer.heartbeat` 的 `seq` 在同一代次内严格递增，不递增的心跳不算数；新代次的 `seq` 从它的第一次心跳算起。心跳超时即释放全部输入（`heartbeat_timeout`）并待命：产出者仍是当前的，同一代次 `seq` 递增的心跳到达后重新计时。
 - `producer.revoke` 作废 `generation` 及更早的全部代次，之后这些代次的心跳与动作块都被拒绝；当前代次在其中时先释放全部输入（`generation_revoked`），此后没有当前产出者。实时核在释放完成后才回应，回应即这些代次的输入已释放的确认。
 
-**`action.submit`** 的 params 见[动作块](#动作块)。result 是联合类型 `ActionSubmitResult`：
+**`action.submit`** 的 params 见[动作块](#动作块)。params 解析不了（未知字段、类型或范围不对）回参数无效（-32602）；能解析的按动作块的规则校验，result 是联合类型 `ActionSubmitResult`：
 
 | 分支 | 字段 | 含义 |
 | --- | --- | --- |
-| `accepted`（`Accepted`） | 无 | 已接受，按时间执行 |
-| `rejected`（`Rejected`） | `reason` | `stale_generation`（代次早于当前或已作废）、`producer_mismatch`（代次相同、身份不同）、`stale_seq`（序号不大于已接受的）、`expired`（有效截止时刻已过）、`invalid`（内容不合[动作块](#动作块)的规则） |
+| `accepted`（`Accepted`） | 无 | 已接受，交给调度线程按时间执行；回应时一步都还没执行 |
+| `rejected`（`Rejected`） | `reason` | 按以下顺序核对：`stopping`（实时核正在停止）、`stale_generation`（代次早于当前或已作废）、`producer_mismatch`（代次相同、身份不同）、`invalid`（内容不合[动作块](#动作块)的规则）、`stale_seq`（序号不大于同一代次已接受的）、`expired`（有效截止时刻不晚于现在）。被拒绝的动作块不改变任何状态，其中任何动作都不执行 |
 | | `message` | 给人看的说明，只用于日志与诊断 |
 
-**`action.receipt`**：报告一块动作中一次性动作的结果，每个动作在一块中只报一次。`producer` 与 `block_seq` 指明动作块，`outcomes` 是联合类型 `ActionOutcome` 的列表：
+**`action.receipt`**：报告一块动作中一次性动作的结果，每个动作在一块中只报一次。每执行一步发一条，报这一步的动作；被取代时、释放结束整块时另发一条，报其余未执行的动作。`producer` 与 `block_seq` 指明动作块，`outcomes` 是联合类型 `ActionOutcome` 的列表：
 
 | 分支 | 字段 | 含义 |
 | --- | --- | --- |
 | `executed`（`Executed`） | `id`、`at_ns` | 已交给输入后端及其时刻；不代表游戏中的效果已发生 |
-| `dropped`（`Dropped`） | `id`、`reason` | 没有执行：`superseded`（新的动作块已取代本块未执行的部分）、`duplicate`（同一身份在本代次已执行过）、`released`（到时实时核已释放输入） |
+| `dropped`（`Dropped`） | `id`、`reason` | 没有执行：`superseded`（新的动作块已取代本块未执行的部分）、`duplicate`（同一身份在本代次已执行过）、`released`（到时实时核已释放输入，原因见 `input.released`）、`geometry_changed`（带坐标的动作：基准帧之后客户区的尺寸或 DPI 变了，或基准帧的几何已查不到，见[坐标与几何](#坐标与几何)） |
 
-**`input.released`**：实时核每次释放全部输入后发出，不论释放前是否持有输入。按生命线释放时不发：核连接断开时已无法发出；stdin 读到 EOF 时原因集合中没有对应的一项，实时核随即以 0 退出（[生命线与 panic](realtime-core.md#生命线与-panic)）。
+**`input.released`**：实时核每次释放全部输入后发出，不论释放前是否持有输入。核连接断开时已无法发出，只记日志（以假后端运行时测试设备也能看到，见[测试设备连接](#测试设备连接)）；stdin 读到 EOF 时连接若还在就发出，随即以 0 退出（[生命线与 panic](realtime-core.md#生命线与-panic)）。
 
 | 字段 | 含义 |
 | --- | --- |
-| `reason` | `core_start`（启动时先释放）、`generation_revoked`、`producer_changed`、`heartbeat_timeout`、`deadline_expired`（到截止时刻没有新的动作块）、`frame_stale`（最新的帧超过动作允许的年龄）、`stop` |
+| `reason` | 见下表 |
 | `producer` | 释放时的当前控制产出者；没有时为 `null` |
 | `released_at_ns` | 释放完成的时刻 |
+
+| 原因 | 何时 |
+| --- | --- |
+| `core_start` | 启动时先释放 |
+| `generation_revoked` | 当前代次被 `producer.revoke` 作废 |
+| `producer_changed` | 出现更高的代次，切换前先释放 |
+| `heartbeat_timeout` | 当前产出者的心跳超时；权威检查时这一代次没有有效心跳（超时后待命，或还没有心跳）也是它 |
+| `deadline_expired` | 到截止时刻没有新的动作块 |
+| `frame_stale` | 最新写入帧的帧龄超过动作允许的年龄，或本实例还没有写过帧 |
+| `lease_expired` | 输入许可过了到期时刻，没有续约 |
+| `lease_revoked` | 输入许可被吊销，或许可源换发了更大的令牌 |
+| `lease_source_lost` | 与许可源的连接断开（G0 是测试设备连接） |
+| `no_lease` | 没有输入许可：从未授予，或没有许可源（没有输入后端时即如此） |
+| `stop` | 收到 `core.stop` |
+| `core_connection_lost` | 生命线：核连接断开。主进程收不到，见日志与测试设备 |
+| `stdin_closed` | 生命线：stdin 读到 EOF 或读取失败 |
+
+权威检查不成立时的原因按[权威规则](../architecture.md#权威)三个条件的顺序取第一个不成立的：许可（`lease_*`、`no_lease`）、产出者与心跳（`heartbeat_timeout`、`producer_changed`）、帧龄（`frame_stale`）。
 
 **`core.health`**
 
@@ -231,6 +250,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `inputs_held` | 当前是否持有输入 |
 | `producer` | 当前控制产出者；没有时为 `null` |
 | `latest_frame` | 本实例最近写进帧环的一帧（`LatestFrame`）：`frame_number` 为它在帧环中的帧号，`capture_ns` 为采集时刻；本实例还没写过帧时为 `null`。它不前进即帧龄在增长，见[帧龄的依据](realtime-core.md#采集主循环) |
+| `lease` | 输入许可的状态（`LeaseStatus`）：`not_granted`、`valid`、`expired`、`revoked`、`source_lost`，含义见[输入许可](#输入许可)。只报状态，不报令牌；只用于诊断与测试，主进程不据它做任何决定 |
 
 ## 动作块
 
@@ -254,11 +274,72 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `actions` | 一次性动作，按列出的顺序执行，联合类型 `Action`：`click`（`x`、`y`、`button`）、`key_press`（`scan_code`）、`scroll`（`x`、`y`、`notches`）、`mouse_move`（`dx`、`dy`）。每个都带 `id`，在同一代次内唯一 |
 
 - 坐标是基准帧客户区的物理像素；`scan_code` 是 Set 1 扫描码，扩展键在高字节带 `0xE0`；`button` 为 `left`、`right` 或 `middle`；`notches` 正数向前；`dx`、`dy` 是鼠标计数，正数向右、向下。点击与短按的按住时长、轴名的白名单由游戏适配包给出。
-- **持续状态**（按住的键、轴）每块完整给出，缺项按释放处理，不沿用旧值。同一步中同一键、鼠标键或轴只能出现一次。
-- **一次性动作**（点击、短按、滚动、相对位移）按身份去重，重传不重复执行、不延长持续时间。块内身份不得重复。
-- 新接受的动作块从它的起始时刻起取代上一块未执行的部分。到达时时刻已过的步立即执行；截止时刻之后不再执行任何步。
-- 不合以上规则、步的时刻晚于截止时刻或没有步的动作块整块拒绝（`invalid`）。
+- **持续状态**（按住的键、轴）每块完整给出，缺项按释放处理，不沿用旧值。同一步中同一键、鼠标键或轴只能出现一次，轴的取值在 [-1, 1]。
+- **一次性动作**（点击、短按、滚动、相对位移）按身份在同一代次内去重：已执行过的身份回执 `duplicate`，重传不重复执行、不延长持续时间；被取代或因释放而没执行的不算执行过。块内身份不得重复。
+- 新接受的动作块从它的起始时刻起取代上一块未执行的部分（回执 `superseded`），上一块此前的步照常执行；上一块的截止时刻早于新块的起始时刻时，上一块的持续状态在它的截止时刻抬起（不算释放全部，不发 `input.released`）。到达时时刻已过的步立即执行；截止时刻之后不再执行任何步。
+- 到截止时刻没有新的动作块：释放全部输入（`deadline_expired`），这一块结束。
+- 权威检查不成立而释放时，这一块随之结束：其余动作回执 `released`，之后的步不再执行，要继续须提交新的动作块。
+- 不合以上规则、步的时刻晚于截止时刻、`start_ns + offset_ns` 溢出或没有步的动作块整块拒绝（`invalid`）。
 - 剧情游戏的动作块只含一次点击或短按，没有持续状态；即时游戏的动作块是按固定频率排列的完整控制序列。
+
+执行的时机、权威检查与持键账目见[动作块的执行](realtime-core.md#动作块的执行)。
+
+### 坐标与几何
+
+- 带坐标的动作（`click`、`scroll`）的坐标按基准帧的客户区解释。实时核在执行它之前核对：基准帧之后客户区的尺寸或 DPI 变了，这个动作不执行，回执 `dropped(geometry_changed)`；块里其余不带坐标的动作照常。这不是权威检查的失败，不释放输入。
+- 只移动窗口（客户区原点变了、尺寸与 DPI 不变）不影响客户区坐标，照常执行；真实后端注入时按当时的客户区原点换算（G2）。
+- 实时核记下本实例在当前帧环写出的帧的几何（尺寸与 DPI）的变化点，至多 16 次。基准帧的几何查不到时按变了处理：基准帧早于本实例在当前帧环写出的第一帧（旧实例写的帧、挂接之前的帧）、晚于最近写入的一帧，或早于记下的最早一次变化。实时核重启或再次挂接帧环之后，以旧帧为基准帧的坐标动作因此不执行，产出者须按新实例写出的帧重新决定。
+- 帧环的槽头部不带 DPI；几何由实时核在写帧时从采集源取得，主进程看不到 DPI。
+
+## 输入许可
+
+许可的规则取自 Bellis D-31、D-34（[技术基线](../plan/tech-baseline.md)的继承表）：令牌只增不减，实时核只认等于当前令牌且未过期的许可。许可由许可源直接交给实时核，不经主进程（[总体架构](../architecture.md#进程与连接)）。
+
+| 许可源 | 阶段 | 连接 |
+| --- | --- | --- |
+| 测试许可源，只用于测试 | G0 | [测试设备连接](#测试设备连接)，只能与假输入后端一起启用 |
+| 独立运行的操作员入口与测试许可 | G2 | 形式另行登记批准，这里不定 |
+| Bellis 安全核的 `game.input` 许可 | G3 | 控制连接（[游戏桥](game-bridge.md#连接)），消息是 Bellis 的 `lease.renew`，契约的源在 Bellis |
+
+实时核持有的许可是一个状态机：
+
+| 事件 | 结果 |
+| --- | --- |
+| 授予：令牌大于当前令牌 | 有效，到期时刻为给出的值。此前有有效的许可时先释放它负责的全部输入（`lease_revoked`） |
+| 授予：令牌等于有效许可的令牌 | 续约，到期时刻换成给出的值（也可以更早） |
+| 授予：令牌小于当前令牌、已被吊销、等于已过期的令牌，或到期时刻不晚于现在 | 拒绝（-32004），许可不变：过期的令牌不能续约，须换发更大的令牌 |
+| 到了到期时刻 | 过期，释放全部输入（`lease_expired`）。调度线程按到期时刻定时，不等下一个动作 |
+| 吊销：令牌不小于有效许可的令牌 | 吊销，释放全部输入（`lease_revoked`）；此后这个令牌及更早的令牌都不能再授予 |
+| 与许可源的连接断开 | 此后没有许可，释放全部输入（`lease_source_lost`） |
+| 没有许可源（没有输入后端） | 从无许可（`no_lease`），不发任何输入 |
+
+## 测试设备连接
+
+只用于测试。实时核以假输入后端（`--input-backend fake`）启动时，另作为 `bellis-channel/1` 客户端连到测试一方的服务端；生产中没有这条连接。实现见[假输入后端与测试设备连接](realtime-core.md#假输入后端与测试设备连接)，测试一方是 `game_runtime.core_link.fake_device.FakeDevice`。
+
+- **为什么不经主进程**：主进程只能让输入停下，不能让输入继续，许可不能来自主进程；主进程崩溃时测试一方仍能看到实时核是否发出了抬起与释放全部，这是“主进程崩溃即释放”唯一可观察的办法；拓扑与生产时“许可来自另一方（Bellis 控制连接）”一致。
+- **凭据**：像核连接一样由环境变量交付，另用一组名字：`GAME_RUNTIME_TEST_DEVICE_PATH`（地址）、`GAME_RUNTIME_TEST_DEVICE_KEY`（base64url 密钥）；角色与核连接相同，为 `game-runtime.core`。主进程一侧由 `CoreLinkOptions.test_device` 给出（只用于测试）。
+- **顺序**：实时核先连上测试设备并开始处理它的请求，再释放全部输入（`core_start`，测试设备随即收到 `release_all(core_start)`），再连接主进程。连不上测试设备即以 1 退出。连接断开后不重连：此后没有许可，不发任何输入。
+- **门禁**：`--input-backend` 在 G0 只有 `fake` 一个取值，其它取值（真实后端）unsupported；给了测试设备的凭据却没有 `--input-backend fake`、或 `--input-backend fake` 却没有凭据，都以参数不合法（2）退出。测试许可源只在假后端的代码里构造，没有路径能让它与其它后端一起出现。
+- 这些消息不是游戏桥控制连接的契约，也不冒用它的消息名（那份契约的源在 Bellis，GD-03）。
+
+| 方法 | 方向 | 类型 | params → result | 用途 |
+| --- | --- | --- | --- | --- |
+| `test_lease.grant` | 测试一方 → 实时核 | 请求 | `FakeLeaseGrantParams` → `Empty` | 授予或续约许可：`token`、`expires_ns`（与帧环同一时钟）。不被接受时回 -32004 |
+| `test_lease.revoke` | 测试一方 → 实时核 | 请求 | `FakeLeaseRevokeParams` → `Empty` | 吊销 `token` 及更早的令牌；释放完成后才回应 |
+| `fake_input.event` | 实时核 → 测试一方 | 通知 | `FakeInputEventParams` | 假输入后端的一个事件：`seq`（实例内从 1 起逐个加一）、`at_ns`（交给假后端的时刻）、`event` |
+
+`event` 是联合类型 `FakeInputEvent`：
+
+| 分支 | 字段 | 何时 |
+| --- | --- | --- |
+| `key_down`、`key_up` | `scan_code` | 持续状态里的键按下、抬起 |
+| `mouse_down`、`mouse_up` | `button` | 持续状态里的鼠标键按下、抬起 |
+| `axis_set`、`axis_release` | `axis`，`axis_set` 另有 `value` | 轴设为某个取值（含改变取值）、释放 |
+| `click`、`key_press`、`scroll`、`mouse_move` | 同动作块里的同名动作，含 `id` | 执行一次性动作 |
+| `release_all` | `reason`（释放的原因，取值同 `input.released`） | 释放全部输入：此前按住的每一项都已逐一发出抬起，这一条随后发出；账目为空时也发 |
+
+事件经发送队列写给测试一方，与核连接上的回执、`input.released` 走两条连接，先后不定。实时核退出前至多等 500 ms 把队列里的事件写完。
 
 ## 帧环与音频环
 
@@ -372,11 +453,11 @@ Windows 本机跑命名文件映射，Linux 容器跑 POSIX 共享内存。
 
 | 生成物（`protocol/` 下） | 来源 |
 | --- | --- |
-| `schema/core-protocol.schema.json` | schemars 从 Rust 类型生成；`x-methods`、`x-protocol-version`、`x-error-codes` 来自 `core_protocol::methods` 与协议版本常量 |
+| `schema/core-protocol.schema.json` | schemars 从 Rust 类型生成；`x-methods`、`x-test-device-methods`、`x-protocol-version`、`x-error-codes` 来自 `core_protocol::methods` 与协议版本常量 |
 | `frame-ring-layout.json` | Rust 以 `std::mem::offset_of!` 导出的常量与各结构的大小、对齐、字段偏移、大小与类型 |
-| `fixtures/<方法名>/params[.<用例>].json`、`result[.<用例>].json` | Rust 从类型的值序列化出的示例消息，每个方法的 params 与 result 至少一条，每个联合类型的每个分支至少出现一次 |
+| `fixtures/<方法名>/params[.<用例>].json`、`result[.<用例>].json` | Rust 从类型的值序列化出的示例消息，两组的每个方法的 params 与 result 至少一条，每个联合类型的每个分支至少出现一次 |
 | `src/core_protocol/models.py` | datamodel-code-generator 从 Schema 生成的 Pydantic 模型 |
-| `src/core_protocol/methods.py` | 从 Schema 的 `x-methods` 生成的方法目录、协议版本与自定义错误码 |
+| `src/core_protocol/methods.py` | 从 Schema 的 `x-methods` 与 `x-test-device-methods` 生成的两组方法目录（`METHODS`、`TEST_DEVICE_METHODS`）、协议版本与自定义错误码 |
 
 - 重新生成用 `uv run generate`：先运行 Rust 的 `core-protocol-export` 写出 Schema、偏移表与示例消息，再运行 datamodel-code-generator，两份 Python 文件经仓库的 ruff 配置修正与格式化，然后写回 `protocol/`，删除不再生成的示例消息。改了 `core/crates/core-protocol` 后运行它，生成物与源放在同一个提交里。
 - `uv run check` 的生成物核对把全部生成物重新生成到临时目录，与入库的逐字节比较，缺少、多余或内容不同都失败，并提示运行 `uv run generate`。
@@ -388,7 +469,7 @@ Windows 本机跑命名文件映射，Linux 容器跑 POSIX 共享内存。
 
 | 阶段 | 内容 |
 | --- | --- |
-| G0 | 生成物过期与偏移表不一致时检查失败；本机通道未认证即拒绝，篡改、重放、超长帧与超时都被拒绝；Python 与 Rust 互通，Windows 真机跑命名管道，Linux 容器跑 UDS；帧环由主进程创建、实时核写入、主进程读出，头部与参数不符时拒绝，并发读写不交出撕裂的帧 |
+| G0 | 生成物过期与偏移表不一致时检查失败；本机通道未认证即拒绝，篡改、重放、超长帧与超时都被拒绝；Python 与 Rust 互通，Windows 真机跑命名管道，Linux 容器跑 UDS；帧环由主进程创建、实时核写入、主进程读出，头部与参数不符时拒绝，并发读写不交出撕裂的帧；动作块的校验、调度与权威检查在假输入后端上经测试设备连接验证（[验证](realtime-core.md#动作块的验证)） |
 | G3 | 与 Bellis 宿主真机互通 |
 
 ## 技术路线
