@@ -134,13 +134,14 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | 错误码 | 名字 | 含义 |
 | --- | --- | --- |
 | -32001 | `protocol_version_mismatch` | `core.hello` 的协议版本与主进程的不相等 |
-| -32002 | `frame_ring_mismatch` | `frame_ring.attach` 打不开共享内存，或帧环头部与参数不符 |
+| -32002 | `frame_ring_mismatch` | `frame_ring.attach` 打不开共享内存，或帧环头部与参数不符；`capture.set_target` 的假显示面同样 |
+| -32003 | `capture_unsupported` | `capture.set_target` 的目标在这个平台或系统上不支持：非 Windows 上的 `window`，或系统不支持 WGC |
 
 ### 会话
 
 1. 实时核通过通道认证后先发 `core.hello`；主进程核对协议版本，不相等即以 -32001 回错并断开。握手完成前双方不发其它消息。
 2. 实时核随即发 `input.released(core_start)`（启动时已先释放全部输入），之后才处理任何产出者消息；主进程收到它才算实时核就绪。实时核立即发第一条 `core.health`，此后按周期发。
-3. 主进程发 `frame_ring.attach` 与 `capture.set_target`。
+3. 主进程先发 `frame_ring.attach`，再发 `capture.set_target`，之后才开始发心跳（主进程一侧见[读写规则](#读写规则)）。
 4. 当前控制产出者定期发 `producer.heartbeat`，以 `action.submit` 提交动作块；实时核以 `action.receipt` 报一次性动作的结果，每次释放全部输入后发 `input.released`。
 5. 更换控制产出者（[QUIESCING](plugin-kernel.md#生命周期)）：停止提交动作块 → `producer.revoke`，等到它的回应，即输入已释放的确认 → 撤销注册。
 6. 正常停止：主进程发 `core.stop`；实时核释放全部输入，发 `input.released`，回应写出后退出。这是 Bellis R-06 停止顺序中的 RPC 一步。
@@ -171,7 +172,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `protocol_version` | params：实时核实现的协议版本；result：主进程实现的协议版本。两端都核对 |
 | `core_version` | 实时核的程序版本，只用于日志与诊断 |
 
-**`frame_ring.attach`**：主进程创建帧环并写好头部后发出；实时核打开共享内存，核对头部与参数一致后开始写帧，见[帧环](#帧环)。
+**`frame_ring.attach`**：主进程创建帧环并写好头部后发出；实时核打开共享内存，核对头部与参数一致后交给采集线程，帧号从头部的 `write_seq` 续写，见[帧环](#帧环)。再次挂接即换成新的帧环。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -179,13 +180,17 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `size_bytes` | 共享内存的总字节数，不小于 `SLOTS_OFFSET + slot_count × slot_stride` |
 | `layout_version`、`slot_count`、`slot_stride`、`max_width`、`max_height` | 与帧环头部的同名字段相等 |
 
-**`capture.set_target`**：`target` 是联合类型 `CaptureTarget`，G0 由配置给出，游戏适配包在 G1 接入。
+**`capture.set_target`**：`target` 是联合类型 `CaptureTarget`，G0 由配置给出（见[读写规则](#读写规则)中主进程一侧的实现），游戏适配包在 G1 接入。
 
 | 分支 | 字段 | 含义 |
 | --- | --- | --- |
 | `window`（`WindowTarget`） | `process_name` | 进程的可执行文件名，不区分大小写 |
 | | `window_class`、`title` | 窗口类名与窗口标题，全等匹配；`null` 表示不按它匹配，两者至少给出一个 |
 | `fake`（`FakeTarget`） | `surface` | 假采集源，只用于自动测试：假显示面的共享内存名与布局参数，形式与核对同 `frame_ring.attach`，见[假采集源](realtime-core.md#假采集源) |
+
+- 回应表示目标已核对并交给采集线程，不等采集源建立。找不到窗口不是错误：`core.health.capture` 为 `searching`，实时核定期重新识别（[采集主循环](realtime-core.md#采集主循环)）。
+- 再次设定时先停掉旧的采集源。与 `frame_ring.attach` 的先后不限，两者都到了才开始采集。
+- 错误：`process_name` 为空或 `window_class` 与 `title` 都是 `null` 时回参数无效（-32602）；`window` 在非 Windows 上（unsupported）或系统不支持 WGC 时回 -32003；假显示面按 `frame_ring.attach` 的规则核对，不符回 -32002。被拒绝的请求不改变当前的目标。
 
 **控制产出者**：`Producer` 由身份 `id` 与代次 `generation` 组成。代次由主进程分配，在一个实时核的生命期内严格递增；实时核记住当前代次与已作废的最高代次。
 
@@ -221,10 +226,11 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 
 | 字段 | 含义 |
 | --- | --- |
-| `now_ns` | 发出时实时核的时钟读数 |
-| `capture` | `idle`（还没有挂接帧环或设定采集目标）、`searching`（找不到目标窗口，没有帧）、`capturing` |
+| `now_ns` | 发出时实时核的时钟读数。实时核先读它再读其余字段，所以其余字段反映的状态不早于这一刻 |
+| `capture` | `idle`（还没有挂接帧环或设定采集目标）、`searching`（没有采集源：找不到目标窗口或采集源已失效，正在定期重新识别；没有帧）、`capturing`（有采集源；最小化等可恢复的情形下暂时没有新帧）。转换见[采集主循环](realtime-core.md#采集主循环) |
 | `inputs_held` | 当前是否持有输入 |
 | `producer` | 当前控制产出者；没有时为 `null` |
+| `latest_frame` | 本实例最近写进帧环的一帧（`LatestFrame`）：`frame_number` 为它在帧环中的帧号，`capture_ns` 为采集时刻；本实例还没写过帧时为 `null`。它不前进即帧龄在增长，见[帧龄的依据](realtime-core.md#采集主循环) |
 
 ## 动作块
 
@@ -305,16 +311,24 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 
 | 实现 | 位置 | 做什么 |
 | --- | --- | --- |
-| 主进程（Python） | `runtime/src/game_runtime/frame_ring/` | 创建并写好头部、给出 `frame_ring.attach` 的参数、读最新一帧、算帧龄、销毁 |
-| 实时核（Rust） | `core/crates/frame-ring` | 打开与核对、写帧；其中的读取方只供[假采集源](realtime-core.md#假采集源)与测试使用 |
+| 主进程（Python） | `runtime/src/game_runtime/frame_ring/` | 创建并写好头部、给出 `frame_ring.attach` 的参数、读最新一帧、算帧龄、销毁；由 `CoreLink` 持有并挂接（见下文） |
+| 实时核（Rust） | `core/crates/frame-ring` | 打开与核对、写帧；其中的读取方只供[假采集源](realtime-core.md#假采集源)与测试使用。实时核的采集线程是唯一的写方，见[采集主循环](realtime-core.md#采集主循环) |
 
 #### 读写规则
 
-单写者多读者的 seqlock。写方只有实时核一个：主进程同一时刻只把帧环挂接给一个实时核，实时核重启时等旧进程退出后再挂接新的。
+单写者多读者的 seqlock。写方只有实时核一个：主进程同一时刻只把帧环挂接给一个实时核，实时核重启时等旧进程退出后再挂接新的。主进程一侧的实现见下文“挂接”。
 
 - **写一帧**：把槽的 `seq` 置为下一个奇数（偶数加一，崩溃后遗留的奇数加二），随后一道释放栅栏；写槽头部其余字段与像素，像素去掉行尾的填充，槽的行跨度为 `width × 4`；把 `seq` 加一成为偶数（释放）；最后把 `write_seq` 置为该帧号（释放）。比最大尺寸大或本身不合规则（帧号为 0、宽或高为 0、行跨度小于 `width × 4`、像素不足）的帧不写，帧环不受影响。
 - **读最新一帧**：读 `write_seq`（获取）得到帧号，为 0 即还没有帧；读该帧槽的 `seq`（获取），为奇数即撕裂；复制槽头部，`frame_number` 不是所求帧号即撕裂；槽头部不合布局（尺寸超过最大值、行跨度小于 `width × 4` 或像素放不进槽、像素格式不是 BGRA8）时重读 `seq`，变了算撕裂，没变即报帧环损坏；复制像素，一道获取栅栏后重读 `seq`，与先前不等即撕裂。撕裂就从读 `write_seq` 起重试，有上限（主进程缺省 8 次），都撕裂时这次读取失败，稍后再读。
 - **帧号**：帧号 = 续写基数 + 采集源的帧号。挂接时续写基数取头部的 `write_seq`，所以实时核重启后帧号续写、不回退；采集源的帧号不再增大（新建了采集源，帧号从 1 重新数起）时，续写基数改为已写出的最大帧号。同一采集源相邻两帧的帧号之差减一仍是其间丢弃的帧数（[采集源接口](realtime-core.md#采集源接口)）。客户区原点与 DPI 不进帧环。
+
+**挂接。** 主进程一侧由 `CoreLink`（`runtime/src/game_runtime/core_link/`）实现：
+
+- **配置**：`CoreLinkOptions.capture` 是 `CaptureConfig`（`core_link/capture.py`）：`target` 为 `WindowRule`（`process_name` 加 `window_class` 或 `title`，都不能为空串）或只用于测试的假显示面（`FakeDisplay.target`）；另有帧环的最大尺寸（缺省 1920×1080）与槽数（缺省 3）。窗口比帧环大时帧写不进帧环，实时核记录错误。没有配置时不建帧环，也不设定采集目标。
+- **顺序**：第一次 `start` 创建帧环；每个实例收到 `core_start` 之后先发 `frame_ring.attach`，再发 `capture.set_target`，然后才开始发心跳。任一请求被拒绝即按停止顺序终止该实例，`start` 报 `CoreStartError`，帧环保留到 `stop`。
+- **单写方**：`CoreLink` 同一时刻只有一个实例，上一个实例的进程退出之后才能再 `start`，所以挂接新实例时旧的写方已不在。实时核崩溃或被杀时帧环保留，重启后挂接同一个帧环，帧号续写。
+- **读帧**：宿主代码经 `CoreLink.frames` 读帧、算帧龄；帧环归 `CoreLink` 所有，宿主不关闭它。插件经服务读帧等用到时再做。
+- **销毁**：`stop` 在实时核退出后销毁帧环，强制终止后仍未确认退出时保留。
 
 #### 内存序与平台假设
 
@@ -336,7 +350,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 
 - `name` 字段就是交给 `OpenFileMappingW` 或 `shm_open` 的字符串，不再加工。
 - Python 标准库的 `mmap` 与 `multiprocessing.shared_memory` 设不了安全属性，所以 Windows 上用 ctypes 创建，视图仍由 `mmap` 按名字打开，借它管理映射的生命期。POSIX 上不用 `multiprocessing.shared_memory`：它在 Python 3.12 里会把共享内存登记到另起的 resource tracker 进程。
-- 销毁由主进程负责，在实时核停止之后。主进程崩溃时，Windows 上对象随进程的句柄关闭而消失；POSIX 上名字留到重启，生产平台不受影响。
+- 销毁由主进程负责，在实时核停止之后（`CoreLink.stop`，见[读写规则](#读写规则)）。主进程崩溃时，Windows 上对象随进程的句柄关闭而消失；POSIX 上名字留到重启，生产平台不受影响。
 - 跨完整性级别（非提权主进程创建、提权实时核打开与写入）的可达性 PENDING，由 [GS-03](../plan/spikes.md) 验证。这些设置只减少暴露，同一用户下的恶意进程不在威胁模型内（Bellis D-12）。
 
 #### 帧龄
@@ -350,6 +364,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | Rust 单元 | 测试自建共享内存并写好头部：参数与头部逐项核对、共享内存缺失或太小、写读往返与去掉行尾填充、拒绝过大与不合规则的帧、帧号的空缺保留与重启续写及新采集源、崩溃遗留的奇数 `seq`、撕裂与损坏的槽、写方高速写读方并发读、假采集源 |
 | Python | 创建与命名、读的重试与放弃（`seq` 为奇数、拷贝期间 `seq` 变化、槽里是别的帧）、损坏的槽、帧龄、销毁、同名已存在、Windows 上的 DACL |
 | 互通 | pytest 编译并拉起 Rust 示例 `ring_interop`：Python 创建、Rust 写、Python 读，重启后帧号续写；头部与参数不符时 Rust 拒绝；Rust 高速写时 Python 并发读、Python 高速写假显示面时 Rust 的假采集源并发读，读到的帧都完整一致；合成游戏的帧经假采集源进入帧环 |
+| 经实时核 | 真实的 `realtime-core` 上的挂接、设定目标、错误码，以及 `CoreLink` 的挂接顺序、重启续写与销毁，见[画面采集](realtime-core.md#画面采集)一节的验证 |
 
 Windows 本机跑命名文件映射，Linux 容器跑 POSIX 共享内存。
 

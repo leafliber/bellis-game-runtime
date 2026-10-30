@@ -16,7 +16,7 @@
 | 在本机 Docker 的 Linux 容器里跑同一检查 | `uv run check --linux` |
 | 只跑 Python 测试 | `uv run pytest` |
 | 只跑 Rust 测试 | `cargo test --workspace` |
-| 只跑实时核的启动、生命线与心跳测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link` |
+| 只跑实时核的启动、生命线、心跳与采集主循环测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link` |
 | 格式化 | `uv run ruff format`；`cargo fmt --all` |
 | 改了 `core/crates/core-protocol` 后重新生成 `protocol/` 的生成物 | `uv run generate` |
 | 给某个 Python 包加依赖 | `uv add --package <发行名> <依赖>` |
@@ -24,11 +24,14 @@
 | 打开合成游戏的窗口 | `uv run synthetic-game` |
 | 改了合成游戏的台词后重新生成字体子集（要联网，见[字体](docs/modules/offline-tools.md#字体)） | `uv run python -m synthetic_game.font_subset` |
 | 采集的真机测试（需要 Windows 交互桌面，不在 `uv run check` 中） | `cargo test -p capture -- --ignored --nocapture` |
+| 合成游戏窗口经 `CoreLink`、实时核与 WGC 进入帧环的真机测试（需要 Windows 交互桌面，不在 `uv run check` 中；先关掉已打开的合成游戏窗口） | `uv run pytest -m manual runtime/tests/core_link/test_capture_window.py -s` |
 | GS-01 探测：列出可见的顶层窗口及其进程、类名与标题 | `cargo run --release -p capture --bin capture-probe -- --list` |
 | GS-01 探测：采一个窗口 N 秒，报告帧率、帧龄、丢帧、变换版本与黄色边框 | `cargo run --release -p capture --bin capture-probe -- --process <进程名> --title <标题> --seconds <N>` |
 | GS-01 探测：采自建的已知图案窗口，另报从重画到采集的时延 | `cargo run --release -p capture --bin capture-probe -- --pattern-window --animate` |
 
 探测程序另有 `--class <类名>`、`--keep-border`（保留黄色边框作对照）、`--min-update-interval-ms <N>`（会话的最小帧间隔）、`--borderless` 与 `--dpi-unaware`（图案窗口的样式）；`--help` 列出全部选项。
+
+pytest 缺省不选标 `manual` 的真机手动测试，命令行写 `-m manual` 才运行。
 
 `uv run check --linux` 首次运行要构建镜像。容器不写回仓库：虚拟环境、cargo target 与工具缓存放在每个检出目录各自的 `bellis-game-runtime-check-work-<路径摘要>` 卷里，uv 与 cargo 的下载缓存放在共用的 `bellis-game-runtime-check-uv-cache`、`bellis-game-runtime-check-cargo-registry` 卷里。这些卷都只是缓存，删掉只会让下次检查重新下载与编译；工作树删掉后它的卷会留下，用 `docker volume ls --filter name=bellis-game-runtime-check` 列出后 `docker volume rm` 清理。
 
