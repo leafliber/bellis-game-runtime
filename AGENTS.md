@@ -16,6 +16,7 @@
 | 在本机 Docker 的 Linux 容器里跑同一检查 | `uv run check --linux` |
 | 只跑 Python 测试 | `uv run pytest` |
 | 只跑 Rust 测试 | `cargo test --workspace` |
+| 只跑实时核的启动、生命线与心跳测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link` |
 | 格式化 | `uv run ruff format`；`cargo fmt --all` |
 | 改了 `core/crates/core-protocol` 后重新生成 `protocol/` 的生成物 | `uv run generate` |
 | 给某个 Python 包加依赖 | `uv add --package <发行名> <依赖>` |

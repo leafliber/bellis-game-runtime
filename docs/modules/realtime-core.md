@@ -20,10 +20,120 @@ Rust 写的独立进程，是游戏侧的安全核：采集画面与声音，并
 
 | 游戏是否提权 | 实时核的启动 |
 | --- | --- |
-| 不提权 | 主进程以 `subprocess.Popen` 拉起非提权子进程，停止顺序为 RPC → 关 stdin → 超时强制终止，Windows 上用 Job Object 管住孙进程（Bellis R-06） |
-| 提权 | 维护者一次性注册的计划任务（GR-06），见下文 |
+| 不提权 | 主进程以 `subprocess.Popen` 拉起非提权子进程，停止顺序为 RPC → 关 stdin → 超时强制终止，Windows 上用 Job Object 管住孙进程（Bellis R-06），见下文。G0 实现 |
+| 提权 | 维护者一次性注册的计划任务（GR-06），见下文。G2 或原神阶段实现 |
 
-**提权时的计划任务（GR-06）。**
+两种启动之后的生命线、控制状态与释放相同。主进程一侧的代码在 `runtime/src/game_runtime/core_link/`，实时核一侧在 `core/crates/realtime-core`。
+
+### 非提权子进程
+
+主进程的 `CoreLink` 每次 `start` 都拉起一个新的实时核实例，与 Bellis `startSidecar` 的做法相同：
+
+1. 以 `session_credentials` 生成本实例的会话地址与密钥，在 `bellis-channel/1` 上开服务端监听。每个实例的凭据都是新的，被杀或已退出的旧实例连不上。
+2. 以 `subprocess.Popen` 和参数列表拉起 `realtime-core`：不经 shell，不用 `DETACHED_PROCESS`、`CREATE_BREAKAWAY_FROM_JOB` 或 `start_new_session`；stdin 是管道，stdout 与 stderr 继承主进程。
+3. 环境变量按 Bellis 的 `baseEnvironment` 只取系统必需的（Windows 的 `SYSTEMROOT`、`PATH` 等，POSIX 的 `HOME`、`PATH` 等），其余不继承；凭据按 Bellis 的 `ChildEnv` 放在 `BELLIS_CHANNEL_PATH`（地址）、`BELLIS_CHANNEL_KEY`（base64url 密钥）与 `BELLIS_ROLE`（角色，固定为 `game-runtime.core`）里。时限经命令行参数 `--heartbeat-timeout-ms`、`--health-interval-ms` 给出。
+4. Windows 上以 `CREATE_SUSPENDED` 创建，放进 Job Object 并交出 job 句柄之后才恢复运行，见下文。
+5. 实时核连上后发 `core.hello`；主进程只接受角色为 `game-runtime.core` 的第一个连接，核对协议版本，不相等即以 -32001 回错并断开。收到 `input.released(core_start)` 才算就绪，此后开始发心跳。从拉起到就绪超过 `start_timeout` 或实例在就绪前退出，即按停止顺序终止它并报 `CoreStartError`。
+
+实例退出后宿主可以再 `start`，即重启。是否自动重启、退避多久：unsupported，由宿主决定，见[失效与释放](../architecture.md#失效与释放)中的“实时核崩溃”。
+
+### Job Object
+
+job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时，系统终止 job 里剩下的进程。这样做既能管住孙进程，又不会在主进程崩溃时立即杀掉实时核：
+
+- **先进 job 再运行。** 实时核以 `CREATE_SUSPENDED` 创建，主进程把它放进 job、交出句柄后，在线程快照里找到它唯一的初始线程恢复运行。它在进 job 之前做不了任何事，拉起的孙进程也一定在 job 里。`subprocess.Popen` 不保留线程句柄，所以按进程号找线程。
+- **job 句柄交给实时核一份。** 主进程以 `DuplicateHandle` 把 job 句柄复制进实时核（只有 `JOB_OBJECT_QUERY` 权限，不可继承）。实时核不知道也不使用这个句柄，只是持有它到退出。主进程崩溃时系统关闭主进程的句柄，但实时核持有的那份让 job 不关闭；实时核按生命线释放全部输入后退出，最后一个句柄随之关闭，job 终止残留的孙进程。被杀的实时核发不出按键抬起，所以“主进程崩溃”时实时核是唯一的释放者，不能随主进程一起被杀。
+- **强制终止整个 job。** 停止顺序的最后一步以 `TerminateJobObject` 终止实时核连同孙进程。实时核自行退出后，job 里若还有进程（孙进程），主进程终止它们再关闭自己的句柄。
+
+实测（Windows 11）：
+- 不复制句柄时，主进程关闭它的 job 句柄的一刻实时核即被终止；复制之后实时核照常运行，主进程被杀后按生命线释放并以 0 退出。由 `test_link.py` 的主进程被杀测试核对。
+- 因 `KILL_ON_JOB_CLOSE` 被终止的进程退出码为 0，与正常退出无法区分。主进程在实时核运行期间始终持有自己的句柄，所以它观察到的实时核不会以这种方式结束。
+- 以 `uv run` 或虚拟环境的 `python.exe` 运行的主进程自己在启动器的 job 里，这个 job 设了 `KILL_ON_JOB_CLOSE` 与 `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`：主进程拉起的进程静默脱离它，启动器退出不会连带杀掉实时核。主进程的启动方式不得把实时核放进会随主进程退出而关闭、又不允许脱离的 job。
+
+其它平台没有 Job Object，不收拾孙进程（unsupported）；实时核本身不拉起子进程。
+
+### 停止
+
+主进程的停止顺序：先停插件内核，控制产出者走完 [QUIESCING](plugin-kernel.md#控制产出者)；再按 Bellis R-06 停实时核（`shutdown_runtime`）。每一步的时限可配置（`StopTimeouts`），实时核在哪一步退出记日志：
+
+| 步 | 做法 | 缺省时限 | 实时核 |
+| --- | --- | --- | --- |
+| 1. RPC | `core.stop` | 2 秒，从发出请求到退出 | 释放全部输入，发 `input.released(stop)`，回应写出后以 0 退出 |
+| 2. 关 stdin | 关闭 stdin 管道 | 2 秒 | 读到 EOF，释放后以 0 退出 |
+| 3. 强制终止 | Windows 上 `TerminateJobObject`，其它平台 `SIGKILL` | 5 秒，只作上报的界限 | 被终止，不释放 |
+
+第 1、2 步的时限取 Bellis `ManagedProcess` 的缺省值；实时核的释放与回应在毫秒内完成，2 秒是给卡住的实时核留的余量。请求失败（连接已断、超时、对端报错）不影响后续步骤。
+
+### 生命线与 panic
+
+实时核在以下任一情形释放全部输入后退出，原因写进 stderr 的日志：
+
+| 情形 | 通知主进程 | 退出码 |
+| --- | --- | --- |
+| 收到 `core.stop` | `input.released(stop)`，回应写出后才退出 | 0 |
+| 核连接断开 | 无法通知 | 0 |
+| stdin 读到 EOF 或读取失败（主进程要求停止或已退出） | 不发：原因集合中没有对应的一项，随即退出 | 0 |
+
+- 断开与 EOF 都由阻塞读立即发现，不需要计时；主进程卡死而连接未断时由心跳超时释放并待命，不退出。
+- 退出码 0 只在释放之后出现；连不上主进程或握手失败为 1，参数不合法为 2。
+- **panic 即退出。** 标准库在非主线程 panic 时只结束那个线程，读线程或看门狗的 panic 会被吞掉。实时核启动时装 panic 钩子：照常打印 panic 信息后以 101 退出整个进程。钩子里不释放输入，panic 时的状态不可信；重启后先释放（`core_start`）。
+- **提权时**（计划任务启动）没有 stdin 管道，stdin 生命线须能关闭：unsupported，随 GR-06 实现。
+
+### 控制状态与心跳
+
+规则见[消息集](core-protocol.md#消息集)中的“控制产出者”；这里只写实现，时刻读的时钟见[时钟](#时钟)：
+
+- 实时核记当前产出者（身份、代次、上一个算数的 `seq`、心跳截止时刻）、已作废的最高代次与持有输入的账目，放在一把锁里。
+- 心跳由主进程的 `CoreLink` 发：当前提交资格（`kernel.active_control`）有效时每个周期发一次，身份取 `ControlGrant.producer`（条目 id），代次取 `ControlGrant.generation`，`seq` 在主进程运行期间全局递增，因而在每个代次内严格递增。资格收回（进入 QUIESCING）即停发。
+- 实时核的心跳看门狗等到截止时刻即释放（`heartbeat_timeout`）并待命：产出者仍是当前的，同一代次 `seq` 递增的心跳到达后重新计时。
+- **启动的顺序。** 每次启动先释放全部输入，再连接主进程；握手完成、`input.released(core_start)` 发出之后才启动处理产出者消息的读线程，所以 `core_start` 一定先于任何因产出者消息而发的通知。
+- 实时核每次启动都没有当前产出者与已作废的代次；代次由主进程的插件内核分配，在主进程运行期间单调递增，所以也满足“在一个实时核的生命期内严格递增”。
+
+主进程以 `core.health` 判断实时核存活：`CoreLink` 记下最近一条与收到的时刻，超过 `health_timeout` 没有新的即记录告警；实时核退出或连接断开另有进程退出与连接关闭的事件。
+
+### 释放
+
+释放是唯一的安全路径。持有输入的账目与“释放全部输入”是实时核内部的一个接口（`InputLedger::release_all`）：任何失效都在控制状态的锁内调用它，释放完成后才读释放时刻、才在锁外发 `input.released`；释放不依赖核连接，写失败也已经释放。这一步还没有输入后端（unsupported），没有任何路径向账目加入输入，账目总是空的，释放只是清空，`core.health` 的 `inputs_held` 因而总是 `false`。第 8 步在这里接假输入后端与动作块，G2 接 SendInput 与持键核验。
+
+`CoreControl` 的实现（`CoreLink`）：`invalidate_generation` 发 `producer.revoke` 并在请求写出后返回；`wait_released` 按以下任一事件完成，等待跨实例保留：
+
+- `producer.revoke` 的回应：该代次及更早代次的输入已释放；
+- 新实例的 `input.released(core_start)`：此前的等待全部完成；
+- 实例以 0 退出：实时核只在释放后以 0 退出；此后没有实例在运行时，新的等待也立即完成。
+
+实例被强制终止或崩溃（退出码非 0）时没有进程发出按键抬起，等待保留到下一个实例的 `core_start`，插件内核在此期间保持 QUIESCING（`release-timeout`）。
+
+### 线程
+
+实时核用标准线程加阻塞 IO，不用异步运行时：
+
+| 线程 | 做什么 |
+| --- | --- |
+| 主线程 | 释放、连接、握手、发 `core_start`，启动其余线程，然后等会话结束 |
+| `RpcPeer` 读线程 | `producer.heartbeat`、`producer.revoke`、`core.stop` 的处理函数：只动控制状态并发通知，很快返回，不向主进程发请求 |
+| 心跳看门狗 | 等到截止时刻即释放 |
+| 健康 | 握手后立即发一次 `core.health`，之后按周期发 |
+| 两条生命线 | 一个等核连接关闭，一个读 stdin 直到 EOF |
+
+`core.stop` 以 `Handlers::request_then` 登记（见[错误处理](core-protocol.md#错误处理)）：回应写出之后才通知主线程结束会话，否则退出会丢掉回应。日志写 stderr，写失败丢弃，不 panic。
+
+### 时限
+
+| 项 | 缺省值 | 在哪里配置 | 依据 |
+| --- | --- | --- | --- |
+| 心跳周期 | 100 ms | `CoreLinkOptions.heartbeat_interval` | 主进程的事件循环被 GC 或同步代码占住几十毫秒不算异常；Windows 的计时精度约 15.6 ms |
+| 心跳超时 | 500 ms | `CoreLinkOptions.heartbeat_timeout`，经命令行交给实时核 | 连续丢失约 5 次才超时；主进程卡死后输入最多多保持约 0.5 秒，动作块自己的截止时刻通常更短；误判只会多一次释放 |
+| `core.health` 周期 | 1 秒 | `CoreLinkOptions.health_interval`，经命令行交给实时核 | 只用于诊断与判断卡死；实时核退出由进程退出与连接关闭立即发现 |
+| `core.health` 超时 | 3 秒 | `CoreLinkOptions.health_timeout` | 连续丢失 3 条 |
+| 启动 | 10 秒 | `CoreLinkOptions.start_timeout` | 含连接的握手（2 秒）与 `core.hello`（2 秒）；新编译的程序首次运行可能被杀毒软件扫描几秒 |
+| `producer.revoke` 的请求 | 2 秒 | `CoreLinkOptions.rpc_timeout` | 超时只记录，等待由其它事件完成；内核另有 `release_timeout` |
+| `core.hello` 的回应 | 2 秒 | 实时核内的常量 | 与通道握手的缺省时限相同 |
+| 停止各步 | 2、2、5 秒 | `CoreLinkOptions.stop` | 见上文“停止” |
+
+这些取值只在测试与假后端上跑过；真实输入下的表现（误判的频率、主进程卡死到释放的时延）在 G2 实测，PENDING。
+
+### 提权时的计划任务（GR-06）
+
 - 任务“以最高权限运行”：只按需启动、无触发器、交互令牌，重复启动时忽略新实例。
 - 参照 Bellis R-26，以 `subprocess.Popen`（参数列表，不经 shell）调 `schtasks.exe /Create /XML` 注册；任务 XML 由代码生成，注册后以 `/Query /XML` 读回核对。注册由维护者本人执行。
 - 主进程先把本次的连接信息写入 SecretStore，再以 `schtasks /Run` 触发；实时核自行读取主进程与 Bellis 的连接信息（Bellis R-23）。
@@ -31,7 +141,17 @@ Rust 写的独立进程，是游戏侧的安全核：采集画面与声音，并
 - 实时核程序与配置放在只有管理员能写的目录（由一次提权的安装步骤放入），防止主进程内的代码替换后借任务提权。这道防护只防程序与配置被替换；威胁模型同 Bellis D-12，不防同一用户下的恶意进程：它可以触发任务、写 SecretStore 并连上实时核，但没有 Bellis 经控制连接发给实时核的输入许可就发不出任何输入，独立运行的测试许可只在测试中使用。
 - 可行性由 [GS-03](../plan/spikes.md) 验证。
 
-**生命线。** 实时核以与主进程的核连接为生命线，断开超时即释放全部输入后退出。panic 即退出；每次启动先释放全部输入，再接受动作。
+### 验证
+
+`uv run check` 中运行，Windows 上走命名管道，Linux 容器里走 UDS：
+
+| 测试 | 内容 |
+| --- | --- |
+| `realtime-core` 的单元测试 | 控制状态的每条规则（`seq`、旧代次与已作废代次、身份不同、更高代次、作废、超时待命、停止）；实时的看门狗；参数与凭据的解析 |
+| `realtime-core/tests/panic_exit.rs` | 工作线程 panic 使进程以 101 退出 |
+| `runtime/tests/core_link/test_core.py` | 测试扮演主进程拉起真实的实时核：`core_start` 先于产出者消息；版本不符时退出；`core.stop` 先释放再回应、以 0 退出；断开连接、stdin EOF 后释放并以 0 退出；心跳超时、`seq` 不递增、旧代次与已作废代次、更高代次、`producer.revoke` 在释放后回应；时钟 |
+| `runtime/tests/core_link/test_link.py` | `CoreLink` 启动与停止；与插件内核联调的 QUIESCING 与停止顺序；杀掉实时核后重启，新实例的 `core_start` 使等待完成；干净退出后等待完成；真的杀掉主进程（Windows 上先单独关闭主进程的 job 句柄）后实时核按生命线释放并以 0 退出 |
+| `runtime/tests/core_link/test_process.py` | 替身子进程：RPC 不应答时退到关 stdin，不理 stdin 时强制终止；Windows 上孙进程在 job 里并在停止后不残留 |
 
 ## 画面采集
 
@@ -71,7 +191,17 @@ Rust 写的独立进程，是游戏侧的安全核：采集画面与声音，并
 
 ### 时钟
 
-采集时刻取 WGC 帧的 `SystemRelativeTime`。它是 QPC 换算成的 100 ns 单位，采集时刻 = `SystemRelativeTime × 100` 纳秒。主进程在 Windows 上用 `time.perf_counter_ns()`，即 QPC 刻度按 `刻度 × 10⁹ / 频率` 向下取整；实时核读现在的时刻用同一换算，不用 `std::time::Instant`。
+实时核与主进程读同一个单调时钟，核协议中以 `_ns` 结尾的时刻、帧环的采集时刻与 `core.health.now_ns` 都是它的纳秒读数。主进程读 `time.perf_counter_ns()`；实时核读 `mono-clock` crate 的 `now_ns()`，不用 `std::time::Instant`：
+
+| 平台 | `perf_counter_ns` | `now_ns` |
+| --- | --- | --- |
+| Windows | QPC 刻度按 `刻度 × 10⁹ / 频率` 向下取整 | 同一换算（`qpc_ticks_to_ns`） |
+| Linux | `CLOCK_MONOTONIC`（Python 3.12） | `clock_gettime(CLOCK_MONOTONIC)` |
+| 其它 | 别的时钟（macOS 上是 `mach_absolute_time`） | 不支持，编译即报错 |
+
+两边读同一时钟由测试实测核对，Windows（命名管道）与 Linux 容器（UDS）上都通过：实时核收到握手回应之后才发第一条 `core.health`，它的 `now_ns` 落在主进程回应之前与收到它之间；`producer.revoke` 的释放时刻落在主进程发请求前与收到回应后的两次读数之间。
+
+采集时刻取 WGC 帧的 `SystemRelativeTime`。它是 QPC 换算成的 100 ns 单位，采集时刻 = `SystemRelativeTime × 100` 纳秒。
 
 - **换算误差。** QPC 频率为 10 MHz（Windows 10 起常见）时，100 ns 单位就是 QPC 刻度，两边相等，误差为 0。其它频率下两边各自取整，误差的绝对值不超过 100 ns。
 - **采集时刻的含义。** 实测采集时刻可能晚于帧交给调用方的时刻几毫秒，推测是 DWM 合成的目标显示时刻（PENDING 核实）。所以“现在 − 采集时刻”可能为负，用帧龄的地方把负值按 0 处理。

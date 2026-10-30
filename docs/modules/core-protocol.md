@@ -78,7 +78,7 @@
 | 对端请求未知方法、消息不合法、处理函数抛出 RpcError、其它异常 | 依次回 MethodNotFound、InvalidRequest（id 为 null）、原样的错误、InternalError（不外泄细节）；应答超过帧长上限时改回 InternalError |
 | 连接关闭 | 未完成的请求报 `closed`；Python 中正在处理的请求被取消 |
 
-RPC 的处理函数：Python 中每个请求在自己的任务里处理，收到 `rpc.cancel` 时取消它且不再应答；Rust 中处理函数在读线程上同步执行，须很快返回，也不能在里面向同一对端发请求，`rpc.cancel` 到达时处理早已结束，所以忽略它。
+RPC 的处理函数：Python 中每个请求在自己的任务里处理，收到 `rpc.cancel` 时取消它且不再应答；Rust 中处理函数在读线程上同步执行，须很快返回，也不能在里面向同一对端发请求，`rpc.cancel` 到达时处理早已结束，所以忽略它。Rust 中需要先应答再收尾的请求以 `Handlers::request_then` 登记：应答写出之后（写失败也算）才在读线程上调用收尾函数，例如收到 `core.stop` 后退出进程，对应 Bellis `handleShutdown` 在下一轮事件循环才收尾的做法。
 
 ### 与 Bellis 实现的出入
 
@@ -127,7 +127,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - 方法名为“对象.动作”。有 result 的方法是请求，没有的是通知。params 一律是对象，不带参数的方法也发 `{}`。
 - 结构体拒绝未知字段，缺少必需字段即拒绝；可以为空的字段显式写 `null`。整数的范围按其 Rust 类型（`u16`、`u32`、`u64`、`i32`），越界即拒绝。
 - 联合类型统一以 `type` 字段为内部标签，每个分支是一个具名结构体，Rust 与 Python 用同一名字。
-- 以 `_ns` 结尾的时刻字段是实时核单调时钟的纳秒读数，与帧环的采集时刻同一时钟（Windows 上由 QPC 换算）；`offset_ns` 是相对起始时刻的纳秒数。主进程读取同一时钟的方式在实现动作块时确定并实测（PENDING）。
+- 以 `_ns` 结尾的时刻字段是实时核单调时钟的纳秒读数，与帧环的采集时刻同一时钟；`offset_ns` 是相对起始时刻的纳秒数。主进程以 `time.perf_counter_ns()` 读同一时钟（Windows 上是 QPC，Linux 上是 `CLOCK_MONOTONIC`），已在 Windows 与 Linux 上实测核对，见[时钟](realtime-core.md#时钟)。
 - 方法名到 params 与 result 类型的对应只有一处源：Rust 的 `core_protocol::methods`。它导出到 Schema 的 `x-methods`（每个方法的方向与 params、result 的 `$ref`，通知的 `result` 为 `null`），再生成为 Python 的 `core_protocol.methods`。
 - 错误用 JSON-RPC 2.0 的标准错误码（解析失败、无效请求、方法不存在、参数无效），另有两个自定义错误码：
 
@@ -139,12 +139,13 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 ### 会话
 
 1. 实时核通过通道认证后先发 `core.hello`；主进程核对协议版本，不相等即以 -32001 回错并断开。握手完成前双方不发其它消息。
-2. 主进程发 `frame_ring.attach` 与 `capture.set_target`；实时核此后定期发 `core.health`。
-3. 当前控制产出者定期发 `producer.heartbeat`，以 `action.submit` 提交动作块；实时核以 `action.receipt` 报一次性动作的结果，每次释放全部输入后发 `input.released`。
-4. 更换控制产出者（[QUIESCING](plugin-kernel.md#生命周期)）：停止提交动作块 → `producer.revoke`，等到它的回应，即输入已释放的确认 → 撤销注册。
-5. 正常停止：主进程发 `core.stop`；实时核释放全部输入，发 `input.released`，回应后退出。这是 Bellis R-06 停止顺序中的 RPC 一步。
+2. 实时核随即发 `input.released(core_start)`（启动时已先释放全部输入），之后才处理任何产出者消息；主进程收到它才算实时核就绪。实时核立即发第一条 `core.health`，此后按周期发。
+3. 主进程发 `frame_ring.attach` 与 `capture.set_target`。
+4. 当前控制产出者定期发 `producer.heartbeat`，以 `action.submit` 提交动作块；实时核以 `action.receipt` 报一次性动作的结果，每次释放全部输入后发 `input.released`。
+5. 更换控制产出者（[QUIESCING](plugin-kernel.md#生命周期)）：停止提交动作块 → `producer.revoke`，等到它的回应，即输入已释放的确认 → 撤销注册。
+6. 正常停止：主进程发 `core.stop`；实时核释放全部输入，发 `input.released`，回应写出后退出。这是 Bellis R-06 停止顺序中的 RPC 一步。
 
-`core.health` 的周期与心跳超时的取值在实现生命线时确定（PENDING）。
+心跳周期 100 ms、心跳超时 500 ms，`core.health` 周期 1 秒、主进程判定失联 3 秒，都可配置；依据与真实输入下的实测（PENDING，G2）见[时限](realtime-core.md#时限)。
 
 ### 消息集
 
@@ -189,9 +190,9 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 **控制产出者**：`Producer` 由身份 `id` 与代次 `generation` 组成。代次由主进程分配，在一个实时核的生命期内严格递增；实时核记住当前代次与已作废的最高代次。
 
 - 心跳或动作块的代次不大于已作废的代次，或小于当前代次：拒绝。代次等于当前代次而身份不同：拒绝。
-- 代次大于当前代次：先释放全部输入（`producer_changed`），再以它为当前代次。
-- `producer.heartbeat` 的 `seq` 在同一代次内严格递增，不递增的心跳不算数；心跳超时即释放全部输入（`heartbeat_timeout`）。
-- `producer.revoke` 作废 `generation` 及更早的全部代次，之后这些代次的心跳与动作块都被拒绝；当前代次在其中时先释放全部输入（`generation_revoked`）。实时核在释放完成后才回应，回应即这些代次的输入已释放的确认。
+- 代次大于当前代次：先释放全部输入（`producer_changed`），再以它为当前代次。没有当前产出者时（启动后、当前代次被作废后）直接以它为当前代次，不需要释放。
+- `producer.heartbeat` 的 `seq` 在同一代次内严格递增，不递增的心跳不算数；新代次的 `seq` 从它的第一次心跳算起。心跳超时即释放全部输入（`heartbeat_timeout`）并待命：产出者仍是当前的，同一代次 `seq` 递增的心跳到达后重新计时。
+- `producer.revoke` 作废 `generation` 及更早的全部代次，之后这些代次的心跳与动作块都被拒绝；当前代次在其中时先释放全部输入（`generation_revoked`），此后没有当前产出者。实时核在释放完成后才回应，回应即这些代次的输入已释放的确认。
 
 **`action.submit`** 的 params 见[动作块](#动作块)。result 是联合类型 `ActionSubmitResult`：
 
@@ -208,7 +209,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `executed`（`Executed`） | `id`、`at_ns` | 已交给输入后端及其时刻；不代表游戏中的效果已发生 |
 | `dropped`（`Dropped`） | `id`、`reason` | 没有执行：`superseded`（新的动作块已取代本块未执行的部分）、`duplicate`（同一身份在本代次已执行过）、`released`（到时实时核已释放输入） |
 
-**`input.released`**：实时核每次释放全部输入后发出，不论释放前是否持有输入。
+**`input.released`**：实时核每次释放全部输入后发出，不论释放前是否持有输入。按生命线释放时不发：核连接断开时已无法发出；stdin 读到 EOF 时原因集合中没有对应的一项，实时核随即以 0 退出（[生命线与 panic](realtime-core.md#生命线与-panic)）。
 
 | 字段 | 含义 |
 | --- | --- |
