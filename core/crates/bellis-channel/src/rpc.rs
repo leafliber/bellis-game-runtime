@@ -303,12 +303,13 @@ fn failure_envelope(id: Option<&RpcId>, error: &RpcError) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 type RequestHandler = Box<dyn Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync>;
+type AfterReply = Box<dyn Fn() + Send + Sync>;
 type NotificationHandler = Box<dyn Fn(&Map<String, Value>) + Send + Sync>;
 
 /// 处理函数表，在启动对端前登记。
 #[derive(Default)]
 pub struct Handlers {
-    requests: HashMap<String, RequestHandler>,
+    requests: HashMap<String, (RequestHandler, Option<AfterReply>)>,
     notifications: HashMap<String, NotificationHandler>,
 }
 
@@ -335,7 +336,31 @@ impl Handlers {
         handler: impl Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync + 'static,
     ) -> Self {
         check_method(method, self.requests.contains_key(method));
-        self.requests.insert(method.to_owned(), Box::new(handler));
+        self.requests
+            .insert(method.to_owned(), (Box::new(handler), None));
+        self
+    }
+
+    /// 同 `request`，另在应答写出之后（写出失败也算）在读线程上调用 `after_reply`。
+    ///
+    /// 用于先应答、再收尾的请求，例如收到停止请求后退出进程：处理函数返回时应答还没有写出，
+    /// 这时退出会丢掉应答。对应 Bellis `handleShutdown` 在下一轮事件循环才收尾的做法。
+    ///
+    /// # Panics
+    ///
+    /// 方法名以 `rpc.` 开头或已登记时 panic。
+    #[must_use]
+    pub fn request_then(
+        mut self,
+        method: &str,
+        handler: impl Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync + 'static,
+        after_reply: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        check_method(method, self.requests.contains_key(method));
+        self.requests.insert(
+            method.to_owned(),
+            (Box::new(handler), Some(Box::new(after_reply))),
+        );
         self
     }
 
@@ -646,7 +671,7 @@ impl Shared {
             return;
         };
         let method = request["method"].as_str().unwrap_or_default();
-        let Some(handler) = handlers.requests.get(method) else {
+        let Some((handler, after_reply)) = handlers.requests.get(method) else {
             self.reply(&failure_envelope(
                 Some(&id),
                 &RpcError::new(
@@ -669,6 +694,9 @@ impl Shared {
                 }
             }
             Err(error) => self.reply(&failure_envelope(Some(&id), &error)),
+        }
+        if let Some(after_reply) = after_reply {
+            after_reply();
         }
     }
 
