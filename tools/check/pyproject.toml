@@ -1,0 +1,16 @@
+[project]
+name = "bellis-game-runtime-check"
+version = "0.0.0"
+description = "统一检查入口：uv run check 与 uv run check --linux"
+requires-python = "==3.12.*"
+dependencies = []
+
+[project.scripts]
+check = "game_runtime_check:main"
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "game_runtime_check"
