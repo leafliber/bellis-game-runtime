@@ -2,15 +2,16 @@
 //!
 //! 规则见 `docs/modules/core-protocol.md` 的“控制产出者”。每个改变状态的操作都在锁内先完成释放，
 //! 再把 `input.released` 的内容交给调用方，由调用方在锁外发出：释放从不等待写入，写失败也已释放。
+//! 释放也不碰采集一侧（[`FrameStatus`] 的锁与采集线程），见 `frames` 模块。
 
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use core_protocol::messages::{
-    CaptureState, CoreHealthParams, InputReleasedParams, Producer, ProducerHeartbeatParams,
-    ReleaseReason,
+    CoreHealthParams, InputReleasedParams, Producer, ProducerHeartbeatParams, ReleaseReason,
 };
 
+use crate::frames::FrameStatus;
 use crate::ledger::InputLedger;
 
 /// 心跳不算数的原因。
@@ -69,14 +70,18 @@ pub(crate) struct Control {
     heartbeat_timeout: Duration,
     state: Mutex<State>,
     changed: Condvar,
+    /// 采集状态与本实例最近写进帧环的一帧（帧号与采集时刻），由采集线程更新。它是“帧未超过动作允许的
+    /// 年龄”的依据；需要在控制状态的锁内读它时，锁序是先控制状态、后它，采集线程只拿它的锁。
+    frames: Arc<FrameStatus>,
 }
 
 impl Control {
-    pub(crate) fn new(heartbeat_timeout: Duration) -> Self {
+    pub(crate) fn new(heartbeat_timeout: Duration, frames: Arc<FrameStatus>) -> Self {
         Self {
             heartbeat_timeout,
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
+            frames,
         }
     }
 
@@ -199,15 +204,17 @@ impl Control {
         self.changed.notify_all();
     }
 
-    /// `core.health` 的内容。
+    /// `core.health` 的内容。先读时刻再读状态：`now_ns` 不早于某个时刻的一条，其中的状态也不早于那个时刻。
     pub(crate) fn health(&self) -> CoreHealthParams {
+        let now_ns = mono_clock::now_ns();
+        let (capture, latest_frame) = self.frames.snapshot();
         let state = self.lock();
         CoreHealthParams {
-            now_ns: mono_clock::now_ns(),
-            // 帧环与采集在第 7 步接入，此前总是没有挂接。
-            capture: CaptureState::Idle,
+            now_ns,
+            capture,
             inputs_held: !state.ledger.is_empty(),
             producer: state.current_producer(),
+            latest_frame,
         }
     }
 
@@ -266,6 +273,7 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::{Control, Rejection};
+    use crate::frames::FrameStatus;
     use core_protocol::messages::{
         InputReleasedParams, Producer, ProducerHeartbeatParams, ReleaseReason,
     };
@@ -296,7 +304,7 @@ mod tests {
 
     #[test]
     fn start_releases_without_a_producer() {
-        let control = Control::new(TIMEOUT);
+        let control = Control::new(TIMEOUT, Arc::default());
         let released = control.release_on_start();
         assert_eq!(released.reason, ReleaseReason::CoreStart);
         assert_eq!(released.producer, None);
@@ -308,7 +316,7 @@ mod tests {
 
     #[test]
     fn first_heartbeat_sets_the_producer_without_releasing() {
-        let control = Control::new(TIMEOUT);
+        let control = Control::new(TIMEOUT, Arc::default());
         let now = Instant::now();
         assert_eq!(control.heartbeat(&beat("a", 1, 7), now), Ok(None));
         assert_eq!(control.health().producer, Some(producer("a", 1)));
@@ -316,7 +324,7 @@ mod tests {
 
     #[test]
     fn seq_must_increase_within_a_generation() {
-        let control = Control::new(TIMEOUT);
+        let control = Control::new(TIMEOUT, Arc::default());
         let t0 = Instant::now();
         assert_eq!(control.heartbeat(&beat("a", 1, 5), t0), Ok(None));
         for stale in [5, 4, 0] {
@@ -340,7 +348,7 @@ mod tests {
 
     #[test]
     fn heartbeat_timeout_releases_once_and_stands_by() {
-        let control = Control::new(TIMEOUT);
+        let control = Control::new(TIMEOUT, Arc::default());
         let t0 = Instant::now();
         control.heartbeat(&beat("a", 3, 1), t0).unwrap();
         assert_eq!(
@@ -357,7 +365,7 @@ mod tests {
 
     #[test]
     fn old_generations_and_other_identities_are_rejected() {
-        let control = Control::new(TIMEOUT);
+        let control = Control::new(TIMEOUT, Arc::default());
         let now = Instant::now();
         control.heartbeat(&beat("a", 2, 1), now).unwrap();
         assert_eq!(
@@ -373,7 +381,7 @@ mod tests {
 
     #[test]
     fn higher_generation_releases_before_switching() {
-        let control = Control::new(TIMEOUT);
+        let control = Control::new(TIMEOUT, Arc::default());
         let now = Instant::now();
         control.heartbeat(&beat("a", 1, 10), now).unwrap();
         let released = control.heartbeat(&beat("b", 2, 1), now).unwrap();
@@ -388,7 +396,7 @@ mod tests {
 
     #[test]
     fn revoke_releases_the_current_generation_and_blocks_it() {
-        let control = Control::new(TIMEOUT);
+        let control = Control::new(TIMEOUT, Arc::default());
         let now = Instant::now();
         control.heartbeat(&beat("a", 4, 1), now).unwrap();
         // 作废更早的代次不影响当前产出者。
@@ -429,7 +437,7 @@ mod tests {
 
     #[test]
     fn stop_releases_and_refuses_producers() {
-        let control = Control::new(TIMEOUT);
+        let control = Control::new(TIMEOUT, Arc::default());
         let now = Instant::now();
         control.heartbeat(&beat("a", 1, 1), now).unwrap();
         let released = control.stop();
@@ -445,7 +453,7 @@ mod tests {
     #[test]
     fn watchdog_releases_in_real_time_and_stops() {
         let timeout = Duration::from_millis(50);
-        let control = Arc::new(Control::new(timeout));
+        let control = Arc::new(Control::new(timeout, Arc::default()));
         let (sender, released) = mpsc::channel();
         let watchdog = thread::spawn({
             let control = Arc::clone(&control);
@@ -459,5 +467,46 @@ mod tests {
         control.release_on_exit();
         watchdog.join().unwrap();
         assert!(released.try_recv().is_err());
+    }
+
+    #[test]
+    fn releasing_never_waits_for_the_capture_side() {
+        let frames = Arc::new(FrameStatus::default());
+        let control = Arc::new(Control::new(TIMEOUT, Arc::clone(&frames)));
+        // 采集一侧一直占着它的锁：每条释放的路径照样完成。
+        let held = frames.hold();
+        let (done, finished) = mpsc::channel();
+        let releaser = thread::spawn({
+            let control = Arc::clone(&control);
+            move || {
+                let now = Instant::now();
+                let mut reasons = vec![control.release_on_start().reason];
+                control.heartbeat(&beat("a", 1, 1), now).unwrap();
+                reasons.extend(
+                    control
+                        .heartbeat(&beat("b", 2, 1), now)
+                        .unwrap()
+                        .map(|r| r.reason),
+                );
+                reasons.extend(control.expire(now + TIMEOUT).map(|r| r.reason));
+                reasons.extend(control.revoke(2).map(|r| r.reason));
+                reasons.push(control.stop().reason);
+                control.release_on_exit();
+                done.send(reasons).unwrap();
+            }
+        });
+        let reasons = finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            reasons,
+            [
+                ReleaseReason::CoreStart,
+                ReleaseReason::ProducerChanged,
+                ReleaseReason::HeartbeatTimeout,
+                ReleaseReason::GenerationRevoked,
+                ReleaseReason::Stop,
+            ]
+        );
+        drop(held);
+        releaser.join().unwrap();
     }
 }

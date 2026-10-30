@@ -4,9 +4,6 @@
 //! stdin 是生命线。退出码：0 表示释放全部输入后正常结束（`core.stop`、核连接断开或 stdin EOF），
 //! 1 表示没能建立会话，2 表示参数不合法，101 表示 panic。
 
-#[cfg(windows)]
-mod dpi;
-
 use std::fmt;
 use std::io::{self, Write as _};
 use std::process::ExitCode;
@@ -21,9 +18,9 @@ fn say(message: fmt::Arguments<'_>) {
 
 fn main() -> ExitCode {
     install_panic_exit();
-    // 坐标一律用物理像素，须在创建任何窗口或读取任何坐标之前声明（画面采集）。
+    // 坐标一律用物理像素，须在创建任何窗口或读取任何坐标之前声明（画面采集）。采集线程继承进程的声明。
     #[cfg(windows)]
-    if let Err(error) = dpi::declare_per_monitor_aware_v2() {
+    if let Err(error) = capture::win::dpi::declare_per_monitor_aware_v2() {
         say(format_args!(
             "failed to declare per-monitor DPI awareness v2: {error}"
         ));

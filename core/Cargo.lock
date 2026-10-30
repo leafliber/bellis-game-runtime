@@ -219,11 +219,12 @@ name = "realtime-core"
 version = "0.0.0"
 dependencies = [
  "bellis-channel",
+ "capture",
  "core-protocol",
+ "frame-ring",
  "mono-clock",
  "serde",
  "serde_json",
- "windows",
 ]
 
 [[package]]

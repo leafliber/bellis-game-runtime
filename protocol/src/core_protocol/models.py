@@ -443,11 +443,29 @@ class CaptureState(StrEnum):
     """
     SEARCHING = "searching"
     """
-    正在寻找目标窗口，没有帧。
+    没有采集源：找不到目标窗口或采集源失效，正在定期重新识别；没有帧。
     """
     CAPTURING = "capturing"
     """
-    正在采集，帧写入帧环。
+    有采集源，帧写入帧环；窗口最小化等可恢复的情形下暂时没有新帧。
+    """
+
+
+class LatestFrame(BaseModel):
+    """
+    实时核最近写进帧环的一帧，是判断帧龄的依据。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    frame_number: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    帧环中的帧号。
+    """
+    capture_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    采集时刻，与帧环的采集时刻同一时钟。
     """
 
 
@@ -602,6 +620,10 @@ class CoreHealthParams(BaseModel):
     producer: Producer | None = None
     """
     当前控制产出者；没有时为 `null`。
+    """
+    latest_frame: LatestFrame | None = None
+    """
+    本实例最近写进帧环的一帧；本实例还没写过帧时为 `null`。
     """
 
 

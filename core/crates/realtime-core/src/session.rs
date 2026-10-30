@@ -3,10 +3,12 @@
 //! 线程：
 //! - 调用 [`run`] 的线程：先释放全部输入，连接并握手，发出 `input.released(core_start)`，再启动其余线程，
 //!   然后等会话结束；
-//! - `RpcPeer` 的读线程：处理 `producer.heartbeat`、`producer.revoke` 与 `core.stop`，处理函数在读线程上同步
-//!   执行，只动控制状态并发通知，很快返回，也不向主进程发请求；
+//! - `RpcPeer` 的读线程：处理 `producer.heartbeat`、`producer.revoke`、`core.stop`、`frame_ring.attach` 与
+//!   `capture.set_target`，处理函数在读线程上同步执行，只动控制状态、发通知或把命令交给采集线程，很快返回，
+//!   也不向主进程发请求；
 //! - 心跳看门狗：到截止时刻即释放；
 //! - 健康：启动时立即发一次 `core.health`，之后按周期发；
+//! - 采集：取帧写进帧环（`frames` 模块）；
 //! - 两条生命线：一个线程等核连接关闭，一个线程读 stdin 直到 EOF。
 //!
 //! 握手与 `core_start` 在启动读线程之前完成，所以读线程处理任何产出者消息之前，`core_start` 已经发出。
@@ -24,23 +26,28 @@ use bellis_channel::{
 };
 use core_protocol::PROTOCOL_VERSION;
 use core_protocol::messages::{
-    CoreHelloParams, CoreHelloResult, Empty, InputReleasedParams, ProducerHeartbeatParams,
-    ProducerRevokeParams,
+    CaptureSetTargetParams, CoreHelloParams, CoreHelloResult, Empty, FrameRingAttachParams,
+    InputReleasedParams, ProducerHeartbeatParams, ProducerRevokeParams,
 };
 use core_protocol::methods::{
-    CoreHealth, CoreHello, CoreStop, InputReleased, Method, Notification, ProducerHeartbeat,
-    ProducerRevoke,
+    CaptureSetTarget, CoreHealth, CoreHello, CoreStop, FrameRingAttach, InputReleased, Method,
+    Notification, ProducerHeartbeat, ProducerRevoke, error_code,
 };
+use frame_ring::FrameRingWriter;
 use serde_json::{Map, Value, json};
 
 use crate::config::{HELLO_TIMEOUT, Launch, Options};
 use crate::control::Control;
+use crate::frames::{Capture, CaptureThread, FrameStatus, TargetError, opener_for};
 
 /// 实时核的程序版本，经 `core.hello` 报给主进程。
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 本端发出的请求的截止时间。实时核目前只在握手时发请求（`core.hello`，另有 [`HELLO_TIMEOUT`]）。
 const RPC_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 会话结束时等采集线程停掉采集源的时限。等不到也照常退出：输入此前已经释放。
+const CAPTURE_STOP_WAIT: Duration = Duration::from_millis(500);
 
 /// 会话怎样结束。每一种都已释放全部输入。
 #[derive(Debug)]
@@ -99,7 +106,8 @@ pub fn run(
     launch: &Launch,
     stdin: impl Read + Send + 'static,
 ) -> Result<Ended, StartError> {
-    let control = Arc::new(Control::new(options.heartbeat_timeout));
+    let frames = Arc::new(FrameStatus::default());
+    let control = Arc::new(Control::new(options.heartbeat_timeout, Arc::clone(&frames)));
     // 每次启动先释放全部输入，再接受任何产出者与动作。
     let started = control.release_on_start();
     log!("released all inputs on start");
@@ -117,17 +125,23 @@ pub fn run(
         .send(&notification::<InputReleased>(&started))
         .map_err(StartError::Connect)?;
 
+    let (capture, capture_thread) = Capture::spawn(frames).map_err(StartError::Thread)?;
     let outbox = Arc::new(Outbox::default());
     let (ended, end) = mpsc::channel();
     let peer = RpcPeer::spawn(
         connection,
-        handlers(&control, &outbox, ended.clone()),
+        handlers(&control, &outbox, &Arc::new(capture), ended.clone()),
         &RpcOptions {
             timeout: RPC_TIMEOUT,
         },
-    )
-    .map_err(StartError::Thread)?;
-    let peer = Arc::new(peer);
+    );
+    let peer = match peer {
+        Ok(peer) => Arc::new(peer),
+        Err(error) => {
+            stop_capture(capture_thread);
+            return Err(StartError::Thread(error));
+        }
+    };
     outbox.attach(&peer);
     log!(
         "connected as {}; heartbeat timeout {}ms, health every {}ms",
@@ -142,6 +156,7 @@ pub fn run(
         Ok(workers) => workers,
         Err(error) => {
             control.release_on_exit();
+            stop_capture(capture_thread);
             peer.close();
             return Err(StartError::Thread(error));
         }
@@ -157,8 +172,19 @@ pub fn run(
     for worker in workers {
         let _ = worker.join();
     }
+    stop_capture(capture_thread);
     peer.close();
     Ok(reason)
+}
+
+/// 停掉采集线程；释放已在此前完成，等不到它结束也照常退出。
+fn stop_capture(capture: CaptureThread) {
+    if !capture.stop(CAPTURE_STOP_WAIT) {
+        log!(
+            "the capture thread did not stop within {}ms",
+            CAPTURE_STOP_WAIT.as_millis()
+        );
+    }
 }
 
 /// 发 `core.hello` 并等主进程接受。握手完成前双方不发其它消息，所以第一条收到的就应是回应。
@@ -260,7 +286,71 @@ fn empty() -> Value {
     serde_json::to_value(Empty {}).unwrap_or_else(|_| json!({}))
 }
 
-fn handlers(control: &Arc<Control>, outbox: &Arc<Outbox>, ended: Sender<Ended>) -> Handlers {
+fn capture_stopped() -> RpcError {
+    RpcError::new(
+        RpcErrorCode::INTERNAL_ERROR,
+        "the capture thread has stopped",
+    )
+}
+
+/// `frame_ring.attach`：打开并核对帧环，把写入方交给采集线程。帧号从帧环头部的 `write_seq` 续写。
+fn attach_handler(
+    capture: &Arc<Capture>,
+) -> impl Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync + 'static {
+    let capture = Arc::clone(capture);
+    move |params| {
+        let params: FrameRingAttachParams =
+            parse(params).map_err(|error| invalid_params(FrameRingAttach::NAME, &error))?;
+        let writer = FrameRingWriter::attach(&params).map_err(|error| {
+            log!(
+                "{} {:?} refused: {error}",
+                FrameRingAttach::NAME,
+                params.name
+            );
+            RpcError::new(
+                i64::from(error_code::FRAME_RING_MISMATCH),
+                error.to_string(),
+            )
+        })?;
+        log!(
+            "attached frame ring {:?}; frame numbers continue after {}",
+            params.name,
+            writer.last_frame_number()
+        );
+        capture.attach(writer).map_err(|_| capture_stopped())?;
+        Ok(empty())
+    }
+}
+
+/// `capture.set_target`：核对目标，交给采集线程；旧的采集源先停掉。
+fn set_target_handler(
+    capture: &Arc<Capture>,
+) -> impl Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync + 'static {
+    let capture = Arc::clone(capture);
+    move |params| {
+        let params: CaptureSetTargetParams =
+            parse(params).map_err(|error| invalid_params(CaptureSetTarget::NAME, &error))?;
+        let opener = opener_for(params.target).map_err(|error| {
+            log!("{} refused: {error}", CaptureSetTarget::NAME);
+            let code = match &error {
+                TargetError::Invalid(_) => RpcErrorCode::INVALID_PARAMS,
+                TargetError::Unsupported(_) => i64::from(error_code::CAPTURE_UNSUPPORTED),
+                TargetError::Surface(_) => i64::from(error_code::FRAME_RING_MISMATCH),
+            };
+            RpcError::new(code, error.to_string())
+        })?;
+        log!("capture target: {opener}");
+        capture.set_target(opener).map_err(|_| capture_stopped())?;
+        Ok(empty())
+    }
+}
+
+fn handlers(
+    control: &Arc<Control>,
+    outbox: &Arc<Outbox>,
+    capture: &Arc<Capture>,
+    ended: Sender<Ended>,
+) -> Handlers {
     let heartbeat = {
         let (control, outbox) = (Arc::clone(control), Arc::clone(outbox));
         move |params: &Map<String, Value>| {
@@ -311,6 +401,8 @@ fn handlers(control: &Arc<Control>, outbox: &Arc<Outbox>, ended: Sender<Ended>) 
         .notification(ProducerHeartbeat::NAME, heartbeat)
         .request(ProducerRevoke::NAME, revoke)
         .request_then(CoreStop::NAME, stop, stopped)
+        .request(FrameRingAttach::NAME, attach_handler(capture))
+        .request(CaptureSetTarget::NAME, set_target_handler(capture))
 }
 
 /// 启动看门狗、健康与两条生命线的线程，返回会在进入停止后结束、需要等待的线程。

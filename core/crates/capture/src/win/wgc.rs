@@ -128,9 +128,7 @@ impl WgcCapture {
     /// [`CaptureError::NotPerMonitorDpiAwareV2`]；窗口找不到、不唯一、已关闭、最小化或处于独占全屏时返回
     /// 对应的错误；其余失败返回 [`CaptureError::Os`]。
     pub fn new(options: &WgcOptions) -> Result<Self, CaptureError> {
-        if !GraphicsCaptureSession::IsSupported()
-            .map_err(os("GraphicsCaptureSession::IsSupported"))?
-        {
+        if !is_supported()? {
             return Err(CaptureError::Unsupported("Windows Graphics Capture"));
         }
         if !thread_is_per_monitor_aware_v2() {
@@ -513,6 +511,15 @@ impl Signal {
             })
             .unwrap_or_else(PoisonError::into_inner);
     }
+}
+
+/// 系统是否支持 WGC。在任何线程上都可以调用，不建设备也不找窗口。
+///
+/// # Errors
+///
+/// 查询失败时返回 [`CaptureError::Os`]。
+pub fn is_supported() -> Result<bool, CaptureError> {
+    GraphicsCaptureSession::IsSupported().map_err(os("GraphicsCaptureSession::IsSupported"))
 }
 
 fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext), CaptureError> {

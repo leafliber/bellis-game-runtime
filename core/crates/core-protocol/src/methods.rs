@@ -136,12 +136,15 @@ methods! {
 pub mod error_code {
     /// `core.hello` 的协议版本与主进程的不相等。
     pub const PROTOCOL_VERSION_MISMATCH: i32 = -32001;
-    /// `frame_ring.attach` 打不开共享内存，或帧环头部与参数不符。
+    /// `frame_ring.attach` 打不开共享内存，或帧环头部与参数不符；`capture.set_target` 的假显示面同样。
     pub const FRAME_RING_MISMATCH: i32 = -32002;
+    /// `capture.set_target` 的目标在这个平台或系统上不支持。
+    pub const CAPTURE_UNSUPPORTED: i32 = -32003;
 
     /// 全部自定义错误码及其名字，供导出 Schema。
-    pub const ALL: [(&str, i32); 2] = [
+    pub const ALL: [(&str, i32); 3] = [
         ("protocol_version_mismatch", PROTOCOL_VERSION_MISMATCH),
         ("frame_ring_mismatch", FRAME_RING_MISMATCH),
+        ("capture_unsupported", CAPTURE_UNSUPPORTED),
     ];
 }
