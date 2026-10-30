@@ -1,0 +1,25 @@
+# GS-03 真机探针的非提权一侧与编排（`docs/plan/spikes.md` 的 GS-03）。
+# 只用于探针，不是产品代码；提供 `uv run gs03`。
+[project]
+name = "bellis-game-runtime-gs03-probe"
+version = "0.0.0"
+description = "GS-03 探针的非提权一侧与编排：开真实通道与帧环、写凭据、核对提权一侧、生成计划任务 XML 与命令"
+requires-python = "==3.12.*"
+dependencies = [
+    "bellis-game-runtime",
+    "core-protocol",
+]
+
+[project.scripts]
+gs03 = "gs03_probe.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "gs03_probe"
+
+[tool.uv.sources]
+bellis-game-runtime = { workspace = true }
+core-protocol = { workspace = true }

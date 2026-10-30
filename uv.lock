@@ -6,6 +6,7 @@ requires-python = "==3.12.*"
 members = [
     "bellis-game-runtime",
     "bellis-game-runtime-check",
+    "bellis-game-runtime-gs03-probe",
     "core-protocol",
     "synthetic-game",
 ]
@@ -55,6 +56,21 @@ requires-dist = [
 name = "bellis-game-runtime-check"
 version = "0.0.0"
 source = { editable = "tools/check" }
+
+[[package]]
+name = "bellis-game-runtime-gs03-probe"
+version = "0.0.0"
+source = { editable = "tools/gs03-probe" }
+dependencies = [
+    { name = "bellis-game-runtime" },
+    { name = "core-protocol" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "bellis-game-runtime", editable = "runtime" },
+    { name = "core-protocol", editable = "protocol" },
+]
 
 [[package]]
 name = "black"

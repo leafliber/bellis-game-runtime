@@ -1,0 +1,33 @@
+# GS-03 真机探针的提权一侧（`docs/plan/spikes.md` 的 GS-03）。只用于探针，不是产品代码；
+# 非 Windows 平台上凭据读取与完整性级别报告为 unsupported，连接与写帧仍可用，便于在检查里编译。
+[package]
+name = "gs03-probe"
+version = "0.0.0"
+description = "GS-03 探针的提权一侧：连接非提权主进程、握手、做一次 RPC、写帧，并报告自己的完整性级别与用户 SID"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gs03-core-probe"
+path = "src/main.rs"
+
+[dependencies]
+bellis-channel = { path = "../bellis-channel" }
+capture = { path = "../capture" }
+core-protocol = { path = "../core-protocol" }
+frame-ring = { path = "../frame-ring" }
+serde = { workspace = true }
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Credentials",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

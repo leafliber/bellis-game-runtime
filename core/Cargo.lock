@@ -131,6 +131,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gs03-probe"
+version = "0.0.0"
+dependencies = [
+ "bellis-channel",
+ "capture",
+ "core-protocol",
+ "frame-ring",
+ "serde",
+ "serde_json",
+ "windows",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
