@@ -168,8 +168,8 @@ Game Runtime 为 Bellis 提供游戏能力：采集画面与声音、读懂画�
 | `vendor/bellis-protocol/` | 锁定的 Bellis 游戏桥生成物，附来源提交与摘要 |
 | `docs/` | 文档，分工见[文档索引](README.md) |
 
-统一检查入口为 `uv run check`，在仓库根目录运行：根目录放一个最小的 `pyproject.toml`，以 uv workspace 纳入 `runtime/` 与 `tools/` 并定义 `check` 脚本；它依次运行 ruff、pyright、pytest、`cargo fmt --check`、clippy、`cargo test` 与生成物核对；CI 与提交前都运行这一条。
+统一检查入口为 `uv run check`，在仓库根目录运行：根目录放一个最小的 `pyproject.toml`，以 uv workspace 纳入 `runtime/` 与 `tools/` 并定义 `check` 脚本；它依次运行 ruff、pyright、pytest、`cargo fmt --check`、clippy、`cargo test` 与生成物核对；`uv run check --linux` 在本机 Docker 的 Linux 容器里跑同一检查，覆盖非 Windows 的代码路径；提交前与合并 PR 前都在本机运行这两条，不用托管 CI（GR-29）。
 
 ## 平台
 
-Windows 11 x64 是唯一的生产平台（Bellis D-11）。Windows 专有部分（采集、输入、钩子、跨完整性级别的进程间对象）放在接口后面并提供假实现，Windows、macOS、Linux 三平台 CI 都运行完整检查；CI 通过不等于真机通过。Rust 用 `windows` crate，Windows 专有代码用 `cfg` 隔离（GR-01）。
+Windows 11 x64 是唯一的生产平台（Bellis D-11）。Windows 专有部分（采集、输入、钩子、跨完整性级别的进程间对象）放在接口后面并提供假实现；完整检查在 Windows 真机与本机 Linux 容器上运行，macOS 不验证；自动测试通过不等于真机通过。Rust 用 `windows` crate，Windows 专有代码用 `cfg` 隔离（GR-01）。
