@@ -853,6 +853,110 @@ async def test_provider_waits_for_stuck_producer_before_stopping() -> None:
     assert h.codes("step") == [ReasonCode.SERVICE_MISSING]
 
 
+# 停止内核
+
+
+@run
+async def test_shutdown_stops_entries_in_reverse_profile_order() -> None:
+    log: list[str] = []
+    h = Harness(log, adapter(log), consumer(log), producer("step", log, inject=[GAME.ref]))
+    h.kernel.add([entry("adapter"), entry("consumer"), entry("step", grant=[CONTROL_SUBMIT])])
+    await h.kernel.set_control_producer("step")
+    log.clear()
+
+    await h.kernel.shutdown()
+    assert log == [
+        "作废代次 1（提交资格已失效）",
+        "输入已释放 1",
+        "收尾 step：提交资格已失效",
+        "撤销 step 注册2",
+        "撤销 step 注册1",
+        "撤销 consumer",
+        "撤销 adapter",
+    ]
+    for entry_id in ("adapter", "consumer", "step"):
+        status = h.kernel.status(entry_id)
+        assert status.state is State.DISPOSED
+        assert status.reasons == (Reason(ReasonCode.DISABLED, entry_id, "内核已停止"),)
+        # 停止不改条目的启用开关。
+        assert status.enabled
+    # 停止之后不再激活，也不再加入条目。
+    await h.kernel.enable("step")
+    assert h.state("step") is State.DISPOSED
+    with pytest.raises(RuntimeError, match="内核已停止"):
+        h.kernel.add([entry("other", "consumer")])
+
+
+@run
+async def test_shutdown_reports_release_timeout_then_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log: list[str] = []
+    h = Harness(log, adapter(log), producer("step", log, inject=[GAME.ref]), auto_release=False)
+    h.kernel.add([entry("adapter"), entry("step", grant=[CONTROL_SUBMIT])])
+    await h.kernel.set_control_producer("step")
+    log.clear()
+
+    stopping = asyncio.create_task(h.kernel.shutdown())
+    await h.clock.advance(4.999)
+    # 停止时照常等确认，时限内不撤销注册。
+    assert not stopping.done()
+    assert not any(line.startswith("撤销") for line in log)
+    await h.clock.advance(0.001)
+    await stopping
+
+    # 等确认超时照常上报，然后撤销注册继续停止，提供方随后停用。
+    reported = [t for t in h.transitions if t.entry_id == "step" and t.after is State.QUIESCING]
+    assert reported[-1].reasons[0].code is ReasonCode.RELEASE_TIMEOUT
+    assert h.path("step")[-3:] == [
+        (State.ACTIVE, State.QUIESCING),
+        (State.QUIESCING, State.UNLOADING),
+        (State.UNLOADING, State.DISPOSED),
+    ]
+    assert log[-3:] == ["撤销 step 注册2", "撤销 step 注册1", "撤销 adapter"]
+    assert h.state("adapter") is State.DISPOSED
+    assert any(
+        r.levelno == logging.WARNING and "撤销其注册继续停止" in r.getMessage()
+        for r in caplog.records
+    )
+    # 迟到的确认不再改变什么。
+    h.core.release(1)
+    await h.clock.advance(0)
+    await h.kernel.settled()
+    assert h.state("step") is State.DISPOSED
+
+
+@run
+async def test_shutdown_does_not_wait_again_for_a_stuck_producer() -> None:
+    log: list[str] = []
+    h = Harness(log, producer("step", log), auto_release=False)
+    h.kernel.add([entry("step", grant=[CONTROL_SUBMIT])])
+    await h.kernel.set_control_producer("step")
+    disabling = asyncio.create_task(h.kernel.disable("step"))
+    await h.clock.advance(5)
+    await disabling
+    assert h.codes("step") == [ReasonCode.RELEASE_TIMEOUT]
+
+    # 已经卡在 QUIESCING 的控制产出者在停止时直接撤销注册，不再计时。
+    await h.kernel.shutdown()
+    assert h.state("step") is State.DISPOSED
+    assert log[-2:] == ["撤销 step 注册2", "撤销 step 注册1"]
+
+
+@run
+async def test_shutdown_continues_after_a_failed_release_wait() -> None:
+    log: list[str] = []
+    h = Harness(log, producer("step", log), auto_release=False)
+    h.kernel.add([entry("step", grant=[CONTROL_SUBMIT])])
+    await h.kernel.set_control_producer("step")
+    h.core.fail_wait = True
+
+    await h.kernel.shutdown()
+    assert h.state("step") is State.DISPOSED
+    reported = [t for t in h.transitions if t.after is State.QUIESCING]
+    assert reported[-1].reasons[0].code is ReasonCode.RELEASE_FAILED
+
+
 # profile 交给内核
 
 
