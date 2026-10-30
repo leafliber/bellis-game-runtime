@@ -1,24 +1,28 @@
-//! 核连接上的一次会话：启动、握手、控制产出者的消息与生命线（`docs/modules/realtime-core.md` 的“启动与生命线”）。
+//! 核连接上的一次会话：启动、握手、控制产出者的消息、动作块与生命线（`docs/modules/realtime-core.md` 的
+//! “启动与生命线”与“动作块的执行”）。
 //!
 //! 线程：
-//! - 调用 [`run`] 的线程：先释放全部输入，连接并握手，发出 `input.released(core_start)`，再启动其余线程，
-//!   然后等会话结束；
-//! - `RpcPeer` 的读线程：处理 `producer.heartbeat`、`producer.revoke`、`core.stop`、`frame_ring.attach` 与
-//!   `capture.set_target`，处理函数在读线程上同步执行，只动控制状态、发通知或把命令交给采集线程，很快返回，
-//!   也不向主进程发请求；
-//! - 心跳看门狗：到截止时刻即释放；
+//! - 调用 [`run`] 的线程：以假后端启动时先连上测试设备；释放全部输入，连接主进程并握手，发出
+//!   `input.released(core_start)`，再启动其余线程，然后等会话结束；
+//! - `RpcPeer` 的读线程：处理 `producer.heartbeat`、`producer.revoke`、`core.stop`、`action.submit`、
+//!   `frame_ring.attach` 与 `capture.set_target`，处理函数在读线程上同步执行，只动控制状态、发通知或把命令
+//!   交给采集线程，很快返回，也不向主进程发请求；`action.submit` 只校验并交给调度线程，不执行任何一步；
+//! - 调度线程：按时刻执行动作块的步，负责全部定时的释放（心跳超时、许可到期、帧龄超限、截止时刻）；
+//! - 核连接的发送线程：写出调度线程与测试设备连接放进队列的通知，它们因此从不等网络写入；
 //! - 健康：启动时立即发一次 `core.health`，之后按周期发；
 //! - 采集：取帧写进帧环（`frames` 模块）；
-//! - 两条生命线：一个线程等核连接关闭，一个线程读 stdin 直到 EOF。
+//! - 两条生命线：一个线程等核连接关闭，一个线程读 stdin 直到 EOF；
+//! - 以假后端启动时另有测试设备连接的读线程、发送线程与生命线（`fake` 模块）。
 //!
-//! 握手与 `core_start` 在启动读线程之前完成，所以读线程处理任何产出者消息之前，`core_start` 已经发出。
+//! 握手与 `core_start` 在启动读线程之前完成，所以读线程处理任何产出者消息之前，`core_start` 已经发出；
+//! 发送队列也在 `core_start` 之后才开始写。
 
 use std::fmt;
 use std::io::{self, Read};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bellis_channel::{
     ChannelError, Connection, ConnectionOptions, Handlers, Message, RpcError, RpcErrorCode,
@@ -26,19 +30,24 @@ use bellis_channel::{
 };
 use core_protocol::PROTOCOL_VERSION;
 use core_protocol::messages::{
-    CaptureSetTargetParams, CoreHelloParams, CoreHelloResult, Empty, FrameRingAttachParams,
-    InputReleasedParams, ProducerHeartbeatParams, ProducerRevokeParams,
+    ActionBlock, ActionSubmitResult, CaptureSetTargetParams, CoreHelloParams, CoreHelloResult,
+    Empty, FrameRingAttachParams, InputReleasedParams, ProducerHeartbeatParams,
+    ProducerRevokeParams, ReleaseReason,
 };
 use core_protocol::methods::{
-    CaptureSetTarget, CoreHealth, CoreHello, CoreStop, FrameRingAttach, InputReleased, Method,
-    Notification, ProducerHeartbeat, ProducerRevoke, error_code,
+    ActionReceipt, ActionSubmit, CaptureSetTarget, CoreHealth, CoreHello, CoreStop,
+    FrameRingAttach, InputReleased, Method, Notification, ProducerHeartbeat, ProducerRevoke,
+    error_code,
 };
 use frame_ring::FrameRingWriter;
 use serde_json::{Map, Value, json};
 
-use crate::config::{HELLO_TIMEOUT, Launch, Options};
-use crate::control::Control;
+use crate::config::{HELLO_TIMEOUT, InputSetup, Launch, Options};
+use crate::control::{Control, Limits, Notice, Notices};
+use crate::fake::{Post, TestDevice, connect_test_device};
 use crate::frames::{Capture, CaptureThread, FrameStatus, TargetError, opener_for};
+use crate::ledger::InputBackend;
+use crate::queue::SendQueue;
 
 /// 实时核的程序版本，经 `core.hello` 报给主进程。
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -48,6 +57,12 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 会话结束时等采集线程停掉采集源的时限。等不到也照常退出：输入此前已经释放。
 const CAPTURE_STOP_WAIT: Duration = Duration::from_millis(500);
+
+/// 会话结束时等核连接的发送队列写完的时限。等不到也照常退出：输入此前已经释放。
+const OUTBOX_FLUSH_WAIT: Duration = Duration::from_millis(200);
+
+/// 会话结束时等假输入事件（释放全部输入的抬起）写给测试一方的时限。只用于测试。
+const DEVICE_FLUSH_WAIT: Duration = Duration::from_millis(500);
 
 /// 会话怎样结束。每一种都已释放全部输入。
 #[derive(Debug)]
@@ -74,8 +89,10 @@ impl fmt::Display for Ended {
 /// 启动失败：没能建立会话。
 #[derive(Debug)]
 pub enum StartError {
-    /// 连不上通道或握手失败。
+    /// 连不上主进程或握手失败。
     Connect(ChannelError),
+    /// 连不上测试设备或握手失败（只在假后端时连接）。
+    TestDevice(ChannelError),
     /// `core.hello` 没有得到合法的接受。
     Hello(String),
     /// 无法创建线程。
@@ -86,6 +103,7 @@ impl fmt::Display for StartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Connect(error) => write!(f, "cannot connect to the main process: {error}"),
+            Self::TestDevice(error) => write!(f, "cannot connect to the test device: {error}"),
             Self::Hello(reason) => write!(f, "core.hello failed: {reason}"),
             Self::Thread(error) => write!(f, "cannot start a thread: {error}"),
         }
@@ -96,37 +114,64 @@ impl std::error::Error for StartError {}
 
 /// 运行一次会话直到结束；返回前已释放全部输入。
 ///
-/// `stdin` 是生命线：读到 EOF 即结束。
+/// `input` 是输入后端与许可源的组合（[`InputSetup::select`] 已核对门禁）；`stdin` 是生命线：读到 EOF
+/// 即结束。
 ///
 /// # Errors
 ///
-/// 连不上主进程、握手失败或无法创建线程时返回 [`StartError`]；此时已释放全部输入。
+/// 连不上主进程或测试设备、握手失败或无法创建线程时返回 [`StartError`]；此时已释放全部输入。
 pub fn run(
     options: &Options,
     launch: &Launch,
+    input: InputSetup,
     stdin: impl Read + Send + 'static,
 ) -> Result<Ended, StartError> {
     let frames = Arc::new(FrameStatus::default());
-    let control = Arc::new(Control::new(options.heartbeat_timeout, Arc::clone(&frames)));
+    let outbox = Arc::new(Outbox::default());
+    let limits = Limits {
+        heartbeat_timeout: options.heartbeat_timeout,
+        max_frame_age: options.max_frame_age,
+    };
+    let (control, device) = start_input(input, limits, &frames, &outbox, &launch.role)?;
     // 每次启动先释放全部输入，再接受任何产出者与动作。
     let started = control.release_on_start();
     log!("released all inputs on start");
+    let finish_device = |device: Option<TestDevice>| {
+        if let Some(device) = device {
+            device.finish(DEVICE_FLUSH_WAIT);
+        }
+    };
 
     let credentials = &launch.credentials;
-    let connection = connect(
+    let connection = match connect(
         &credentials.path,
         &launch.role,
         &credentials.key,
         &ConnectionOptions::default(),
-    )
-    .map_err(StartError::Connect)?;
-    hello(&connection)?;
-    connection
-        .send(&notification::<InputReleased>(&started))
-        .map_err(StartError::Connect)?;
+    ) {
+        Ok(connection) => connection,
+        Err(error) => {
+            finish_device(device);
+            return Err(StartError::Connect(error));
+        }
+    };
+    let greeted = hello(&connection).and_then(|()| {
+        connection
+            .send(&notification::<InputReleased>(&started))
+            .map_err(StartError::Connect)
+    });
+    if let Err(error) = greeted {
+        finish_device(device);
+        return Err(error);
+    }
 
-    let (capture, capture_thread) = Capture::spawn(frames).map_err(StartError::Thread)?;
-    let outbox = Arc::new(Outbox::default());
+    let (capture, capture_thread) = match Capture::spawn(frames) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            finish_device(device);
+            return Err(StartError::Thread(error));
+        }
+    };
     let (ended, end) = mpsc::channel();
     let peer = RpcPeer::spawn(
         connection,
@@ -139,15 +184,17 @@ pub fn run(
         Ok(peer) => Arc::new(peer),
         Err(error) => {
             stop_capture(capture_thread);
+            finish_device(device);
             return Err(StartError::Thread(error));
         }
     };
     outbox.attach(&peer);
     log!(
-        "connected as {}; heartbeat timeout {}ms, health every {}ms",
+        "connected as {}; heartbeat timeout {}ms, health every {}ms, max frame age {}ms",
         launch.role,
         options.heartbeat_timeout.as_millis(),
-        options.health_interval.as_millis()
+        options.health_interval.as_millis(),
+        options.max_frame_age.as_millis()
     );
 
     let workers = start_workers(&control, &outbox, &peer, options, &ended, stdin);
@@ -155,7 +202,10 @@ pub fn run(
     let workers = match workers {
         Ok(workers) => workers,
         Err(error) => {
-            control.release_on_exit();
+            // 起不了线程就断开核连接：按核连接断开释放。
+            Outbox::log(&control.release_on_exit(ReleaseReason::CoreConnectionLost));
+            outbox.close(OUTBOX_FLUSH_WAIT);
+            finish_device(device);
             stop_capture(capture_thread);
             peer.close();
             return Err(StartError::Thread(error));
@@ -164,17 +214,58 @@ pub fn run(
 
     // 所有发送端都在线程里；全部退出（不应发生）时按连接断开处理。
     let reason = end.recv().unwrap_or(Ended::ConnectionClosed(None));
-    if !matches!(reason, Ended::Stopped) {
+    match reason {
+        // `core.stop` 的处理函数已释放并在回应之前发出了 `input.released(stop)`。
+        Ended::Stopped => {}
         // 生命线：先释放，再记录；连接已断开时无法通知主进程。
-        control.release_on_exit();
+        Ended::ConnectionClosed(_) => {
+            Outbox::log(&control.release_on_exit(ReleaseReason::CoreConnectionLost));
+        }
+        // 连接可能仍在：尽量告诉主进程。
+        Ended::StdinClosed => outbox.post(control.release_on_exit(ReleaseReason::StdinClosed)),
     }
     log!("{reason}; released all inputs, exiting");
     for worker in workers {
         let _ = worker.join();
     }
+    outbox.close(OUTBOX_FLUSH_WAIT);
+    // 释放全部输入的抬起写给测试一方之后才断开它。
+    finish_device(device);
     stop_capture(capture_thread);
     peer.close();
     Ok(reason)
+}
+
+/// 建立控制状态与输入后端。以假后端启动时先连上测试设备、开始处理测试许可源的请求；测试许可源只在
+/// 这里与假后端一起出现。
+fn start_input(
+    input: InputSetup,
+    limits: Limits,
+    frames: &Arc<FrameStatus>,
+    outbox: &Arc<Outbox>,
+    role: &str,
+) -> Result<(Arc<Control>, Option<TestDevice>), StartError> {
+    match input {
+        InputSetup::None => Ok((
+            Arc::new(Control::new(limits, Arc::clone(frames), None)),
+            None,
+        )),
+        InputSetup::Fake { test_device } => {
+            let (connection, backend) =
+                connect_test_device(&test_device, role).map_err(StartError::TestDevice)?;
+            let backend: Box<dyn InputBackend> = Box::new(backend);
+            let control = Arc::new(Control::new(limits, Arc::clone(frames), Some(backend)));
+            let post: Post = {
+                let outbox = Arc::clone(outbox);
+                Arc::new(move |notices| outbox.post(notices))
+            };
+            let device = connection
+                .start(&control, &post)
+                .map_err(StartError::Thread)?;
+            log!("input backend: fake, via the test device (tests only)");
+            Ok((control, Some(device)))
+        }
+    }
 }
 
 /// 停掉采集线程；释放已在此前完成，等不到它结束也照常退出。
@@ -236,10 +327,26 @@ fn notification<M: Notification>(params: &M::Params) -> Value {
     json!({"jsonrpc": "2.0", "method": M::NAME, "params": params})
 }
 
-/// 处理函数之外发通知的入口。读线程启动后才拿到对端；在那之前到达的处理函数等它就位，最多几微秒。
+/// 发给主进程的通知的出口，有两条路：
+///
+/// - `send`：在调用线程上直接写。读线程上的处理函数用它，`producer.revoke` 与 `core.stop` 由此在回应之前
+///   发出 `input.released`；
+/// - `post`：放进发送队列，由发送线程写。调度线程与测试设备连接的线程用它，从不等网络写入。
+///
+/// 读线程启动后才拿到对端；在那之前到达的处理函数等它就位，最多几微秒。发送线程在拿到对端之后才启动。
 #[derive(Default)]
 struct Outbox {
     peer: OnceLock<Weak<RpcPeer>>,
+    queue: SendQueue,
+}
+
+fn to_params(method: &str, params: &impl serde::Serialize) -> Option<Map<String, Value>> {
+    if let Ok(Value::Object(params)) = serde_json::to_value(params) {
+        Some(params)
+    } else {
+        log!("{method} not sent: params are not an object");
+        None
+    }
 }
 
 impl Outbox {
@@ -247,28 +354,82 @@ impl Outbox {
         let _ = self.peer.set(Arc::downgrade(peer));
     }
 
-    /// 发一条通知；连接已断开或写失败只记录。调用方须已完成释放。
-    fn notify<M: Notification>(&self, params: &M::Params) {
+    /// 写一条通知；连接已断开或写失败只记录。调用方须已完成释放。
+    fn write(&self, method: &str, params: &Map<String, Value>) {
         let Some(peer) = self.peer.wait().upgrade() else {
             return;
         };
-        let Ok(Value::Object(params)) = serde_json::to_value(params) else {
-            log!("{} not sent: params are not an object", M::NAME);
-            return;
-        };
-        if let Err(error) = peer.notify(M::NAME, Some(&params)) {
-            log!("{} not sent: {error}", M::NAME);
+        if let Err(error) = peer.notify(method, Some(params)) {
+            log!("{method} not sent: {error}");
         }
     }
 
-    fn released(&self, released: &InputReleasedParams) {
-        log!(
-            "released all inputs: {:?} (producer {:?})",
-            released.reason,
-            released.producer
-        );
-        self.notify::<InputReleased>(released);
+    /// 在调用线程上直接发一条通知。
+    fn notify<M: Notification>(&self, params: &M::Params) {
+        if let Some(params) = to_params(M::NAME, params) {
+            self.write(M::NAME, &params);
+        }
     }
+
+    /// 记下通知中的释放：主进程收不到时，日志是唯一的记录。
+    fn log(notices: &Notices) {
+        for notice in &notices.0 {
+            if let Notice::Released(released) = notice {
+                log_released(released);
+            }
+        }
+    }
+
+    fn each(notices: Notices, mut deliver: impl FnMut(&'static str, Map<String, Value>)) {
+        for notice in notices.0 {
+            let (method, params) = match &notice {
+                Notice::Released(released) => {
+                    log_released(released);
+                    (
+                        InputReleased::NAME,
+                        to_params(InputReleased::NAME, released),
+                    )
+                }
+                Notice::Receipt(receipt) => {
+                    (ActionReceipt::NAME, to_params(ActionReceipt::NAME, receipt))
+                }
+            };
+            if let Some(params) = params {
+                deliver(method, params);
+            }
+        }
+    }
+
+    /// 在调用线程上直接发出这些通知。
+    fn send(&self, notices: Notices) {
+        Self::each(notices, |method, params| self.write(method, &params));
+    }
+
+    /// 把这些通知放进发送队列，立即返回。
+    fn post(&self, notices: Notices) {
+        Self::each(notices, |method, params| self.queue.push(method, params));
+    }
+
+    /// 发送线程的循环，直到 [`Self::close`]。
+    fn run_sender(&self) {
+        self.queue.run(|method, params| self.write(method, params));
+    }
+
+    /// 等发送队列写完（至多 `timeout`），然后让发送线程结束。
+    fn close(&self, timeout: Duration) {
+        if !self.queue.flush(timeout) {
+            log!("notifications not flushed within {}ms", timeout.as_millis());
+        }
+        self.queue.abandon();
+    }
+}
+
+fn log_released(released: &InputReleasedParams) {
+    log!(
+        "released all inputs: {:?} (producer {:?})",
+        released.reason,
+        released.producer
+    );
 }
 
 fn parse<T: serde::de::DeserializeOwned>(params: &Map<String, Value>) -> Result<T, String> {
@@ -361,9 +522,8 @@ fn handlers(
                     return;
                 }
             };
-            match control.heartbeat(&heartbeat, Instant::now()) {
-                Ok(Some(released)) => outbox.released(&released),
-                Ok(None) => {}
+            match control.heartbeat(&heartbeat, mono_clock::now_ns()) {
+                Ok(notices) => outbox.send(notices),
                 Err(rejection) => log!(
                     "ignored {} from {:?} seq {}: {rejection:?}",
                     ProducerHeartbeat::NAME,
@@ -378,10 +538,8 @@ fn handlers(
         move |params: &Map<String, Value>| {
             let revoke: ProducerRevokeParams =
                 parse(params).map_err(|error| invalid_params(ProducerRevoke::NAME, &error))?;
-            // 释放完成后才回应：回应即这些代次的输入已释放的确认。
-            if let Some(released) = control.revoke(revoke.generation) {
-                outbox.released(&released);
-            }
+            // 释放完成、`input.released` 发出之后才回应：回应即这些代次的输入已释放的确认。
+            outbox.send(control.revoke(revoke.generation));
             Ok(empty())
         }
     };
@@ -389,7 +547,7 @@ fn handlers(
         let (control, outbox) = (Arc::clone(control), Arc::clone(outbox));
         move |params: &Map<String, Value>| {
             let _: Empty = parse(params).map_err(|error| invalid_params(CoreStop::NAME, &error))?;
-            outbox.released(&control.stop());
+            outbox.send(control.stop());
             Ok(empty())
         }
     };
@@ -401,11 +559,42 @@ fn handlers(
         .notification(ProducerHeartbeat::NAME, heartbeat)
         .request(ProducerRevoke::NAME, revoke)
         .request_then(CoreStop::NAME, stop, stopped)
+        .request(ActionSubmit::NAME, submit_handler(control, outbox))
         .request(FrameRingAttach::NAME, attach_handler(capture))
         .request(CaptureSetTarget::NAME, set_target_handler(capture))
 }
 
-/// 启动看门狗、健康与两条生命线的线程，返回会在进入停止后结束、需要等待的线程。
+/// `action.submit`：校验并交给调度线程，不在读线程上执行任何一步。参数解析不了（未知字段、类型不对）
+/// 回参数无效；不合动作块规则的回 `rejected`。
+fn submit_handler(
+    control: &Arc<Control>,
+    outbox: &Arc<Outbox>,
+) -> impl Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync + 'static {
+    let (control, outbox) = (Arc::clone(control), Arc::clone(outbox));
+    move |params| {
+        let block: ActionBlock =
+            parse(params).map_err(|error| invalid_params(ActionSubmit::NAME, &error))?;
+        let (producer, seq) = (block.producer.clone(), block.seq);
+        let (result, notices) = control.submit(block, mono_clock::now_ns());
+        outbox.post(notices);
+        if let ActionSubmitResult::Rejected(rejected) = &result {
+            log!(
+                "{} from {producer:?} seq {seq} rejected: {:?} ({})",
+                ActionSubmit::NAME,
+                rejected.reason,
+                rejected.message
+            );
+        }
+        serde_json::to_value(result).map_err(|error| {
+            RpcError::new(
+                RpcErrorCode::INTERNAL_ERROR,
+                format!("cannot encode: {error}"),
+            )
+        })
+    }
+}
+
+/// 启动调度、发送、健康与两条生命线的线程，返回会在进入停止后结束、需要等待的线程。
 fn start_workers(
     control: &Arc<Control>,
     outbox: &Arc<Outbox>,
@@ -414,11 +603,16 @@ fn start_workers(
     ended: &Sender<Ended>,
     stdin: impl Read + Send + 'static,
 ) -> io::Result<Vec<JoinHandle<()>>> {
-    let watchdog = thread::Builder::new()
-        .name("heartbeat-watchdog".into())
+    // 发送线程在 `Outbox::close` 时结束；它阻塞在写上时随进程退出，不等待。
+    thread::Builder::new().name("core-sender".into()).spawn({
+        let outbox = Arc::clone(outbox);
+        move || outbox.run_sender()
+    })?;
+    let scheduler = thread::Builder::new()
+        .name("action-scheduler".into())
         .spawn({
             let (control, outbox) = (Arc::clone(control), Arc::clone(outbox));
-            move || control.run_watchdog(|released| outbox.released(&released))
+            move || control.run_scheduler(|notices| outbox.post(notices))
         })?;
     let health = thread::Builder::new().name("core-health".into()).spawn({
         let (control, outbox) = (Arc::clone(control), Arc::clone(outbox));
@@ -449,7 +643,7 @@ fn start_workers(
                 let _ = ended.send(Ended::StdinClosed);
             }
         })?;
-    Ok(vec![watchdog, health])
+    Ok(vec![scheduler, health])
 }
 
 /// 读到 EOF 或读取失败为止，丢弃读到的内容：stdin 只作生命线，不传数据。

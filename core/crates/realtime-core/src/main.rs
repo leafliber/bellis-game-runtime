@@ -1,14 +1,14 @@
 //! 实时核的进程入口。职责与边界见 `docs/modules/realtime-core.md`。
 //!
-//! 由主进程以参数列表拉起（`runtime/src/game_runtime/core_link/`）：凭据在环境变量里，时限在命令行参数里，
-//! stdin 是生命线。退出码：0 表示释放全部输入后正常结束（`core.stop`、核连接断开或 stdin EOF），
-//! 1 表示没能建立会话，2 表示参数不合法，101 表示 panic。
+//! 由主进程以参数列表拉起（`runtime/src/game_runtime/core_link/`）：凭据在环境变量里，时限与输入后端在
+//! 命令行参数里，stdin 是生命线。退出码：0 表示释放全部输入后正常结束（`core.stop`、核连接断开或 stdin
+//! EOF），1 表示没能建立会话，2 表示参数不合法（含测试许可源不与假后端一起启用），101 表示 panic。
 
 use std::fmt;
 use std::io::{self, Write as _};
 use std::process::ExitCode;
 
-use realtime_core::config::{Launch, Options, USAGE};
+use realtime_core::config::{InputSetup, Launch, Options, USAGE};
 use realtime_core::{install_panic_exit, session};
 
 /// 写一行到 stderr；写失败时丢弃，不 panic。
@@ -33,14 +33,22 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let launch = match Launch::from_env(|name| std::env::var(name).ok()) {
+    let mut launch = match Launch::from_env(|name| std::env::var(name).ok()) {
         Ok(launch) => launch,
         Err(error) => {
             say(format_args!("{error}"));
             return ExitCode::FAILURE;
         }
     };
-    match session::run(&options, &launch, io::stdin()) {
+    // 门禁：测试许可源只能与假输入后端一起启用。
+    let input = match InputSetup::select(options.input_backend, launch.test_device.take()) {
+        Ok(input) => input,
+        Err(error) => {
+            say(format_args!("{error}\n{USAGE}"));
+            return ExitCode::from(2);
+        }
+    };
+    match session::run(&options, &launch, input, io::stdin()) {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => {
             say(format_args!("{error}"));
