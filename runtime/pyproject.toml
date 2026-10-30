@@ -1,0 +1,13 @@
+[project]
+name = "bellis-game-runtime"
+version = "0.0.0"
+description = "Bellis Game Runtime 的主进程与插件"
+requires-python = "==3.12.*"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "game_runtime"

@@ -1,0 +1,53 @@
+# 仓库根的 uv 工作区（GR-29）。根目录不是包，只纳入成员、锁定开发工具并放工具配置；
+# `check` 脚本由 tools/check 提供。
+[tool.uv.workspace]
+members = ["runtime", "tools/*"]
+
+[dependency-groups]
+dev = [
+    "pyright[nodejs]>=1.1.414",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["docs/inherited"] # 移交的旧设计只作参考，不改动
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle 错误
+    "W",   # pycodestyle 警告
+    "F",   # pyflakes
+    "I",   # import 排序
+    "B",   # bugbear
+    "UP",  # pyupgrade
+    "SIM", # 可简化的写法
+    "C4",  # 推导式
+    "N",   # 命名
+    "PT",  # pytest 风格
+    "PTH", # 用 pathlib
+    "S",   # bandit：含 shell=True 等子进程问题
+    "RUF", # ruff 自有规则
+]
+ignore = [
+    "RUF001", # 字符串、文档字符串与注释用中文标点
+    "RUF002",
+    "RUF003",
+    "S603",   # 子进程一律以参数列表启动，该规则对每次调用都报
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101"] # pytest 用 assert
+
+[tool.pyright]
+include = ["runtime", "tools"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+
+[tool.pytest]
+testpaths = ["runtime", "tools"]
+addopts = ["--import-mode=importlib", "-ra"]
+strict = true
+filterwarnings = ["error"]
