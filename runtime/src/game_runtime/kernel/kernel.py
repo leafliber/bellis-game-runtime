@@ -355,6 +355,7 @@ class Kernel:
                     and entry.instance is not None
                     and entry.instance.id == instance_id
                 ),
+                self._core.submit,
             )
         context = PluginContext(
             entry_id=entry.id,

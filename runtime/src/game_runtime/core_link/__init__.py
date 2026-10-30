@@ -1,7 +1,8 @@
-"""主进程一侧的实时核管理：拉起非提权的实时核子进程、核连接、控制产出者心跳、R-06 停止顺序，
+"""主进程一侧的实时核管理：拉起非提权的实时核子进程、核连接、控制产出者心跳与动作块、R-06 停止顺序，
 以及帧环的创建、挂接与采集目标。
 
-设计见 `docs/modules/realtime-core.md` 的“启动与生命线”与“采集主循环”。
+设计见 `docs/modules/realtime-core.md` 的“启动与生命线”“采集主循环”与“动作块的执行”。只用于测试的
+测试设备（测试许可源与假输入设备）在 `game_runtime.core_link.fake_device`，这里不导入它。
 """
 
 from game_runtime.core_link.capture import (
@@ -15,6 +16,8 @@ from game_runtime.core_link.link import (
     ENV_CHANNEL_KEY,
     ENV_CHANNEL_PATH,
     ENV_ROLE,
+    ENV_TEST_DEVICE_KEY,
+    ENV_TEST_DEVICE_PATH,
     CoreLink,
     CoreLinkOptions,
     CoreStartError,
@@ -35,6 +38,8 @@ __all__ = [
     "ENV_CHANNEL_KEY",
     "ENV_CHANNEL_PATH",
     "ENV_ROLE",
+    "ENV_TEST_DEVICE_KEY",
+    "ENV_TEST_DEVICE_PATH",
     "CaptureConfig",
     "CoreLink",
     "CoreLinkOptions",

@@ -6,6 +6,8 @@ from game_runtime.kernel.control import (
     ControlGrant,
     ControlRevokedError,
     CoreControl,
+    Submission,
+    SubmitFn,
 )
 from game_runtime.kernel.kernel import Kernel, KernelOptions
 from game_runtime.kernel.manifest import Manifest, NoConfig, Tier
@@ -44,6 +46,8 @@ __all__ = [
     "ResolvedEntry",
     "ServiceToken",
     "State",
+    "Submission",
+    "SubmitFn",
     "Tier",
     "Transition",
     "catalog",

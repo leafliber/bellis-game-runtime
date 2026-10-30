@@ -14,6 +14,9 @@
 再设定采集目标，然后才开始发心跳。帧环跨实例保留，`stop` 在实时核退出之后销毁它。同一时刻只有
 一个实例：上一个实例退出之后才能再 `start`，所以帧环只挂接给一个实时核，新实例从帧环头部的
 `write_seq` 续写帧号。
+
+`submit` 是 `CoreControl` 的第三项：控制产出者经提交资格（`ControlGrant.submit`）提交动作块，见
+`docs/modules/plugin-kernel.md` 的“提交动作块”。
 """
 
 import asyncio
@@ -22,14 +25,17 @@ import logging
 import math
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from core_protocol import models
 from core_protocol.methods import (
+    ACTION_RECEIPT,
+    ACTION_SUBMIT,
     CAPTURE_SET_TARGET,
     CORE_HEALTH,
     CORE_HELLO,
@@ -52,6 +58,7 @@ from core_protocol.models import (
     ReleaseReason,
 )
 from game_runtime.channel import (
+    ChannelCredentials,
     ChannelError,
     ChannelServer,
     Connection,
@@ -65,7 +72,7 @@ from game_runtime.core_link.capture import CaptureConfig
 from game_runtime.core_link.process import ManagedProcess, StopResult, StopStage, StopTimeouts
 from game_runtime.core_link.process import base_environment as _base_environment
 from game_runtime.frame_ring import FrameRing
-from game_runtime.kernel import ControlGrant, Kernel
+from game_runtime.kernel import ControlGrant, Kernel, Submission
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +82,9 @@ ENV_CHANNEL_PATH = "BELLIS_CHANNEL_PATH"
 ENV_CHANNEL_KEY = "BELLIS_CHANNEL_KEY"
 ENV_ROLE = "BELLIS_ROLE"
 """凭据经这三个环境变量交给子进程，与 Bellis 的 `ChildEnv` 相同。"""
+ENV_TEST_DEVICE_PATH = "GAME_RUNTIME_TEST_DEVICE_PATH"
+ENV_TEST_DEVICE_KEY = "GAME_RUNTIME_TEST_DEVICE_KEY"
+"""只用于测试：测试设备连接的地址与密钥经这两个环境变量交给以假输入后端启动的实时核。"""
 
 
 class CoreStartError(RuntimeError):
@@ -98,11 +108,18 @@ class CoreLinkOptions:
     start_timeout: float = 10.0
     """从拉起到收到 `core.hello` 与 `input.released(core_start)` 的时限。"""
     rpc_timeout: float = 2.0
-    """发给实时核的请求（`producer.revoke`、`frame_ring.attach`、`capture.set_target`）的截止时间。"""
+    """发给实时核的请求（`producer.revoke`、`action.submit`、`frame_ring.attach`、`capture.set_target`）
+    的截止时间。"""
+    max_frame_age: float = 0.5
+    """动作允许的帧龄，经命令行交给实时核：最新写入帧的帧龄超过它，实时核即不发输入并释放。"""
     stop: StopTimeouts = field(default_factory=StopTimeouts)
     """停止各步的时限。"""
     capture: CaptureConfig | None = None
     """帧环与采集目标；`None` 时不建帧环，也不设定采集目标。"""
+    test_device: ChannelCredentials | None = None
+    """只用于测试：测试设备（`game_runtime.core_link.fake_device.FakeDevice`）的地址与密钥。给出时以
+    假输入后端（`--input-backend fake`）拉起实时核，许可来自测试设备。生产中为 None：G0 没有真实的
+    输入后端与许可源，实时核从不发出输入。"""
 
     def __post_init__(self) -> None:
         timeouts = (
@@ -112,6 +129,7 @@ class CoreLinkOptions:
             self.health_timeout,
             self.start_timeout,
             self.rpc_timeout,
+            self.max_frame_age,
         )
         if min(timeouts) <= 0:
             raise ValueError("时限与周期必须为正")
@@ -122,17 +140,89 @@ class CoreLinkOptions:
 
     def argv(self) -> list[str]:
         """拉起实时核的参数列表。"""
-        return [
+        argv = [
             str(self.executable),
             "--heartbeat-timeout-ms",
             str(_millis(self.heartbeat_timeout)),
             "--health-interval-ms",
             str(_millis(self.health_interval)),
+            "--max-frame-age-ms",
+            str(_millis(self.max_frame_age)),
         ]
+        if self.test_device is not None:
+            argv += ["--input-backend", "fake"]
+        return argv
+
+    def child_env(self) -> dict[str, str]:
+        """除系统必需的变量与核连接的凭据外，交给实时核的环境变量：只有测试设备的地址与密钥。"""
+        if self.test_device is None:
+            return {}
+        return {
+            ENV_TEST_DEVICE_PATH: self.test_device.path,
+            ENV_TEST_DEVICE_KEY: self.test_device.encoded_key,
+        }
 
 
 def _millis(seconds: float) -> int:
     return max(1, math.ceil(seconds * 1000))
+
+
+def _nanos(seconds: float) -> int:
+    return round(seconds * 1e9)
+
+
+class _Submission:
+    """`CoreLink.submit` 交出的一块动作：实时核的回应与回执里各一次性动作的结果。"""
+
+    def __init__(self, block: models.ActionBlock, done: asyncio.Future[None]) -> None:
+        self.block = block
+        self._expected: set[int] = {
+            action.root.id for step in block.steps for action in step.actions
+        }
+        self._outcomes: dict[int, models.Executed | models.Dropped] = {}
+        self._result: models.Accepted | models.Rejected | None = None
+        self._done = done
+
+    @property
+    def result(self) -> models.Accepted | models.Rejected:
+        if self._result is None:
+            raise RuntimeError("还没有收到 action.submit 的回应")
+        return self._result
+
+    async def outcomes(self) -> Mapping[int, models.Executed | models.Dropped]:
+        await asyncio.shield(self._done)
+        return dict(self._outcomes)
+
+    def resolve(self, result: models.Accepted | models.Rejected) -> None:
+        self._result = result
+        if isinstance(result, models.Rejected):
+            # 被拒绝的块不执行任何动作，也没有回执。
+            self._expected = set()
+        self._settle()
+
+    def record(self, outcomes: Sequence[models.ActionOutcome]) -> None:
+        for outcome in outcomes:
+            self._outcomes.setdefault(outcome.root.id, outcome.root)
+        self._settle()
+
+    def fail(self, error: BaseException) -> None:
+        if self._done.done():
+            return
+        if isinstance(error, asyncio.CancelledError):
+            self._done.cancel()
+            return
+        self._done.set_exception(error)
+        # 没人等的时候不报“未取回的异常”。
+        self._done.exception()
+
+    @property
+    def settled(self) -> bool:
+        return self._done.done()
+
+    def _settle(self) -> None:
+        settled = self._result is not None and self._expected <= self._outcomes.keys()
+        if settled and not self._done.done():
+            self._done.set_result(None)
 
 
 @dataclass(eq=False)
@@ -176,6 +266,12 @@ class CoreLink:
         self._clean = True
         self._released: dict[int, asyncio.Future[None]] = {}
         self._heartbeat_seq = 0
+        self._heartbeat_generation: int | None = None
+        """运行中的实例最近一次心跳的代次。"""
+        self._block_seq = 0
+        """动作块序号，在主进程运行期间全局递增，因而在每个代次内严格递增。"""
+        self._submissions: dict[tuple[int, int], _Submission] = {}
+        """还在等回应或回执的动作块，按（代次，序号）索引。"""
         self._last_health: CoreHealthParams | None = None
         self._last_health_at_ns: int | None = None
         self._last_returncode: int | None = None
@@ -266,6 +362,7 @@ class CoreLink:
                 ENV_CHANNEL_PATH: created.path,
                 ENV_CHANNEL_KEY: created.encoded_key,
                 ENV_ROLE: CORE_ROLE,
+                **self._options.child_env(),
             }
             try:
                 process = ManagedProcess.start("realtime-core", self._options.argv(), env)
@@ -390,6 +487,89 @@ class CoreLink:
             self._released[generation] = future
         return future
 
+    async def submit(
+        self,
+        grant: ControlGrant,
+        steps: Sequence[models.ControlStep],
+        *,
+        base_frame: int,
+        valid_for: float,
+        start_delay: float = 0.0,
+    ) -> Submission:
+        """以 `grant` 的身份与代次提交一块动作（`action.submit`），返回时已收到回应。
+
+        起始时刻与有效截止时刻以 `time.perf_counter_ns()` 生成，与实时核同一时钟；序号由本对象管理；
+        `base_frame` 是产出者做决定时看的那一帧的帧号（读帧环得到）。这一代次还没发过心跳时
+        先发一次，让实时核在执行第一步之前就知道产出者在。发送前调用 `grant.check()`。
+        """
+        if not math.isfinite(valid_for) or valid_for <= 0:
+            raise ValueError(f"valid_for 须为正数：{valid_for}")
+        if not math.isfinite(start_delay) or start_delay < 0:
+            raise ValueError(f"start_delay 不能为负：{start_delay}")
+        grant.check()
+        instance = self._instance
+        peer = None if instance is None else instance.peer
+        if peer is None or not peer.connection.is_open:
+            raise ChannelError("closed", "核连接未建立，无法提交动作块")
+        if self._heartbeat_generation != grant.generation:
+            self._send_heartbeat(peer, grant)
+        self._block_seq += 1
+        start_ns = time.perf_counter_ns() + _nanos(start_delay)
+        block = models.ActionBlock(
+            producer=Producer(id=grant.producer, generation=grant.generation),
+            seq=self._block_seq,
+            base_frame=base_frame,
+            start_ns=start_ns,
+            deadline_ns=start_ns + _nanos(valid_for),
+            steps=list(steps),
+        )
+        submission = _Submission(block, asyncio.get_running_loop().create_future())
+        key = (grant.generation, block.seq)
+        # 回执可能先于回应到达：先登记再发。
+        self._submissions[key] = submission
+        try:
+            grant.check()
+            reply = await peer.request(
+                ACTION_SUBMIT.name, _dump(block), timeout=self._options.rpc_timeout
+            )
+            result = models.ActionSubmitResult.model_validate(reply).root
+        except BaseException as error:
+            self._submissions.pop(key, None)
+            submission.fail(error)
+            raise
+        submission.resolve(result)
+        if isinstance(result, models.Rejected):
+            logger.warning(
+                "实时核拒绝了动作块 %s#%d seq %d：%s（%s）",
+                grant.producer,
+                grant.generation,
+                block.seq,
+                result.reason,
+                result.message,
+            )
+        if submission.settled:
+            self._submissions.pop(key, None)
+        return submission
+
+    def _on_receipt_message(self, params: dict[str, Any]) -> None:
+        receipt = _parse(models.ActionReceiptParams, ACTION_RECEIPT.name, params)
+        if receipt is None:
+            return
+        key = (receipt.producer.generation, receipt.block_seq)
+        submission = self._submissions.get(key)
+        if submission is None:
+            logger.debug("收到不认识的动作块的回执：%s", key)
+            return
+        submission.record(receipt.outcomes)
+        if submission.settled:
+            self._submissions.pop(key, None)
+
+    def _fail_submissions(self, error: BaseException) -> None:
+        """实例退出：还没等到的回执不会再来。"""
+        for submission in self._submissions.values():
+            submission.fail(error)
+        self._submissions.clear()
+
     def _release_through(self, generation: int | None) -> None:
         """完成代次不大于 `generation` 的等待；None 表示全部。完成过的保留，之后再等立即返回。"""
         for number, future in self._released.items():
@@ -426,6 +606,7 @@ class CoreLink:
             INPUT_RELEASED.name, lambda params: self._on_released_message(instance, params)
         )
         peer.on_notification(CORE_HEALTH.name, lambda params: self._on_health_message(params))
+        peer.on_notification(ACTION_RECEIPT.name, self._on_receipt_message)
         instance.peer = peer
         peer.closed.add_done_callback(
             lambda _: logger.info("实时核 %d 的核连接已断开", instance.number)
@@ -490,14 +671,18 @@ class CoreLink:
             grant = None if self._grant_source is None else self._grant_source()
             peer = instance.peer
             if grant is not None and grant.is_open and peer is not None and peer.connection.is_open:
-                self._heartbeat_seq += 1
-                heartbeat = ProducerHeartbeatParams(
-                    producer=Producer(id=grant.producer, generation=grant.generation),
-                    seq=self._heartbeat_seq,
-                )
-                with contextlib.suppress(ChannelError):
-                    peer.notify(PRODUCER_HEARTBEAT.name, _dump(heartbeat))
+                self._send_heartbeat(peer, grant)
             await asyncio.sleep(self._options.heartbeat_interval)
+
+    def _send_heartbeat(self, peer: RpcPeer, grant: ControlGrant) -> None:
+        self._heartbeat_seq += 1
+        heartbeat = ProducerHeartbeatParams(
+            producer=Producer(id=grant.producer, generation=grant.generation),
+            seq=self._heartbeat_seq,
+        )
+        with contextlib.suppress(ChannelError):
+            peer.notify(PRODUCER_HEARTBEAT.name, _dump(heartbeat))
+            self._heartbeat_generation = grant.generation
 
     async def _watch_health(self, instance: _Instance) -> None:
         """`core.health` 超时与恢复时各记录一次。"""
@@ -533,6 +718,8 @@ class CoreLink:
             self._clean = returncode == 0
             self._last_returncode = returncode
             self._last_health_at_ns = None
+            self._heartbeat_generation = None
+            self._fail_submissions(ChannelError("closed", f"实时核 {instance.number} 已退出"))
         for task in instance.tasks:
             task.cancel()
         instance.closing = asyncio.get_running_loop().create_task(self._close(instance))
