@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dependencies]
+bellis-channel = { path = "../bellis-channel" }
+core-protocol = { path = "../core-protocol" }
+mono-clock = { path = "../mono-clock" }
+serde.workspace = true
+serde_json.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_UI_HiDpi"] }
 
