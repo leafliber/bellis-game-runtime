@@ -131,7 +131,8 @@ def test_synthetic_game_frames_reach_the_main_process_through_the_core(core_exe:
                     return got
 
                 menu = await show()
-                # 第 8 步才有假输入后端；这里直接点合成游戏，画面变了，帧环里的帧随之变化。
+                # 这里直接点合成游戏，只看帧的链路：画面变了，帧环里的帧随之变化。
+                # 经假输入后端的点击见 test_actions.py。
                 shop = next(t for t in game.truth().targets if t.id == "menu.shop")
                 effect = game.handle(Click(*shop.rect.center, MouseButton.LEFT))
                 assert (effect.kind, effect.target) == (EffectKind.HIT, "menu.shop")
@@ -174,7 +175,8 @@ def test_frozen_capture_lets_the_frame_age_grow(core_exe: Path) -> None:
                 assert later is not None
                 assert later.frame_number == last.frame_number
                 assert frame_age_ns(later.capture_ns) >= first_age + 300_000_000
-                # 实时核记下的最近一帧不再前进；采集源还在，只是没有新帧。第 8 步据帧龄释放输入。
+                # 实时核记下的最近一帧不再前进；采集源还在，只是没有新帧。
+                # 据帧龄释放输入见 test_actions.py。
                 after = await healths.after(time.perf_counter_ns())
                 assert after.now_ns - before.now_ns >= 300_000_000
                 assert after.latest_frame == written
