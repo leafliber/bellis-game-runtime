@@ -109,6 +109,7 @@ def test_type_tag_selects_the_union_branch() -> None:
 
     assert isinstance(window.target.root, models.WindowTarget)
     assert isinstance(fake.target.root, models.FakeTarget)
+    assert isinstance(fake.target.root.surface, models.FrameRingAttachParams)
     assert [type(action.root) for action in step.steps[0].actions] == [models.Click]
     assert [[type(held.root) for held in step.held] for step in continuous.steps] == [
         [models.HeldKey, models.HeldMouseButton, models.HeldAxis],

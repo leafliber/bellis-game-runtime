@@ -113,13 +113,17 @@ class WindowTarget(BaseModel):
 
 class FakeTarget(BaseModel):
     """
-    假采集源，只用于自动测试。
+    假采集源，只用于自动测试：从测试一侧创建并写入的假显示面取帧。
     """
 
     model_config = ConfigDict(
         extra="forbid",
     )
     type: Literal["fake"] = "fake"
+    surface: FrameRingAttachParams
+    """
+    假显示面的共享内存名与布局参数。假显示面与帧环同一布局，参数的含义与核对同 `frame_ring.attach`。
+    """
 
 
 class CaptureTarget(RootModel[WindowTarget | FakeTarget]):
