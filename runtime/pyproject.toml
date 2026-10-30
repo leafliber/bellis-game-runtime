@@ -3,7 +3,9 @@ name = "bellis-game-runtime"
 version = "0.0.0"
 description = "Bellis Game Runtime 的主进程与插件"
 requires-python = "==3.12.*"
-dependencies = []
+dependencies = [
+    "pydantic>=2.14.2",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.11,<0.12"]
