@@ -6,7 +6,7 @@ mod wgc;
 mod window;
 
 pub use pattern_window::{PatternCheck, PatternStyle, PatternWindow};
-pub use wgc::{BorderRequest, BorderStatus, WgcCapture, WgcOptions, WgcStats};
+pub use wgc::{BorderRequest, BorderStatus, WgcCapture, WgcOptions, WgcStats, is_supported};
 pub use window::{TopLevelWindow, find_window, list_windows, query_geometry};
 
 use crate::CaptureError;

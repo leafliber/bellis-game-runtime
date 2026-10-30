@@ -412,6 +412,18 @@ pub struct CoreHealthParams {
     pub inputs_held: bool,
     /// 当前控制产出者；没有时为 `null`。
     pub producer: Option<Producer>,
+    /// 本实例最近写进帧环的一帧；本实例还没写过帧时为 `null`。
+    pub latest_frame: Option<LatestFrame>,
+}
+
+/// 实时核最近写进帧环的一帧，是判断帧龄的依据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LatestFrame {
+    /// 帧环中的帧号。
+    pub frame_number: u64,
+    /// 采集时刻，与帧环的采集时刻同一时钟。
+    pub capture_ns: u64,
 }
 
 /// 采集状态。
@@ -420,8 +432,8 @@ pub struct CoreHealthParams {
 pub enum CaptureState {
     /// 还没有挂接帧环或设定采集目标。
     Idle,
-    /// 正在寻找目标窗口，没有帧。
+    /// 没有采集源：找不到目标窗口或采集源失效，正在定期重新识别；没有帧。
     Searching,
-    /// 正在采集，帧写入帧环。
+    /// 有采集源，帧写入帧环；窗口最小化等可恢复的情形下暂时没有新帧。
     Capturing,
 }

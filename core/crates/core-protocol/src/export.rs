@@ -16,8 +16,8 @@ use crate::messages::{
     CaptureSetTargetParams, CaptureState, CaptureTarget, Click, ControlStep, CoreHealthParams,
     CoreHelloParams, CoreHelloResult, DropReason, Dropped, Empty, Executed, FakeTarget,
     FrameRingAttachParams, HeldAxis, HeldInput, HeldKey, HeldMouseButton, InputReleasedParams,
-    KeyPress, MouseButton, MouseMove, Producer, ProducerHeartbeatParams, ProducerRevokeParams,
-    RejectReason, Rejected, ReleaseReason, Scroll, WindowTarget,
+    KeyPress, LatestFrame, MouseButton, MouseMove, Producer, ProducerHeartbeatParams,
+    ProducerRevokeParams, RejectReason, Rejected, ReleaseReason, Scroll, WindowTarget,
 };
 use crate::methods::{
     ActionReceipt, ActionSubmit, CaptureSetTarget, CoreHealth, CoreHello, CoreStop,
@@ -383,6 +383,10 @@ pub fn fixtures() -> Vec<Fixture> {
                 capture: CaptureState::Capturing,
                 inputs_held: false,
                 producer: Some(step_control()),
+                latest_frame: Some(LatestFrame {
+                    frame_number: 1200,
+                    capture_ns: 5_683_000_000,
+                }),
             },
         ),
     ]

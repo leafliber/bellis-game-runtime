@@ -7,13 +7,12 @@ publish.workspace = true
 
 [dependencies]
 bellis-channel = { path = "../bellis-channel" }
+capture = { path = "../capture" }
 core-protocol = { path = "../core-protocol" }
+frame-ring = { path = "../frame-ring" }
 mono-clock = { path = "../mono-clock" }
 serde.workspace = true
 serde_json.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_UI_HiDpi"] }
 
 [lints]
 workspace = true

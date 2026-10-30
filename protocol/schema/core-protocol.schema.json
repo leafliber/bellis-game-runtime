@@ -89,7 +89,8 @@
   },
   "x-error-codes": {
     "protocol_version_mismatch": -32001,
-    "frame_ring_mismatch": -32002
+    "frame_ring_mismatch": -32002,
+    "capture_unsupported": -32003
   },
   "$defs": {
     "CoreHelloParams": {
@@ -985,6 +986,17 @@
             }
           ],
           "description": "当前控制产出者；没有时为 `null`。"
+        },
+        "latest_frame": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LatestFrame"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "本实例最近写进帧环的一帧；本实例还没写过帧时为 `null`。"
         }
       },
       "required": [
@@ -1004,15 +1016,40 @@
         {
           "type": "string",
           "const": "searching",
-          "description": "正在寻找目标窗口，没有帧。"
+          "description": "没有采集源：找不到目标窗口或采集源失效，正在定期重新识别；没有帧。"
         },
         {
           "type": "string",
           "const": "capturing",
-          "description": "正在采集，帧写入帧环。"
+          "description": "有采集源，帧写入帧环；窗口最小化等可恢复的情形下暂时没有新帧。"
         }
       ],
       "description": "采集状态。"
+    },
+    "LatestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "frame_number": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "帧环中的帧号。",
+          "maximum": 18446744073709551615
+        },
+        "capture_ns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "采集时刻，与帧环的采集时刻同一时钟。",
+          "maximum": 18446744073709551615
+        }
+      },
+      "required": [
+        "frame_number",
+        "capture_ns"
+      ],
+      "description": "实时核最近写进帧环的一帧，是判断帧龄的依据。"
     }
   }
 }

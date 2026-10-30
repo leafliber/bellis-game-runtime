@@ -1,12 +1,14 @@
-"""真实的 `realtime-core`：握手、生命线、控制产出者心跳与时钟。
+"""真实的 `realtime-core`：握手、生命线、控制产出者心跳、时钟、帧环挂接与采集目标。
 
 `FakeMain` 由测试扮演主进程，按脚本收发核协议的消息，用来核对实时核一侧的规则；主进程一侧的实现
-（`CoreLink`、插件内核与停止顺序）见 `test_link.py`。Windows 上走命名管道，其它平台走 UDS。
+（`CoreLink`、插件内核与停止顺序）见 `test_link.py` 与 `test_capture.py`。Windows 上走命名管道，
+其它平台走 UDS。
 """
 
 import asyncio
 import contextlib
 import secrets
+import sys
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from pathlib import Path
@@ -14,10 +16,13 @@ from typing import Any
 
 import pytest
 
+from core_protocol import models
 from core_protocol.methods import (
+    CAPTURE_SET_TARGET,
     CORE_HEALTH,
     CORE_HELLO,
     CORE_STOP,
+    FRAME_RING_ATTACH,
     INPUT_RELEASED,
     PRODUCER_HEARTBEAT,
     PRODUCER_REVOKE,
@@ -51,6 +56,8 @@ from game_runtime.core_link import (
     StopTimeouts,
     base_environment,
 )
+from game_runtime.frame_ring import FrameRing
+from game_runtime.frame_ring.fake import FakeDisplay
 
 HEARTBEAT_TIMEOUT = 0.3
 HEALTH_INTERVAL = 0.05
@@ -165,6 +172,26 @@ class FakeMain:
             health, _ = await asyncio.wait_for(self.health.get(), WAIT)
             if health.now_ns >= settled:
                 return health
+
+    async def until_health(self, condition: Callable[[CoreHealthParams], bool]) -> CoreHealthParams:
+        """等到一条满足条件的 `core.health`。"""
+        deadline = time.monotonic() + WAIT
+        while True:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "没有等到满足条件的 core.health"
+            health, _ = await asyncio.wait_for(self.health.get(), remaining)
+            if condition(health):
+                return health
+
+    async def request(self, method: str, params: dict[str, Any]) -> object:
+        assert self.peer is not None
+        return await self.peer.request(method, params)
+
+    async def refused(self, method: str, params: dict[str, Any]) -> RpcError:
+        """发出请求，它须以错误回应；返回那个错误。"""
+        with pytest.raises(RpcError) as refused:
+            await self.request(method, params)
+        return refused.value
 
     def heartbeat(self, producer: str, generation: int, seq: int) -> None:
         assert self.peer is not None
@@ -425,5 +452,135 @@ def test_core_reads_the_same_clock_as_perf_counter_ns(core_exe: Path, tmp_path: 
             health, received = await asyncio.wait_for(fake.health.get(), WAIT)
             assert last <= health.now_ns <= received
             last = health.now_ns
+
+    run_with_core(core_exe, tmp_path, script)
+
+
+# 帧环与采集
+
+
+def attach_params(ring: FrameRing) -> dict[str, Any]:
+    return ring.attach_params().model_dump(mode="json")
+
+
+def target_params(target: models.WindowTarget | models.FakeTarget) -> dict[str, Any]:
+    params = models.CaptureSetTargetParams(target=models.CaptureTarget(root=target))
+    return params.model_dump(mode="json")
+
+
+def solid(width: int, height: int, value: int) -> bytes:
+    """每个字节都是 `value` 的 BGRA8 画面。"""
+    return bytes([value]) * (width * height * 4)
+
+
+def test_capture_goes_from_idle_to_capturing_and_fills_the_ring(
+    core_exe: Path, tmp_path: Path
+) -> None:
+    async def script(fake: FakeMain) -> None:
+        await fake.started()
+        with FrameRing.create(32, 24) as ring, FakeDisplay.create(32, 24) as display:
+            assert (await fake.snapshot()).capture is CaptureState.IDLE
+            # 只挂接了帧环、还没有采集目标：仍是 idle，没有写过帧。
+            assert await fake.request(FRAME_RING_ATTACH.name, attach_params(ring)) == {}
+            health = await fake.snapshot()
+            assert (health.capture, health.latest_frame) == (CaptureState.IDLE, None)
+
+            assert await fake.request(CAPTURE_SET_TARGET.name, target_params(display.target)) == {}
+            await fake.until_health(lambda h: h.capture is CaptureState.CAPTURING)
+            pixels = solid(32, 24, 0x5A)
+            display.present(pixels, 32, 24, capture_ns=12_345, transform_version=3)
+            health = await fake.until_health(lambda h: h.latest_frame is not None)
+            frame = ring.read_latest()
+            assert frame is not None
+            assert health.latest_frame == models.LatestFrame(frame_number=1, capture_ns=12_345)
+            assert (frame.frame_number, frame.capture_ns, frame.transform_version) == (1, 12_345, 3)
+            assert frame.pixels == pixels
+
+    run_with_core(core_exe, tmp_path, script)
+
+
+def test_a_new_target_replaces_the_old_source(core_exe: Path, tmp_path: Path) -> None:
+    async def script(fake: FakeMain) -> None:
+        await fake.started()
+        with (
+            FrameRing.create(16, 12) as ring,
+            FakeDisplay.create(16, 12) as first,
+            FakeDisplay.create(16, 12) as second,
+        ):
+            await fake.request(FRAME_RING_ATTACH.name, attach_params(ring))
+            await fake.request(CAPTURE_SET_TARGET.name, target_params(first.target))
+            first.present(solid(16, 12, 1), 16, 12)
+            await fake.until_health(lambda h: h.latest_frame is not None)
+
+            await fake.request(CAPTURE_SET_TARGET.name, target_params(second.target))
+            second.present(solid(16, 12, 2), 16, 12)
+            health = await fake.until_health(
+                lambda h: h.latest_frame is not None and h.latest_frame.frame_number > 1
+            )
+            frame = ring.read_latest()
+            assert frame is not None
+            assert frame.pixels == solid(16, 12, 2)
+            # 旧的采集源已停掉：旧显示面上的新帧不再进入帧环。
+            first.present(solid(16, 12, 3), 16, 12)
+            await asyncio.sleep(0.3)
+            assert (await fake.snapshot()).latest_frame == health.latest_frame
+            assert ring.latest_frame_number() == frame.frame_number
+
+    run_with_core(core_exe, tmp_path, script)
+
+
+def test_mismatched_rings_and_bad_targets_are_refused(core_exe: Path, tmp_path: Path) -> None:
+    async def script(fake: FakeMain) -> None:
+        await fake.started()
+        with FrameRing.create(16, 12) as ring, FakeDisplay.create(16, 12) as display:
+            params = attach_params(ring)
+            for bad in (
+                {**params, "max_width": 15},
+                {**params, "name": params["name"] + "x"},
+                {**params, "layout_version": 2},
+            ):
+                error = await fake.refused(FRAME_RING_ATTACH.name, bad)
+                assert error.code == ErrorCode.FRAME_RING_MISMATCH, bad
+            # 假显示面按同样的规则核对。
+            surface = {**display.target.surface.model_dump(mode="json"), "slot_count": 2}
+            error = await fake.refused(
+                CAPTURE_SET_TARGET.name, {"target": {"type": "fake", "surface": surface}}
+            )
+            assert error.code == ErrorCode.FRAME_RING_MISMATCH
+            # 窗口识别规则须给出窗口类或标题。
+            vague = models.WindowTarget(process_name="game.exe", window_class=None, title=None)
+            error = await fake.refused(CAPTURE_SET_TARGET.name, target_params(vague))
+            assert error.code == RpcErrorCode.INVALID_PARAMS
+            # 被拒绝的请求不改变什么。
+            assert (await fake.snapshot()).capture is CaptureState.IDLE
+            assert ring.latest_frame_number() == 0
+        log = fake.log()
+        assert "frame_ring.attach" in log
+        assert "header max_width is 16" in log
+
+    run_with_core(core_exe, tmp_path, script)
+
+
+def test_window_targets_search_on_windows_and_are_unsupported_elsewhere(
+    core_exe: Path, tmp_path: Path
+) -> None:
+    window = models.WindowTarget(
+        process_name="no-such-process-7f3a9c.exe", window_class=None, title="Bellis Test"
+    )
+
+    async def script(fake: FakeMain) -> None:
+        await fake.started()
+        with FrameRing.create(16, 12) as ring:
+            await fake.request(FRAME_RING_ATTACH.name, attach_params(ring))
+            if sys.platform == "win32":
+                assert await fake.request(CAPTURE_SET_TARGET.name, target_params(window)) == {}
+                health = await fake.until_health(lambda h: h.capture is not CaptureState.IDLE)
+                assert (health.capture, health.latest_frame) == (CaptureState.SEARCHING, None)
+                assert "no window matches" in fake.log()
+            else:
+                error = await fake.refused(CAPTURE_SET_TARGET.name, target_params(window))
+                assert error.code == ErrorCode.CAPTURE_UNSUPPORTED
+                assert "only available on Windows" in error.message
+                assert (await fake.snapshot()).capture is CaptureState.IDLE
 
     run_with_core(core_exe, tmp_path, script)
