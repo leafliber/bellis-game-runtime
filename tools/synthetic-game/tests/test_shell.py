@@ -1,4 +1,5 @@
-"""窗口外壳：键名与滚轮的转换、参数解析；有显示时建一个真实的 Tk 窗口核对客户区与事件转换。
+"""窗口外壳：键名与滚轮的转换、参数解析、重画的排定；有显示时建一个真实的 Tk 窗口核对客户区、
+事件转换与重画。
 
 没有 tk 或没有显示（如 Linux 容器）时跳过要建窗的测试。
 """
@@ -11,6 +12,7 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import pytest
+from PIL import Image
 
 from synthetic_game import (
     EffectKind,
@@ -22,13 +24,16 @@ from synthetic_game import (
     SyntheticGame,
 )
 from synthetic_game.shell import (
+    DEFAULT_REDRAW_HZ,
     KEYSYMS,
     TK_BUTTONS,
     WINDOW_CLASS,
     WINDOW_TITLE,
+    RedrawSchedule,
     Shell,
+    ShellOptions,
     WheelAccumulator,
-    parse_config,
+    parse_args,
 )
 
 if TYPE_CHECKING:
@@ -59,15 +64,39 @@ def test_wheel_deltas_accumulate_into_whole_notches() -> None:
 
 
 def test_command_line_sets_the_configuration() -> None:
-    assert parse_config([]) == GameConfig()
-    assert parse_config(
-        ["--width", "800", "--height", "600", "--text-cps", "12", "--choice-seconds", "3"]
-    ) == GameConfig(800, 600, 12.0, 3.0)
+    assert parse_args([]) == ShellOptions(GameConfig(), 30.0)
+    assert DEFAULT_REDRAW_HZ == 30.0
+    assert parse_args(
+        [
+            *("--width", "800", "--height", "600", "--text-cps", "12"),
+            *("--choice-seconds", "3", "--redraw-hz", "60"),
+        ]
+    ) == ShellOptions(GameConfig(800, 600, 12.0, 3.0), 60.0)
 
 
-def test_invalid_command_line_is_rejected() -> None:
+@pytest.mark.parametrize(
+    "argv",
+    [["--width", "10"], ["--redraw-hz", "0"], ["--redraw-hz", "1001"], ["--redraw-hz", "nan"]],
+)
+def test_invalid_command_line_is_rejected(argv: list[str]) -> None:
     with pytest.raises(SystemExit):
-        parse_config(["--width", "10"])
+        parse_args(argv)
+
+
+def test_redraws_keep_a_fixed_rate_without_drifting() -> None:
+    schedule = RedrawSchedule(30, start=0.0)
+    # 每次重画耗时不同，下一次仍排在 1/30 秒的整数倍上。
+    assert schedule.delay_ms(0.005) == 28
+    assert schedule.delay_ms(0.040) == 27
+    assert schedule.delay_ms(0.070) == 30
+    # 落后超过一个周期：不追赶，尽快重画一次，再从那时起按周期排。
+    assert schedule.delay_ms(1.0) == 1
+    assert schedule.delay_ms(1.001) == 32
+
+
+def test_redraw_rate_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="重画频率"):
+        RedrawSchedule(0, start=0.0)
 
 
 def test_window_identity_is_fixed() -> None:
@@ -148,3 +177,33 @@ def test_key_press_reaches_the_state_machine(root: tkinter.Toplevel) -> None:
     effect = shell.game.truth().last_effect
     assert effect is not None
     assert (effect.kind, effect.target) == (EffectKind.KEY, "menu.shop")
+
+
+def test_redraw_repaints_the_window_even_when_the_picture_is_unchanged(
+    root: tkinter.Toplevel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shell = make_shell(root)
+    pasted: list[Image.Image] = []
+    paste = shell.photo.paste
+
+    def counting_paste(image: Image.Image) -> None:
+        pasted.append(image)
+        paste(image)
+
+    monkeypatch.setattr(shell.photo, "paste", counting_paste)
+    shown = shell.game.frame().number
+
+    shell.redraw()
+    shell.redraw()
+    assert shell.refresh() is False, "refresh alone does not repaint an unchanged picture"
+    assert shell.game.frame().number == shown
+    assert len(pasted) == 2
+
+    shell.press_keysym("Down")  # 光标移动，画面变化：立即更新，不等下一次重画
+    assert shell.game.frame().number == shown + 1
+    assert len(pasted) == 3
+
+
+def test_shell_rejects_a_bad_redraw_rate(root: tkinter.Toplevel) -> None:
+    with pytest.raises(ValueError, match="重画频率"):
+        Shell(root, SyntheticGame(GameConfig(320, 180), ManualClock()), redraw_hz=-1)
