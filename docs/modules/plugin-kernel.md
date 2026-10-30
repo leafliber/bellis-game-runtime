@@ -133,7 +133,7 @@
 清单申请了 `control.submit` 且 profile 授予了它的条目是控制产出者的候选；宿主以 `set_control_producer(条目 id 或 None)` 指定其中一个，G0 由宿主直接指定，以后由模式仲裁决定。
 
 - **单写者。** 任何时刻至多一个控制产出者持有实例（LOADING 到 UNLOADING 之间）。更换时旧的先走完 QUIESCING，新的才激活；旧的还在 QUIESCING 时新的停在 WAITING（`control-handover-pending`）。
-- **代次。** 每激活一次控制产出者代次加一，在本次主进程运行内单调递增。插件经 `ctx.control` 拿到提交资格 `ControlGrant`：条目 id、实例 id 与代次。资格只在该实例 ACTIVE 时有效，激活期间尚未生效；提交动作块的路径在发送前调用 `check()`，失效即抛 `ControlRevokedError`。宿主经 `active_control` 读当前有效的资格。
+- **代次。** 每激活一次控制产出者代次加一，在本次主进程运行内单调递增。插件经 `ctx.control` 拿到提交资格 `ControlGrant`：条目 id、实例 id 与代次。资格只在该实例 ACTIVE 时有效，激活期间尚未生效；提交动作块的路径在发送前调用 `check()`，失效即抛 `ControlRevokedError`。宿主经 `active_control` 读当前有效的资格；插件以资格提交动作块，见下文[提交动作块](#提交动作块)。
 
 **QUIESCING。** 控制产出者无论因停用、依赖消失还是被更换而停用，都依次：
 
@@ -142,11 +142,22 @@
 3. **等到输入已释放的确认：** 等 `CoreControl.wait_released` 返回。作废请求送达失败只记录，仍等确认。
 4. **撤销注册：** 确认到达且 `quiesce` 结束后，按后注册先撤销的顺序撤销。
 
-`CoreControl` 是实时核一侧的接口，只有上面两项。真实实现是核连接的 `CoreLink`（`runtime/src/game_runtime/core_link/`）：`invalidate_generation` 发 `producer.revoke`，请求写出后返回；`wait_released` 在 `producer.revoke` 的回应、新实例的 `input.released(core_start)` 或实时核释放后以 0 退出时完成，细节见[释放](realtime-core.md#释放)。测试也用假实现。
+`CoreControl` 是实时核一侧的接口，有三项：上面的 `invalidate_generation` 与 `wait_released`，内核用它们完成 QUIESCING；以及[提交动作块](#提交动作块)的 `submit`，内核只把它交给提交资格，自己不调用。真实实现是核连接的 `CoreLink`（`runtime/src/game_runtime/core_link/`）：`invalidate_generation` 发 `producer.revoke`，请求写出后返回；`wait_released` 在 `producer.revoke` 的回应、新实例的 `input.released(core_start)` 或实时核释放后以 0 退出时完成，细节见[释放](realtime-core.md#释放)。测试也用假实现。
 
 **等确认超时。** 从请求作废起 `release_timeout` 内没有确认时，条目保持 QUIESCING，原因为 `release-timeout`，记录告警并通知宿主；不撤销注册，也不放弃等待，确认到达后再撤销注册并完成停用。等待期间新的控制产出者不激活，它依赖的提供方也不停用。没有确认就撤销注册会违反上面的顺序；此时提交资格已失效，主进程不再提交该代次的动作块，已提交的动作块到有效截止时刻即被实时核释放（[动作块](core-protocol.md#动作块)）。`wait_released` 抛错时同样保持 QUIESCING，原因为 `release-failed`，不自动恢复，由操作员处理；主进程退出时实时核按生命线释放输入。
 
 **停止内核。** 主进程停止时宿主调用 `shutdown`，再按 R-06 停止实时核（[停止](realtime-core.md#停止)）。`shutdown` 让全部条目不再应当运行，在调和任务里按 profile 逆序停用，此后不再激活任何条目，也不再接受 `add`；条目的启用开关不变，DISPOSED 的原因是 `disabled`（“内核已停止”）。控制产出者照常走完 QUIESCING；等确认超时或失败时照常以 `release-timeout` 或 `release-failed` 上报，然后记录告警、撤销注册继续停止，它依赖的提供方随后停用。停止前已卡在 QUIESCING 的控制产出者不再计时，同样撤销注册。这里不再等确认，是因为接下来实时核停止时也会释放全部输入：`core.stop` 先释放再回应；实时核不应答时关 stdin，它读到 EOF 释放后退出；最后才强制终止。
+
+### 提交动作块
+
+控制产出者以 `ctx.control.submit(steps, base_frame=…, valid_for=…, start_delay=0)` 提交一块动作，这就是 `control.submit` 权限的用法。内核创建资格时把 `CoreControl.submit` 交给它，插件拿不到核连接本身：
+
+1. `ControlGrant.submit` 先 `check()`，资格已收回即抛 `ControlRevokedError`，什么也不发；再交给 `CoreControl.submit`。
+2. `CoreLink.submit`（`runtime/src/game_runtime/core_link/`）再 `check()` 一次后组装动作块：身份与代次取自资格；起始时刻为 `time.perf_counter_ns()` 加 `start_delay` 秒，有效截止时刻再加 `valid_for` 秒，与实时核同一时钟；`seq` 在主进程运行期间全局递增，因而在每个代次内严格递增；`base_frame` 由产出者给出，是它做决定时看的那一帧在帧环中的帧号（`CoreLink.frames` 读出的 `RingFrame.frame_number`），坐标按这一帧的客户区解释（[坐标与几何](core-protocol.md#坐标与几何)）。这一代次还没发过心跳时先发一次，让实时核在执行第一步之前就知道产出者在。
+3. 发出 `action.submit`，等实时核的回应后返回 `Submission`：`result` 是 `Accepted` 或 `Rejected`（原因见[消息集](core-protocol.md#消息集)）；`await outcomes()` 等到每个一次性动作都有了回执，按动作身份给出 `Executed` 或 `Dropped`，被拒绝的块与没有一次性动作的块立即返回空。实时核退出时还没等到的回执以 `ChannelError` 失败。
+4. `executed` 只表示已交给输入后端，不代表游戏中的效果已发生；效果由感知从新的帧判断。
+
+接受不等于执行：实时核在每次把输入交给后端之前另行核对输入许可、心跳与帧龄（[动作块的执行](realtime-core.md#动作块的执行)），不成立即不发并释放，主进程一侧由 `input.released` 与回执的 `released` 得知。插件不能放宽这些条件，也拿不到许可。
 
 ## profile
 
@@ -175,7 +186,7 @@ profile 与 patch 是 JSON 文件，格式同 Bellis（`packages/protocol` 的 `
 | `definePlugin` 的 `activate`、`quiesce` | `Plugin` 子类的同名方法 | 上下文没有 `on`、`extensions`、`optional`、`fail`、`signal`、`forced`、`log`；多了 `control` |
 | 状态 | 同名的七个状态 | 无 |
 | 静止中：吊销执行许可 → 插件收尾并等待物理确认 → 撤销；超时即强制撤销，记 `unknown` 并告警，关键平面急停 | 控制产出者：提交资格失效 → 请求作废代次（插件同时收尾）→ 等确认 → 撤销 | 物理确认由内核向实时核取得，不靠插件的 `quiesce`；超时不强制撤销，保持 QUIESCING 并继续等，输入由实时核按失效规则释放 |
-| 与安全核的接缝 `KernelSafetyHooks` | `CoreControl` | 只有作废代次与等确认两项；没有维护态，因为不做热替换 |
+| 与安全核的接缝 `KernelSafetyHooks` | `CoreControl` | 作废代次与等确认两项，另有经提交资格交给控制产出者的 `submit`；没有维护态，因为不做热替换 |
 | 实例活动满 60 秒后重试计数清零 | 激活成功即清零 | 没有运行中报告失败的入口 |
 | 宿主直接提供的服务 `provideCore`、`provideScoped` | 无 | 用到时再加 |
 | profile 与 patch 的格式与展开规则 | 同 | 不检查安全核的名字，因为实时核不是插件、不经加载器；不记 `explicitSwitch`（只用于 Bellis 的审核插件）；条目的 `config` 必须是对象，Bellis 到激活时才报错 |
@@ -189,7 +200,7 @@ profile 与 patch 是 JSON 文件，格式同 Bellis（`packages/protocol` 的 `
 
 | 阶段 | 内容 |
 | --- | --- |
-| G0 | 依赖缺失时停在 WAITING 并说明原因，恢复后激活；未授予权限即不激活；FAILED 有限次退避重试；控制产出者的 QUIESCING 按顺序完成，等到输入已释放才撤销注册，与真实实时核联调同样成立；停止内核时按 profile 逆序停用，等确认超时上报后继续 |
+| G0 | 依赖缺失时停在 WAITING 并说明原因，恢复后激活；未授予权限即不激活；FAILED 有限次退避重试；控制产出者的 QUIESCING 按顺序完成，等到输入已释放才撤销注册，与真实实时核联调同样成立（按住输入时更换控制产出者，新产出者在实时核释放之后才激活）；提交资格收回后 `submit` 什么也不发；停止内核时按 profile 逆序停用，等确认超时上报后继续 |
 
 ## 技术路线
 
