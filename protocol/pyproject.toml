@@ -1,0 +1,15 @@
+[project]
+name = "core-protocol"
+version = "0.0.0"
+description = "核协议的 Python 端：由 Rust 类型生成的 Pydantic 模型与方法目录，以及帧环布局"
+requires-python = "==3.12.*"
+dependencies = [
+    "pydantic>=2.14.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "core_protocol"

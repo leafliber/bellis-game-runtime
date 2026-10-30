@@ -1,0 +1,9 @@
+{
+  "name": "bellis-game-runtime-frames-example",
+  "size_bytes": 24883456,
+  "layout_version": 1,
+  "slot_count": 3,
+  "slot_stride": 8294464,
+  "max_width": 1920,
+  "max_height": 1080
+}

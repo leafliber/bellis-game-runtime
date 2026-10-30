@@ -1,12 +1,13 @@
 [project]
 name = "bellis-game-runtime-check"
 version = "0.0.0"
-description = "统一检查入口：uv run check 与 uv run check --linux"
+description = "统一检查入口：uv run check 与 uv run check --linux；生成物的重新生成：uv run generate"
 requires-python = "==3.12.*"
 dependencies = []
 
 [project.scripts]
 check = "game_runtime_check:main"
+generate = "game_runtime_check.generate:main"
 
 [build-system]
 requires = ["uv_build>=0.11.11,<0.12"]

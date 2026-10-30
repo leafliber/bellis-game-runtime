@@ -4,6 +4,7 @@ version = "0.0.0"
 description = "Bellis Game Runtime 的主进程与插件"
 requires-python = "==3.12.*"
 dependencies = [
+    "core-protocol",
     "pydantic>=2.14.2",
 ]
 
@@ -13,3 +14,6 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = "game_runtime"
+
+[tool.uv.sources]
+core-protocol = { workspace = true }

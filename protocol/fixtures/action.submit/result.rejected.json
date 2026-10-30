@@ -1,0 +1,5 @@
+{
+  "type": "rejected",
+  "reason": "stale_generation",
+  "message": "generation 2 is older than the current generation 3"
+}

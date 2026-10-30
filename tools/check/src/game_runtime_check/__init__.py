@@ -49,6 +49,8 @@ STEPS: tuple[Step, ...] = (
     ),
     Step("cargo test", ("cargo", "test", "--workspace", "--locked"), cwd="core"),
     Step("pytest", (PYTHON, "-m", "pytest")),
+    # 生成物核对：重新生成到临时目录，与入库的逐字节比较（game_runtime_check.generate）。
+    Step("generated files", (PYTHON, "-m", "game_runtime_check.generate", "--check")),
 )
 
 # --linux 用的镜像与卷。下载缓存各检出目录共用；虚拟环境、cargo target 与工具缓存按检出目录

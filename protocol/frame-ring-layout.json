@@ -1,0 +1,134 @@
+{
+  "constants": [
+    {
+      "name": "MAGIC",
+      "value": 5138124842827138882
+    },
+    {
+      "name": "LAYOUT_VERSION",
+      "value": 1
+    },
+    {
+      "name": "SLOTS_OFFSET",
+      "value": 64
+    },
+    {
+      "name": "SLOT_PIXELS_OFFSET",
+      "value": 64
+    },
+    {
+      "name": "SLOT_ALIGN",
+      "value": 64
+    },
+    {
+      "name": "PIXEL_FORMAT_BGRA8",
+      "value": 1
+    }
+  ],
+  "structs": [
+    {
+      "name": "FrameRingHeader",
+      "size": 40,
+      "align": 8,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        {
+          "name": "layout_version",
+          "offset": 8,
+          "size": 4,
+          "type": "u32"
+        },
+        {
+          "name": "slot_count",
+          "offset": 12,
+          "size": 4,
+          "type": "u32"
+        },
+        {
+          "name": "slot_stride",
+          "offset": 16,
+          "size": 8,
+          "type": "u64"
+        },
+        {
+          "name": "max_width",
+          "offset": 24,
+          "size": 4,
+          "type": "u32"
+        },
+        {
+          "name": "max_height",
+          "offset": 28,
+          "size": 4,
+          "type": "u32"
+        },
+        {
+          "name": "write_seq",
+          "offset": 32,
+          "size": 8,
+          "type": "atomic_u64"
+        }
+      ]
+    },
+    {
+      "name": "FrameSlotHeader",
+      "size": 48,
+      "align": 8,
+      "fields": [
+        {
+          "name": "seq",
+          "offset": 0,
+          "size": 8,
+          "type": "atomic_u64"
+        },
+        {
+          "name": "frame_number",
+          "offset": 8,
+          "size": 8,
+          "type": "u64"
+        },
+        {
+          "name": "capture_ns",
+          "offset": 16,
+          "size": 8,
+          "type": "u64"
+        },
+        {
+          "name": "transform_version",
+          "offset": 24,
+          "size": 8,
+          "type": "u64"
+        },
+        {
+          "name": "width",
+          "offset": 32,
+          "size": 4,
+          "type": "u32"
+        },
+        {
+          "name": "height",
+          "offset": 36,
+          "size": 4,
+          "type": "u32"
+        },
+        {
+          "name": "row_stride",
+          "offset": 40,
+          "size": 4,
+          "type": "u32"
+        },
+        {
+          "name": "pixel_format",
+          "offset": 44,
+          "size": 4,
+          "type": "u32"
+        }
+      ]
+    }
+  ]
+}

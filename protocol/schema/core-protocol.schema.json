@@ -1,0 +1,1013 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CoreProtocol",
+  "description": "主进程与实时核之间核连接上的消息，由 core/crates/core-protocol 生成。",
+  "x-protocol-version": 1,
+  "x-methods": {
+    "core.hello": {
+      "direction": "core_to_main",
+      "params": {
+        "$ref": "#/$defs/CoreHelloParams"
+      },
+      "result": {
+        "$ref": "#/$defs/CoreHelloResult"
+      }
+    },
+    "frame_ring.attach": {
+      "direction": "main_to_core",
+      "params": {
+        "$ref": "#/$defs/FrameRingAttachParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "capture.set_target": {
+      "direction": "main_to_core",
+      "params": {
+        "$ref": "#/$defs/CaptureSetTargetParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "producer.heartbeat": {
+      "direction": "main_to_core",
+      "params": {
+        "$ref": "#/$defs/ProducerHeartbeatParams"
+      },
+      "result": null
+    },
+    "action.submit": {
+      "direction": "main_to_core",
+      "params": {
+        "$ref": "#/$defs/ActionBlock"
+      },
+      "result": {
+        "$ref": "#/$defs/ActionSubmitResult"
+      }
+    },
+    "producer.revoke": {
+      "direction": "main_to_core",
+      "params": {
+        "$ref": "#/$defs/ProducerRevokeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "core.stop": {
+      "direction": "main_to_core",
+      "params": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "action.receipt": {
+      "direction": "core_to_main",
+      "params": {
+        "$ref": "#/$defs/ActionReceiptParams"
+      },
+      "result": null
+    },
+    "input.released": {
+      "direction": "core_to_main",
+      "params": {
+        "$ref": "#/$defs/InputReleasedParams"
+      },
+      "result": null
+    },
+    "core.health": {
+      "direction": "core_to_main",
+      "params": {
+        "$ref": "#/$defs/CoreHealthParams"
+      },
+      "result": null
+    }
+  },
+  "x-error-codes": {
+    "protocol_version_mismatch": -32001,
+    "frame_ring_mismatch": -32002
+  },
+  "$defs": {
+    "CoreHelloParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "实时核实现的核协议版本。",
+          "maximum": 4294967295
+        },
+        "core_version": {
+          "type": "string",
+          "description": "实时核的程序版本，只用于日志与诊断。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "core_version"
+      ],
+      "description": "`core.hello` 的 params：实时核通过通道认证后发出的第一条消息。"
+    },
+    "CoreHelloResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "主进程实现的核协议版本。",
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "protocol_version"
+      ],
+      "description": "`core.hello` 的 result：主进程接受握手。"
+    },
+    "FrameRingAttachParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "共享内存名。"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "共享内存的总字节数。",
+          "maximum": 18446744073709551615
+        },
+        "layout_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "帧环的布局版本。",
+          "maximum": 4294967295
+        },
+        "slot_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "槽数。",
+          "maximum": 4294967295
+        },
+        "slot_stride": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "相邻两槽起点之间的字节数。",
+          "maximum": 18446744073709551615
+        },
+        "max_width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "帧的最大宽度（物理像素）。",
+          "maximum": 4294967295
+        },
+        "max_height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "帧的最大高度（物理像素）。",
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "name",
+        "size_bytes",
+        "layout_version",
+        "slot_count",
+        "slot_stride",
+        "max_width",
+        "max_height"
+      ],
+      "description": "`frame_ring.attach` 的 params：主进程创建的帧环的共享内存名与布局参数。"
+    },
+    "Empty": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "不带字段的 params 或 result。"
+    },
+    "CaptureSetTargetParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/CaptureTarget",
+          "description": "采集目标。"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "description": "`capture.set_target` 的 params。"
+    },
+    "CaptureTarget": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "window"
+            },
+            "process_name": {
+              "type": "string",
+              "description": "进程的可执行文件名，不区分大小写。"
+            },
+            "window_class": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "窗口类名，全等匹配；`null` 表示不按窗口类匹配。"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "窗口标题，全等匹配；`null` 表示不按标题匹配。"
+            }
+          },
+          "required": [
+            "type",
+            "process_name"
+          ],
+          "title": "WindowTarget",
+          "description": "窗口识别规则：进程名加窗口类或标题，至少给出窗口类与标题之一。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "title": "FakeTarget",
+          "description": "假采集源，只用于自动测试。",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "fake"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ],
+      "description": "采集目标：按规则识别的游戏窗口，或测试用的假采集源。",
+      "discriminator": {
+        "propertyName": "type"
+      }
+    },
+    "ProducerHeartbeatParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "producer": {
+          "$ref": "#/$defs/Producer",
+          "description": "发出心跳的控制产出者。"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "心跳序号，同一代次内严格递增。",
+          "maximum": 18446744073709551615
+        }
+      },
+      "required": [
+        "producer",
+        "seq"
+      ],
+      "description": "`producer.heartbeat` 的 params：当前控制产出者的心跳。"
+    },
+    "Producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "控制产出者的身份。"
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "代次，由主进程分配，在一个实时核的生命期内严格递增。",
+          "maximum": 18446744073709551615
+        }
+      },
+      "required": [
+        "id",
+        "generation"
+      ],
+      "description": "控制产出者的身份与代次。"
+    },
+    "ActionBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "producer": {
+          "$ref": "#/$defs/Producer",
+          "description": "产出这块动作的控制产出者。"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "动作块序号，同一代次内严格递增。",
+          "maximum": 18446744073709551615
+        },
+        "base_frame": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "基准帧号：产出者做决定时依据的帧，坐标按这一帧的客户区解释。",
+          "maximum": 18446744073709551615
+        },
+        "start_ns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "起始时刻。",
+          "maximum": 18446744073709551615
+        },
+        "deadline_ns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "有效截止时刻：到时还没有新的动作块，实时核即释放全部输入。",
+          "maximum": 18446744073709551615
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ControlStep"
+          },
+          "description": "按时间排列的控制步，至少一步。"
+        }
+      },
+      "required": [
+        "producer",
+        "seq",
+        "base_frame",
+        "start_ns",
+        "deadline_ns",
+        "steps"
+      ],
+      "description": "`action.submit` 的 params：主进程向实时核提交的唯一动作形式。"
+    },
+    "ControlStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "offset_ns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "相对起始时刻的纳秒数，在块内不减。",
+          "maximum": 18446744073709551615
+        },
+        "held": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HeldInput"
+          },
+          "description": "完整的持续状态：列出的保持按下或保持取值，没列出的一律释放。"
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "description": "一次性动作，按列出的顺序执行。"
+        }
+      },
+      "required": [
+        "offset_ns",
+        "held",
+        "actions"
+      ],
+      "description": "动作块中的一步：从这一步的时刻起生效的完整持续状态，以及在这一时刻执行的一次性动作。"
+    },
+    "HeldInput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "key"
+            },
+            "scan_code": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535,
+              "description": "扫描码（Set 1）；扩展键在高字节带 `0xE0`。"
+            }
+          },
+          "required": [
+            "type",
+            "scan_code"
+          ],
+          "title": "HeldKey",
+          "description": "按住的键。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "mouse_button"
+            },
+            "button": {
+              "$ref": "#/$defs/MouseButton",
+              "description": "鼠标键。"
+            }
+          },
+          "required": [
+            "type",
+            "button"
+          ],
+          "title": "HeldMouseButton",
+          "description": "按住的鼠标键。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "axis"
+            },
+            "axis": {
+              "type": "string",
+              "description": "轴名，由游戏适配包的白名单定义。"
+            },
+            "value": {
+              "type": "number",
+              "format": "double",
+              "description": "取值，范围 [-1, 1]。"
+            }
+          },
+          "required": [
+            "type",
+            "axis",
+            "value"
+          ],
+          "title": "HeldAxis",
+          "description": "轴的取值。"
+        }
+      ],
+      "description": "持续状态的一项。",
+      "discriminator": {
+        "propertyName": "type"
+      }
+    },
+    "MouseButton": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "left",
+          "description": "左键。"
+        },
+        {
+          "type": "string",
+          "const": "right",
+          "description": "右键。"
+        },
+        {
+          "type": "string",
+          "const": "middle",
+          "description": "中键。"
+        }
+      ],
+      "description": "鼠标键。"
+    },
+    "Action": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "click"
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "动作身份，在同一代次内唯一。",
+              "maximum": 18446744073709551615
+            },
+            "x": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "description": "客户区横坐标（物理像素）。",
+              "maximum": 4294967295
+            },
+            "y": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "description": "客户区纵坐标（物理像素）。",
+              "maximum": 4294967295
+            },
+            "button": {
+              "$ref": "#/$defs/MouseButton",
+              "description": "鼠标键。"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "x",
+            "y",
+            "button"
+          ],
+          "title": "Click",
+          "description": "点击：移到客户区坐标处按下并抬起；按住时长由游戏适配包给出。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "key_press"
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "动作身份，在同一代次内唯一。",
+              "maximum": 18446744073709551615
+            },
+            "scan_code": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535,
+              "description": "扫描码（Set 1）；扩展键在高字节带 `0xE0`。"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "scan_code"
+          ],
+          "title": "KeyPress",
+          "description": "短按：按下并抬起一个键；按住时长由游戏适配包给出。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "scroll"
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "动作身份，在同一代次内唯一。",
+              "maximum": 18446744073709551615
+            },
+            "x": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "description": "客户区横坐标（物理像素）。",
+              "maximum": 4294967295
+            },
+            "y": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "description": "客户区纵坐标（物理像素）。",
+              "maximum": 4294967295
+            },
+            "notches": {
+              "type": "integer",
+              "format": "int32",
+              "description": "滚轮格数，正数向前（远离用户）。",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "x",
+            "y",
+            "notches"
+          ],
+          "title": "Scroll",
+          "description": "滚动：移到客户区坐标处滚动滚轮。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "mouse_move"
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "动作身份，在同一代次内唯一。",
+              "maximum": 18446744073709551615
+            },
+            "dx": {
+              "type": "integer",
+              "format": "int32",
+              "description": "横向位移（鼠标计数），正数向右。",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            },
+            "dy": {
+              "type": "integer",
+              "format": "int32",
+              "description": "纵向位移（鼠标计数），正数向下。",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "dx",
+            "dy"
+          ],
+          "title": "MouseMove",
+          "description": "鼠标相对位移。"
+        }
+      ],
+      "description": "一次性动作。每个都带身份，供实时核去重：重传不重复执行。",
+      "discriminator": {
+        "propertyName": "type"
+      }
+    },
+    "ActionSubmitResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "title": "Accepted",
+          "description": "动作块已接受，按时间执行。",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "accepted"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "rejected"
+            },
+            "reason": {
+              "$ref": "#/$defs/RejectReason",
+              "description": "拒绝的原因。"
+            },
+            "message": {
+              "type": "string",
+              "description": "给人看的说明，只用于日志与诊断。"
+            }
+          },
+          "required": [
+            "type",
+            "reason",
+            "message"
+          ],
+          "title": "Rejected",
+          "description": "动作块被拒绝，其中任何动作都不执行。"
+        }
+      ],
+      "description": "`action.submit` 的 result：实时核是否接受这块动作。",
+      "discriminator": {
+        "propertyName": "type"
+      }
+    },
+    "RejectReason": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "stale_generation",
+          "description": "代次早于当前代次，或已被作废。"
+        },
+        {
+          "type": "string",
+          "const": "producer_mismatch",
+          "description": "代次等于当前代次，身份却不同。"
+        },
+        {
+          "type": "string",
+          "const": "stale_seq",
+          "description": "序号不大于同一代次已接受的动作块。"
+        },
+        {
+          "type": "string",
+          "const": "expired",
+          "description": "有效截止时刻已过。"
+        },
+        {
+          "type": "string",
+          "const": "invalid",
+          "description": "内容不合规则，例如步的时刻倒序、同一项持续状态出现两次、动作身份在块内重复。"
+        }
+      ],
+      "description": "动作块被拒绝的原因。"
+    },
+    "ProducerRevokeParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "作废此代次及更早的全部代次。",
+          "maximum": 18446744073709551615
+        }
+      },
+      "required": [
+        "generation"
+      ],
+      "description": "`producer.revoke` 的 params：作废代次。实时核释放完成后才回应，回应即输入已释放的确认。"
+    },
+    "ActionReceiptParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "producer": {
+          "$ref": "#/$defs/Producer",
+          "description": "动作块所属的控制产出者。"
+        },
+        "block_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "动作块的序号。",
+          "maximum": 18446744073709551615
+        },
+        "outcomes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ActionOutcome"
+          },
+          "description": "各一次性动作的结果，每个动作在一块中只报一次。"
+        }
+      },
+      "required": [
+        "producer",
+        "block_seq",
+        "outcomes"
+      ],
+      "description": "`action.receipt` 的 params：一块动作中一次性动作的执行结果。"
+    },
+    "ActionOutcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "executed"
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "动作身份。",
+              "maximum": 18446744073709551615
+            },
+            "at_ns": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "交给输入后端的时刻。",
+              "maximum": 18446744073709551615
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "at_ns"
+          ],
+          "title": "Executed",
+          "description": "动作已交给输入后端；不代表游戏中的效果已发生。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "dropped"
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "动作身份。",
+              "maximum": 18446744073709551615
+            },
+            "reason": {
+              "$ref": "#/$defs/DropReason",
+              "description": "没有执行的原因。"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "reason"
+          ],
+          "title": "Dropped",
+          "description": "动作没有执行。"
+        }
+      ],
+      "description": "一个一次性动作的结果。",
+      "discriminator": {
+        "propertyName": "type"
+      }
+    },
+    "DropReason": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "superseded",
+          "description": "到它的时刻之前，新的动作块已取代本块未执行的部分。"
+        },
+        {
+          "type": "string",
+          "const": "duplicate",
+          "description": "同一身份的动作在本代次已执行过。"
+        },
+        {
+          "type": "string",
+          "const": "released",
+          "description": "到它的时刻时实时核已释放输入，见 `input.released`。"
+        }
+      ],
+      "description": "一次性动作没有执行的原因。"
+    },
+    "InputReleasedParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/ReleaseReason",
+          "description": "释放的原因。"
+        },
+        "producer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Producer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "释放时的当前控制产出者；没有时为 `null`。"
+        },
+        "released_at_ns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "释放完成的时刻。",
+          "maximum": 18446744073709551615
+        }
+      },
+      "required": [
+        "reason",
+        "released_at_ns"
+      ],
+      "description": "`input.released` 的 params：实时核释放了全部输入。"
+    },
+    "ReleaseReason": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "core_start",
+          "description": "实时核启动，接受动作之前先释放。"
+        },
+        {
+          "type": "string",
+          "const": "generation_revoked",
+          "description": "当前代次被 `producer.revoke` 作废。"
+        },
+        {
+          "type": "string",
+          "const": "producer_changed",
+          "description": "出现了更新的代次，更换控制产出者前先释放。"
+        },
+        {
+          "type": "string",
+          "const": "heartbeat_timeout",
+          "description": "当前控制产出者的心跳超时。"
+        },
+        {
+          "type": "string",
+          "const": "deadline_expired",
+          "description": "动作块到了有效截止时刻，没有新的动作块。"
+        },
+        {
+          "type": "string",
+          "const": "frame_stale",
+          "description": "帧环中最新的帧超过了动作允许的年龄。"
+        },
+        {
+          "type": "string",
+          "const": "stop",
+          "description": "收到 `core.stop`。"
+        }
+      ],
+      "description": "释放全部输入的原因。"
+    },
+    "CoreHealthParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "now_ns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "发出时实时核的时钟读数。",
+          "maximum": 18446744073709551615
+        },
+        "capture": {
+          "$ref": "#/$defs/CaptureState",
+          "description": "采集状态。"
+        },
+        "inputs_held": {
+          "type": "boolean",
+          "description": "当前是否持有输入。"
+        },
+        "producer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Producer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "当前控制产出者；没有时为 `null`。"
+        }
+      },
+      "required": [
+        "now_ns",
+        "capture",
+        "inputs_held"
+      ],
+      "description": "`core.health` 的 params：实时核定期发出的健康状态，也是主进程判断实时核存活的依据。"
+    },
+    "CaptureState": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "idle",
+          "description": "还没有挂接帧环或设定采集目标。"
+        },
+        {
+          "type": "string",
+          "const": "searching",
+          "description": "正在寻找目标窗口，没有帧。"
+        },
+        {
+          "type": "string",
+          "const": "capturing",
+          "description": "正在采集，帧写入帧环。"
+        }
+      ],
+      "description": "采集状态。"
+    }
+  }
+}
