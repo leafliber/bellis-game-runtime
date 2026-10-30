@@ -1,4 +1,5 @@
-//! 核连接上各方法的 params 与 result 类型，字段含义见 `docs/modules/core-protocol.md` 的“消息集”。
+//! 核连接上各方法的 params 与 result 类型，字段含义见 `docs/modules/core-protocol.md` 的“消息集”；
+//! 文件末尾是只用于测试的测试设备连接上的消息（同一文档的“测试设备连接”）。
 //!
 //! 约定：结构体一律拒绝未知字段；联合类型一律以 `type` 字段为内部标签，每个分支是一个拒绝未知
 //! 字段的具名结构体；以 `_ns` 结尾的时刻字段是与帧环同一单调时钟的纳秒读数。
@@ -258,7 +259,7 @@ pub struct MouseMove {
 }
 
 /// 鼠标键。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MouseButton {
     /// 左键。
@@ -308,6 +309,8 @@ pub enum RejectReason {
     Expired,
     /// 内容不合规则，例如步的时刻倒序、同一项持续状态出现两次、动作身份在块内重复。
     Invalid,
+    /// 实时核正在停止，不再接受动作块。
+    Stopping,
 }
 
 // ---------------------------------------------------------------- 回执与释放
@@ -364,6 +367,8 @@ pub enum DropReason {
     Duplicate,
     /// 到它的时刻时实时核已释放输入，见 `input.released`。
     Released,
+    /// 带坐标的动作：基准帧之后客户区的尺寸或 DPI 变了，或基准帧的几何已查不到。
+    GeometryChanged,
 }
 
 /// `input.released` 的 params：实时核释放了全部输入。
@@ -392,10 +397,22 @@ pub enum ReleaseReason {
     HeartbeatTimeout,
     /// 动作块到了有效截止时刻，没有新的动作块。
     DeadlineExpired,
-    /// 帧环中最新的帧超过了动作允许的年龄。
+    /// 帧环中最新的帧超过了动作允许的年龄，或本实例还没有写过帧。
     FrameStale,
+    /// 输入许可过了到期时刻，没有续约。
+    LeaseExpired,
+    /// 输入许可被许可源吊销，或许可源换发了更新的令牌。
+    LeaseRevoked,
+    /// 与许可源的连接断开；G0 的许可源是测试设备连接。
+    LeaseSourceLost,
+    /// 没有输入许可：许可源从未授予，或没有许可源。
+    NoLease,
     /// 收到 `core.stop`。
     Stop,
+    /// 生命线：核连接断开。主进程收不到，只出现在测试设备的事件与日志里。
+    CoreConnectionLost,
+    /// 生命线：stdin 读到 EOF 或读取失败。
+    StdinClosed,
 }
 
 // ---------------------------------------------------------------- 健康
@@ -414,6 +431,8 @@ pub struct CoreHealthParams {
     pub producer: Option<Producer>,
     /// 本实例最近写进帧环的一帧；本实例还没写过帧时为 `null`。
     pub latest_frame: Option<LatestFrame>,
+    /// 输入许可的状态。
+    pub lease: LeaseStatus,
 }
 
 /// 实时核最近写进帧环的一帧，是判断帧龄的依据。
@@ -426,6 +445,22 @@ pub struct LatestFrame {
     pub capture_ns: u64,
 }
 
+/// 输入许可的状态。只报状态，不报令牌。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseStatus {
+    /// 没有许可：许可源从未授予，或没有许可源。
+    NotGranted,
+    /// 有效：令牌等于当前值且未到期。
+    Valid,
+    /// 过了到期时刻，没有续约。
+    Expired,
+    /// 被吊销，或许可源换发了更新的令牌。
+    Revoked,
+    /// 与许可源的连接已断开。
+    SourceLost,
+}
+
 /// 采集状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -436,4 +471,175 @@ pub enum CaptureState {
     Searching,
     /// 有采集源，帧写入帧环；窗口最小化等可恢复的情形下暂时没有新帧。
     Capturing,
+}
+
+// ---------------------------------------------------------------- 测试设备连接（只用于测试）
+//
+// 实时核以假输入后端（`--input-backend fake`）启动时，另作为通道客户端连到测试一方；以下是这条连接上的
+// 消息。测试一方既是测试许可源，也是假输入设备。生产中没有这条连接，这些消息也不是游戏桥控制连接的契约。
+
+/// `test_lease.grant` 的 params：测试许可源授予或续约输入许可。只用于测试。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FakeLeaseGrantParams {
+    /// 许可令牌，只增不减：等于当前令牌即续约，大于当前令牌即换发新的许可。
+    pub token: u64,
+    /// 到期时刻，与帧环同一时钟。
+    pub expires_ns: u64,
+}
+
+/// `test_lease.revoke` 的 params：测试许可源吊销输入许可。只用于测试。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FakeLeaseRevokeParams {
+    /// 吊销这个令牌及更早的全部令牌。
+    pub token: u64,
+}
+
+/// `fake_input.event` 的 params：假输入后端交给假输入设备的一个事件。只用于测试。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FakeInputEventParams {
+    /// 事件序号，在实时核的一个实例内从 1 起逐个加一。
+    pub seq: u64,
+    /// 交给假输入后端的时刻。
+    pub at_ns: u64,
+    /// 事件。
+    pub event: FakeInputEvent,
+}
+
+/// 假输入后端发出的事件：按下、抬起、轴、一次性动作与释放全部。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FakeInputEvent {
+    KeyDown(FakeKeyDown),
+    KeyUp(FakeKeyUp),
+    MouseDown(FakeMouseDown),
+    MouseUp(FakeMouseUp),
+    AxisSet(FakeAxisSet),
+    AxisRelease(FakeAxisRelease),
+    Click(FakeClick),
+    KeyPress(FakeKeyPress),
+    Scroll(FakeScroll),
+    MouseMove(FakeMouseMove),
+    ReleaseAll(FakeReleaseAll),
+}
+
+/// 按下一个键并保持。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeKeyDown")]
+pub struct FakeKeyDown {
+    /// 扫描码（Set 1）。
+    pub scan_code: u16,
+}
+
+/// 抬起一个按住的键。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeKeyUp")]
+pub struct FakeKeyUp {
+    /// 扫描码（Set 1）。
+    pub scan_code: u16,
+}
+
+/// 按下一个鼠标键并保持。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeMouseDown")]
+pub struct FakeMouseDown {
+    /// 鼠标键。
+    pub button: MouseButton,
+}
+
+/// 抬起一个按住的鼠标键。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeMouseUp")]
+pub struct FakeMouseUp {
+    /// 鼠标键。
+    pub button: MouseButton,
+}
+
+/// 把一个轴设为某个取值并保持。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeAxisSet")]
+pub struct FakeAxisSet {
+    /// 轴名。
+    pub axis: String,
+    /// 取值，范围 [-1, 1]。
+    pub value: f64,
+}
+
+/// 释放一个轴，回到中立。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeAxisRelease")]
+pub struct FakeAxisRelease {
+    /// 轴名。
+    pub axis: String,
+}
+
+/// 点击，即动作块的 `click`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeClick")]
+pub struct FakeClick {
+    /// 动作身份。
+    pub id: u64,
+    /// 基准帧客户区的横坐标（物理像素）。
+    pub x: u32,
+    /// 基准帧客户区的纵坐标（物理像素）。
+    pub y: u32,
+    /// 鼠标键。
+    pub button: MouseButton,
+}
+
+/// 短按，即动作块的 `key_press`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeKeyPress")]
+pub struct FakeKeyPress {
+    /// 动作身份。
+    pub id: u64,
+    /// 扫描码（Set 1）。
+    pub scan_code: u16,
+}
+
+/// 滚动，即动作块的 `scroll`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeScroll")]
+pub struct FakeScroll {
+    /// 动作身份。
+    pub id: u64,
+    /// 基准帧客户区的横坐标（物理像素）。
+    pub x: u32,
+    /// 基准帧客户区的纵坐标（物理像素）。
+    pub y: u32,
+    /// 滚轮格数，正数向前。
+    pub notches: i32,
+}
+
+/// 鼠标相对位移，即动作块的 `mouse_move`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeMouseMove")]
+pub struct FakeMouseMove {
+    /// 动作身份。
+    pub id: u64,
+    /// 横向位移（鼠标计数）。
+    pub dx: i32,
+    /// 纵向位移（鼠标计数）。
+    pub dy: i32,
+}
+
+/// 释放全部输入：此前按住的每一项都已逐一发出抬起或释放，这一条随后发出。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeReleaseAll")]
+pub struct FakeReleaseAll {
+    /// 释放的原因。
+    pub reason: ReleaseReason,
 }

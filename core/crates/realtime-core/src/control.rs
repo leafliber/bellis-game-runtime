@@ -8,7 +8,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use core_protocol::messages::{
-    CoreHealthParams, InputReleasedParams, Producer, ProducerHeartbeatParams, ReleaseReason,
+    CoreHealthParams, InputReleasedParams, LeaseStatus, Producer, ProducerHeartbeatParams,
+    ReleaseReason,
 };
 
 use crate::frames::FrameStatus;
@@ -215,6 +216,8 @@ impl Control {
             inputs_held: !state.ledger.is_empty(),
             producer: state.current_producer(),
             latest_frame,
+            // 还没有许可源。
+            lease: LeaseStatus::NotGranted,
         }
     }
 

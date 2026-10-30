@@ -1,7 +1,8 @@
 """JSON-RPC 方法的描述类型。各方法由生成的 `core_protocol.methods` 列出。
 
 核连接上实时核是通道客户端，主进程是服务端，两边都可以发请求与通知（JSON-RPC 2.0）；
-消息集见 `docs/modules/core-protocol.md` 的“消息集”。
+消息集见 `docs/modules/core-protocol.md` 的“消息集”，只用于测试的测试设备连接见同一文档的
+“测试设备连接”。
 """
 
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ class Direction(StrEnum):
     """实时核发往主进程。"""
     MAIN_TO_CORE = "main_to_core"
     """主进程发往实时核。"""
+    CORE_TO_TEST = "core_to_test"
+    """实时核发往测试一方（测试设备连接，只用于测试）。"""
+    TEST_TO_CORE = "test_to_core"
+    """测试一方发往实时核（测试设备连接，只用于测试）。"""
 
 
 @dataclass(frozen=True)

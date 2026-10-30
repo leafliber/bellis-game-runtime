@@ -14,15 +14,18 @@ use crate::frame_ring;
 use crate::messages::{
     Accepted, Action, ActionBlock, ActionOutcome, ActionReceiptParams, ActionSubmitResult,
     CaptureSetTargetParams, CaptureState, CaptureTarget, Click, ControlStep, CoreHealthParams,
-    CoreHelloParams, CoreHelloResult, DropReason, Dropped, Empty, Executed, FakeTarget,
-    FrameRingAttachParams, HeldAxis, HeldInput, HeldKey, HeldMouseButton, InputReleasedParams,
-    KeyPress, LatestFrame, MouseButton, MouseMove, Producer, ProducerHeartbeatParams,
-    ProducerRevokeParams, RejectReason, Rejected, ReleaseReason, Scroll, WindowTarget,
+    CoreHelloParams, CoreHelloResult, DropReason, Dropped, Empty, Executed, FakeAxisRelease,
+    FakeAxisSet, FakeClick, FakeInputEvent, FakeInputEventParams, FakeKeyDown, FakeKeyPress,
+    FakeKeyUp, FakeLeaseGrantParams, FakeLeaseRevokeParams, FakeMouseDown, FakeMouseMove,
+    FakeMouseUp, FakeReleaseAll, FakeScroll, FakeTarget, FrameRingAttachParams, HeldAxis,
+    HeldInput, HeldKey, HeldMouseButton, InputReleasedParams, KeyPress, LatestFrame, LeaseStatus,
+    MouseButton, MouseMove, Producer, ProducerHeartbeatParams, ProducerRevokeParams, RejectReason,
+    Rejected, ReleaseReason, Scroll, WindowTarget,
 };
 use crate::methods::{
-    ActionReceipt, ActionSubmit, CaptureSetTarget, CoreHealth, CoreHello, CoreStop,
-    FrameRingAttach, InputReleased, Method, ProducerHeartbeat, ProducerRevoke, Request, catalog,
-    error_code,
+    ActionReceipt, ActionSubmit, CaptureSetTarget, CoreHealth, CoreHello, CoreStop, FakeInput,
+    FrameRingAttach, InputReleased, Method, MethodInfo, ProducerHeartbeat, ProducerRevoke, Request,
+    TestLeaseGrant, TestLeaseRevoke, catalog, error_code, test_device_catalog,
 };
 
 /// Schema 相对 `protocol/` 的路径。
@@ -70,23 +73,17 @@ fn to_json<T: Serialize + ?Sized>(value: &T) -> String {
 
 /// 核协议的 JSON Schema（2020-12）。
 ///
-/// `$defs` 是全部消息类型；`x-methods` 按方法名列出方向与 params、result 的引用，通知的
-/// `result` 为 `null`；`x-protocol-version` 与 `x-error-codes` 是协议版本与自定义错误码。
+/// `$defs` 是全部消息类型；`x-methods` 按方法名列出核连接上每个方法的方向与 params、result 的引用，
+/// 通知的 `result` 为 `null`；`x-test-device-methods` 同样列出只用于测试的测试设备连接上的方法；
+/// `x-protocol-version` 与 `x-error-codes` 是协议版本与自定义错误码。
 #[must_use]
 pub fn schema() -> Value {
     let mut generator = SchemaSettings::draft2020_12()
         .with_transform(RecursiveTransform(add_integer_bounds))
         .with_transform(RecursiveTransform(mark_type_discriminator))
         .into_generator();
-    let mut methods = Map::new();
-    for method in catalog() {
-        let params = (method.params)(&mut generator);
-        let result = method.result.map(|result| result(&mut generator));
-        methods.insert(
-            method.name.to_owned(),
-            json!({ "direction": method.direction, "params": params, "result": result }),
-        );
-    }
+    let methods = method_refs(&catalog(), &mut generator);
+    let test_device_methods = method_refs(&test_device_catalog(), &mut generator);
     let error_codes: Map<String, Value> = error_code::ALL
         .iter()
         .map(|&(name, code)| (name.to_owned(), code.into()))
@@ -97,9 +94,24 @@ pub fn schema() -> Value {
         "description": "主进程与实时核之间核连接上的消息，由 core/crates/core-protocol 生成。",
         "x-protocol-version": PROTOCOL_VERSION,
         "x-methods": methods,
+        "x-test-device-methods": test_device_methods,
         "x-error-codes": error_codes,
         "$defs": generator.take_definitions(true),
     })
+}
+
+/// 一组方法的方向与 params、result 的引用。
+fn method_refs(catalog: &[MethodInfo], generator: &mut schemars::SchemaGenerator) -> Value {
+    let mut methods = Map::new();
+    for method in catalog {
+        let params = (method.params)(generator);
+        let result = method.result.map(|result| result(generator));
+        methods.insert(
+            method.name.to_owned(),
+            json!({ "direction": method.direction, "params": params, "result": result }),
+        );
+    }
+    Value::Object(methods)
 }
 
 /// 给整数补上 Rust 类型的上下界。schemars 只给部分整数类型写出上界；补齐后 Pydantic 与 serde
@@ -212,7 +224,7 @@ pub fn fixtures() -> Vec<Fixture> {
             max_height: height,
         }
     };
-    vec![
+    let mut fixtures = vec![
         Fixture::params::<CoreHello>(
             None,
             &CoreHelloParams {
@@ -387,9 +399,105 @@ pub fn fixtures() -> Vec<Fixture> {
                     frame_number: 1200,
                     capture_ns: 5_683_000_000,
                 }),
+                lease: LeaseStatus::Valid,
             },
         ),
-    ]
+        Fixture::params::<TestLeaseGrant>(
+            None,
+            &FakeLeaseGrantParams {
+                token: 2,
+                expires_ns: 5_500_000_000,
+            },
+        ),
+        Fixture::result::<TestLeaseGrant>(None, &Empty {}),
+        Fixture::params::<TestLeaseRevoke>(None, &FakeLeaseRevokeParams { token: 2 }),
+        Fixture::result::<TestLeaseRevoke>(None, &Empty {}),
+    ];
+    let events = [
+        (
+            "key-down",
+            FakeInputEvent::KeyDown(FakeKeyDown { scan_code: 0x11 }),
+        ),
+        (
+            "key-up",
+            FakeInputEvent::KeyUp(FakeKeyUp { scan_code: 0x11 }),
+        ),
+        (
+            "mouse-down",
+            FakeInputEvent::MouseDown(FakeMouseDown {
+                button: MouseButton::Right,
+            }),
+        ),
+        (
+            "mouse-up",
+            FakeInputEvent::MouseUp(FakeMouseUp {
+                button: MouseButton::Right,
+            }),
+        ),
+        (
+            "axis-set",
+            FakeInputEvent::AxisSet(FakeAxisSet {
+                axis: "camera_yaw".into(),
+                value: -0.5,
+            }),
+        ),
+        (
+            "axis-release",
+            FakeInputEvent::AxisRelease(FakeAxisRelease {
+                axis: "camera_yaw".into(),
+            }),
+        ),
+        (
+            "click",
+            FakeInputEvent::Click(FakeClick {
+                id: 1,
+                x: 640,
+                y: 360,
+                button: MouseButton::Left,
+            }),
+        ),
+        (
+            "key-press",
+            FakeInputEvent::KeyPress(FakeKeyPress {
+                id: 11,
+                scan_code: 0x1C,
+            }),
+        ),
+        (
+            "scroll",
+            FakeInputEvent::Scroll(FakeScroll {
+                id: 12,
+                x: 100,
+                y: 200,
+                notches: -1,
+            }),
+        ),
+        (
+            "mouse-move",
+            FakeInputEvent::MouseMove(FakeMouseMove {
+                id: 10,
+                dx: 12,
+                dy: -3,
+            }),
+        ),
+        (
+            "release-all",
+            FakeInputEvent::ReleaseAll(FakeReleaseAll {
+                reason: ReleaseReason::LeaseExpired,
+            }),
+        ),
+    ];
+    fixtures.extend(events.into_iter().zip(1..).map(|((case, event), seq)| {
+        Fixture::params::<FakeInput>(
+            Some(case),
+            &FakeInputEventParams {
+                seq,
+                at_ns: 5_000_000_000 + seq * 1_000_000,
+                event,
+            },
+        )
+    }));
+    fixtures
 }
 
 #[cfg(test)]
@@ -399,7 +507,14 @@ mod tests {
     use serde_json::Value;
 
     use super::{fixtures, schema};
-    use crate::methods::catalog;
+    use crate::methods::{MethodInfo, catalog, test_device_catalog};
+
+    /// 两组方法：核连接上的与测试设备连接上的。
+    fn all_methods() -> Vec<MethodInfo> {
+        let mut methods = catalog();
+        methods.extend(test_device_catalog());
+        methods
+    }
 
     /// 在 `value` 中每个对象节点的路径（JSON Pointer）。
     fn object_pointers(value: &Value, pointer: &str, out: &mut Vec<String>) {
@@ -435,7 +550,7 @@ mod tests {
     #[test]
     fn every_method_has_params_and_result_fixtures() {
         let paths: BTreeSet<String> = fixtures().into_iter().map(|fixture| fixture.path).collect();
-        for method in catalog() {
+        for method in all_methods() {
             let has = |part: &str| {
                 paths.iter().any(|path| {
                     path.strip_prefix(method.name)
@@ -523,23 +638,36 @@ mod tests {
     #[test]
     fn schema_lists_every_method_with_typed_params_and_result() {
         let schema = schema();
-        let methods = schema["x-methods"].as_object().unwrap();
-        let names: Vec<&str> = methods.keys().map(String::as_str).collect();
-        let expected: Vec<&str> = catalog().iter().map(|method| method.name).collect();
-        assert_eq!(names, expected);
         let defs = schema["$defs"].as_object().unwrap();
-        for (name, method) in methods {
-            for part in ["params", "result"] {
-                let Some(reference) = method[part]["$ref"].as_str() else {
-                    assert!(part == "result" && method[part].is_null(), "{name} {part}");
-                    continue;
-                };
-                let def = reference.strip_prefix("#/$defs/").unwrap();
-                assert!(
-                    defs.contains_key(def),
-                    "{name} {part} refers to missing {def}"
-                );
+        for (key, catalog) in [
+            ("x-methods", catalog()),
+            ("x-test-device-methods", test_device_catalog()),
+        ] {
+            let methods = schema[key].as_object().unwrap();
+            let names: Vec<&str> = methods.keys().map(String::as_str).collect();
+            let expected: Vec<&str> = catalog.iter().map(|method| method.name).collect();
+            assert_eq!(names, expected, "{key}");
+            for (name, method) in methods {
+                for part in ["params", "result"] {
+                    let Some(reference) = method[part]["$ref"].as_str() else {
+                        assert!(part == "result" && method[part].is_null(), "{name} {part}");
+                        continue;
+                    };
+                    let def = reference.strip_prefix("#/$defs/").unwrap();
+                    assert!(
+                        defs.contains_key(def),
+                        "{name} {part} refers to missing {def}"
+                    );
+                }
             }
+        }
+    }
+
+    #[test]
+    fn the_two_groups_do_not_share_method_names() {
+        let core: BTreeSet<&str> = catalog().iter().map(|method| method.name).collect();
+        for method in test_device_catalog() {
+            assert!(!core.contains(method.name), "{}", method.name);
         }
     }
 }

@@ -9,5 +9,6 @@
   "latest_frame": {
     "frame_number": 1200,
     "capture_ns": 5683000000
-  }
+  },
+  "lease": "valid"
 }

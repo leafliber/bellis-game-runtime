@@ -1,0 +1,8 @@
+{
+  "seq": 1,
+  "at_ns": 5001000000,
+  "event": {
+    "type": "key_down",
+    "scan_code": 17
+  }
+}

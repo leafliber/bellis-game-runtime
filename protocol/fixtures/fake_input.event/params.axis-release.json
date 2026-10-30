@@ -1,0 +1,8 @@
+{
+  "seq": 6,
+  "at_ns": 5006000000,
+  "event": {
+    "type": "axis_release",
+    "axis": "camera_yaw"
+  }
+}

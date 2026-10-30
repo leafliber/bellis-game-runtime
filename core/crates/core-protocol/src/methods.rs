@@ -2,6 +2,9 @@
 //!
 //! 核连接上实时核是通道客户端，主进程是服务端，两边都可以发请求与通知（JSON-RPC 2.0）。
 //! 有 result 的方法是请求，没有的是通知。
+//!
+//! 两个目录：[`catalog`] 是核连接上的方法；[`test_device_catalog`] 是只用于测试的测试设备连接上的方法
+//! （实时核以假输入后端启动时连到测试一方），见 `docs/modules/core-protocol.md` 的“测试设备连接”。
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::Serialize;
@@ -9,8 +12,9 @@ use serde::de::DeserializeOwned;
 
 use crate::messages::{
     ActionBlock, ActionReceiptParams, ActionSubmitResult, CaptureSetTargetParams, CoreHealthParams,
-    CoreHelloParams, CoreHelloResult, Empty, FrameRingAttachParams, InputReleasedParams,
-    ProducerHeartbeatParams, ProducerRevokeParams,
+    CoreHelloParams, CoreHelloResult, Empty, FakeInputEventParams, FakeLeaseGrantParams,
+    FakeLeaseRevokeParams, FrameRingAttachParams, InputReleasedParams, ProducerHeartbeatParams,
+    ProducerRevokeParams,
 };
 
 /// 消息的发送方。
@@ -21,6 +25,10 @@ pub enum Direction {
     CoreToMain,
     /// 主进程发往实时核。
     MainToCore,
+    /// 实时核发往测试一方（测试设备连接，只用于测试）。
+    CoreToTest,
+    /// 测试一方发往实时核（测试设备连接，只用于测试）。
+    TestToCore,
 }
 
 /// 一个 JSON-RPC 方法。
@@ -59,8 +67,8 @@ fn subschema<T: JsonSchema>(generator: &mut SchemaGenerator) -> Schema {
     generator.subschema_for::<T>()
 }
 
-/// 声明方法：为每个方法定义标记类型并实现 [`Method`] 与 [`Request`] 或 [`Notification`]，
-/// 同时生成 [`catalog`]，使目录与类型不会脱节。
+/// 声明一组方法：为每个方法定义标记类型并实现 [`Method`] 与 [`Request`] 或 [`Notification`]，
+/// 同时生成这一组的目录函数，使目录与类型不会脱节。
 macro_rules! methods {
     (@kind $marker:ident => $result:ty) => {
         impl Request for $marker {
@@ -76,10 +84,14 @@ macro_rules! methods {
     (@result) => {
         None
     };
-    ($(
-        $(#[$attr:meta])*
-        $marker:ident = $name:literal, $direction:ident, $params:ty $(=> $result:ty)?;
-    )*) => {
+    (
+        $(#[$catalog_attr:meta])*
+        fn $catalog:ident;
+        $(
+            $(#[$attr:meta])*
+            $marker:ident = $name:literal, $direction:ident, $params:ty $(=> $result:ty)?;
+        )*
+    ) => {
         $(
             $(#[$attr])*
             #[derive(Debug, Clone, Copy)]
@@ -94,9 +106,9 @@ macro_rules! methods {
             methods!(@kind $marker $(=> $result)?);
         )*
 
-        /// 全部方法，按声明顺序。
+        $(#[$catalog_attr])*
         #[must_use]
-        pub fn catalog() -> Vec<MethodInfo> {
+        pub fn $catalog() -> Vec<MethodInfo> {
             vec![$(
                 MethodInfo {
                     name: $name,
@@ -110,6 +122,8 @@ macro_rules! methods {
 }
 
 methods! {
+    /// 核连接上的全部方法，按声明顺序。
+    fn catalog;
     /// 握手：实时核通过通道认证后发出的第一条消息。
     CoreHello = "core.hello", CoreToMain, CoreHelloParams => CoreHelloResult;
     /// 帧环挂接：告诉实时核主进程创建的帧环。
@@ -132,6 +146,17 @@ methods! {
     CoreHealth = "core.health", CoreToMain, CoreHealthParams;
 }
 
+methods! {
+    /// 测试设备连接上的全部方法，按声明顺序。只用于测试：实时核以假输入后端启动时才有这条连接。
+    fn test_device_catalog;
+    /// 测试许可源授予或续约输入许可。
+    TestLeaseGrant = "test_lease.grant", TestToCore, FakeLeaseGrantParams => Empty;
+    /// 测试许可源吊销输入许可；释放完成后才回应。
+    TestLeaseRevoke = "test_lease.revoke", TestToCore, FakeLeaseRevokeParams => Empty;
+    /// 假输入后端交给假输入设备的一个事件。
+    FakeInput = "fake_input.event", CoreToTest, FakeInputEventParams;
+}
+
 /// 核协议自定义的 JSON-RPC 错误码；其它错误用 JSON-RPC 2.0 的标准错误码。
 pub mod error_code {
     /// `core.hello` 的协议版本与主进程的不相等。
@@ -140,11 +165,14 @@ pub mod error_code {
     pub const FRAME_RING_MISMATCH: i32 = -32002;
     /// `capture.set_target` 的目标在这个平台或系统上不支持。
     pub const CAPTURE_UNSUPPORTED: i32 = -32003;
+    /// `test_lease.grant` 不被接受：令牌小于当前令牌、已吊销或已过期，或到期时刻已过。只用于测试。
+    pub const LEASE_REFUSED: i32 = -32004;
 
     /// 全部自定义错误码及其名字，供导出 Schema。
-    pub const ALL: [(&str, i32); 3] = [
+    pub const ALL: [(&str, i32); 4] = [
         ("protocol_version_mismatch", PROTOCOL_VERSION_MISMATCH),
         ("frame_ring_mismatch", FRAME_RING_MISMATCH),
         ("capture_unsupported", CAPTURE_UNSUPPORTED),
+        ("lease_refused", LEASE_REFUSED),
     ];
 }
