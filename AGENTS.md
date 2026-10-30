@@ -22,6 +22,12 @@
 | 核对 `uv.lock` 未过期 | `uv lock --check` |
 | 打开合成游戏的窗口 | `uv run synthetic-game` |
 | 改了合成游戏的台词后重新生成字体子集（要联网，见[字体](docs/modules/offline-tools.md#字体)） | `uv run python -m synthetic_game.font_subset` |
+| 采集的真机测试（需要 Windows 交互桌面，不在 `uv run check` 中） | `cargo test -p capture -- --ignored --nocapture` |
+| GS-01 探测：列出可见的顶层窗口及其进程、类名与标题 | `cargo run --release -p capture --bin capture-probe -- --list` |
+| GS-01 探测：采一个窗口 N 秒，报告帧率、帧龄、丢帧、变换版本与黄色边框 | `cargo run --release -p capture --bin capture-probe -- --process <进程名> --title <标题> --seconds <N>` |
+| GS-01 探测：采自建的已知图案窗口，另报从重画到采集的时延 | `cargo run --release -p capture --bin capture-probe -- --pattern-window --animate` |
+
+探测程序另有 `--class <类名>`、`--keep-border`（保留黄色边框作对照）、`--min-update-interval-ms <N>`（会话的最小帧间隔）、`--borderless` 与 `--dpi-unaware`（图案窗口的样式）；`--help` 列出全部选项。
 
 `uv run check --linux` 首次运行要构建镜像。容器不写回仓库：虚拟环境、cargo target 与工具缓存放在每个检出目录各自的 `bellis-game-runtime-check-work-<路径摘要>` 卷里，uv 与 cargo 的下载缓存放在共用的 `bellis-game-runtime-check-uv-cache`、`bellis-game-runtime-check-cargo-registry` 卷里。这些卷都只是缓存，删掉只会让下次检查重新下载与编译；工作树删掉后它的卷会留下，用 `docker volume ls --filter name=bellis-game-runtime-check` 列出后 `docker volume rm` 清理。
 
