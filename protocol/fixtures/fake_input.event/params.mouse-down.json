@@ -1,0 +1,8 @@
+{
+  "seq": 3,
+  "at_ns": 5003000000,
+  "event": {
+    "type": "mouse_down",
+    "button": "right"
+  }
+}

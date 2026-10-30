@@ -343,6 +343,10 @@ class RejectReason(StrEnum):
     """
     内容不合规则，例如步的时刻倒序、同一项持续状态出现两次、动作身份在块内重复。
     """
+    STOPPING = "stopping"
+    """
+    实时核正在停止，不再接受动作块。
+    """
 
 
 class ProducerRevokeParams(BaseModel):
@@ -395,6 +399,10 @@ class DropReason(StrEnum):
     """
     到它的时刻时实时核已释放输入，见 `input.released`。
     """
+    GEOMETRY_CHANGED = "geometry_changed"
+    """
+    带坐标的动作：基准帧之后客户区的尺寸或 DPI 变了，或基准帧的几何已查不到。
+    """
 
 
 class ReleaseReason(StrEnum):
@@ -424,11 +432,35 @@ class ReleaseReason(StrEnum):
     """
     FRAME_STALE = "frame_stale"
     """
-    帧环中最新的帧超过了动作允许的年龄。
+    帧环中最新的帧超过了动作允许的年龄，或本实例还没有写过帧。
+    """
+    LEASE_EXPIRED = "lease_expired"
+    """
+    输入许可过了到期时刻，没有续约。
+    """
+    LEASE_REVOKED = "lease_revoked"
+    """
+    输入许可被许可源吊销，或许可源换发了更新的令牌。
+    """
+    LEASE_SOURCE_LOST = "lease_source_lost"
+    """
+    与许可源的连接断开；G0 的许可源是测试设备连接。
+    """
+    NO_LEASE = "no_lease"
+    """
+    没有输入许可：许可源从未授予，或没有许可源。
     """
     STOP = "stop"
     """
     收到 `core.stop`。
+    """
+    CORE_CONNECTION_LOST = "core_connection_lost"
+    """
+    生命线：核连接断开。主进程收不到，只出现在测试设备的事件与日志里。
+    """
+    STDIN_CLOSED = "stdin_closed"
+    """
+    生命线：stdin 读到 EOF 或读取失败。
     """
 
 
@@ -466,6 +498,304 @@ class LatestFrame(BaseModel):
     capture_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
     """
     采集时刻，与帧环的采集时刻同一时钟。
+    """
+
+
+class LeaseStatus(StrEnum):
+    """
+    输入许可的状态。只报状态，不报令牌。
+    """
+
+    NOT_GRANTED = "not_granted"
+    """
+    没有许可：许可源从未授予，或没有许可源。
+    """
+    VALID = "valid"
+    """
+    有效：令牌等于当前值且未到期。
+    """
+    EXPIRED = "expired"
+    """
+    过了到期时刻，没有续约。
+    """
+    REVOKED = "revoked"
+    """
+    被吊销，或许可源换发了更新的令牌。
+    """
+    SOURCE_LOST = "source_lost"
+    """
+    与许可源的连接已断开。
+    """
+
+
+class FakeLeaseGrantParams(BaseModel):
+    """
+    `test_lease.grant` 的 params：测试许可源授予或续约输入许可。只用于测试。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    token: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    许可令牌，只增不减：等于当前令牌即续约，大于当前令牌即换发新的许可。
+    """
+    expires_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    到期时刻，与帧环同一时钟。
+    """
+
+
+class FakeLeaseRevokeParams(BaseModel):
+    """
+    `test_lease.revoke` 的 params：测试许可源吊销输入许可。只用于测试。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    token: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    吊销这个令牌及更早的全部令牌。
+    """
+
+
+class FakeKeyDown(BaseModel):
+    """
+    按下一个键并保持。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["key_down"] = "key_down"
+    scan_code: Annotated[int, Field(ge=0, le=65535)]
+    """
+    扫描码（Set 1）。
+    """
+
+
+class FakeKeyUp(BaseModel):
+    """
+    抬起一个按住的键。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["key_up"] = "key_up"
+    scan_code: Annotated[int, Field(ge=0, le=65535)]
+    """
+    扫描码（Set 1）。
+    """
+
+
+class FakeMouseDown(BaseModel):
+    """
+    按下一个鼠标键并保持。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["mouse_down"] = "mouse_down"
+    button: MouseButton
+    """
+    鼠标键。
+    """
+
+
+class FakeMouseUp(BaseModel):
+    """
+    抬起一个按住的鼠标键。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["mouse_up"] = "mouse_up"
+    button: MouseButton
+    """
+    鼠标键。
+    """
+
+
+class FakeAxisSet(BaseModel):
+    """
+    把一个轴设为某个取值并保持。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["axis_set"] = "axis_set"
+    axis: str
+    """
+    轴名。
+    """
+    value: float
+    """
+    取值，范围 [-1, 1]。
+    """
+
+
+class FakeAxisRelease(BaseModel):
+    """
+    释放一个轴，回到中立。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["axis_release"] = "axis_release"
+    axis: str
+    """
+    轴名。
+    """
+
+
+class FakeClick(BaseModel):
+    """
+    点击，即动作块的 `click`。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["click"] = "click"
+    id: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    动作身份。
+    """
+    x: Annotated[int, Field(ge=0, le=4294967295)]
+    """
+    基准帧客户区的横坐标（物理像素）。
+    """
+    y: Annotated[int, Field(ge=0, le=4294967295)]
+    """
+    基准帧客户区的纵坐标（物理像素）。
+    """
+    button: MouseButton
+    """
+    鼠标键。
+    """
+
+
+class FakeKeyPress(BaseModel):
+    """
+    短按，即动作块的 `key_press`。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["key_press"] = "key_press"
+    id: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    动作身份。
+    """
+    scan_code: Annotated[int, Field(ge=0, le=65535)]
+    """
+    扫描码（Set 1）。
+    """
+
+
+class FakeScroll(BaseModel):
+    """
+    滚动，即动作块的 `scroll`。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["scroll"] = "scroll"
+    id: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    动作身份。
+    """
+    x: Annotated[int, Field(ge=0, le=4294967295)]
+    """
+    基准帧客户区的横坐标（物理像素）。
+    """
+    y: Annotated[int, Field(ge=0, le=4294967295)]
+    """
+    基准帧客户区的纵坐标（物理像素）。
+    """
+    notches: Annotated[int, Field(ge=-2147483648, le=2147483647)]
+    """
+    滚轮格数，正数向前。
+    """
+
+
+class FakeMouseMove(BaseModel):
+    """
+    鼠标相对位移，即动作块的 `mouse_move`。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["mouse_move"] = "mouse_move"
+    id: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    动作身份。
+    """
+    dx: Annotated[int, Field(ge=-2147483648, le=2147483647)]
+    """
+    横向位移（鼠标计数）。
+    """
+    dy: Annotated[int, Field(ge=-2147483648, le=2147483647)]
+    """
+    纵向位移（鼠标计数）。
+    """
+
+
+class FakeReleaseAll(BaseModel):
+    """
+    释放全部输入：此前按住的每一项都已逐一发出抬起或释放，这一条随后发出。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["release_all"] = "release_all"
+    reason: ReleaseReason
+    """
+    释放的原因。
+    """
+
+
+class FakeInputEvent(
+    RootModel[
+        FakeKeyDown
+        | FakeKeyUp
+        | FakeMouseDown
+        | FakeMouseUp
+        | FakeAxisSet
+        | FakeAxisRelease
+        | FakeClick
+        | FakeKeyPress
+        | FakeScroll
+        | FakeMouseMove
+        | FakeReleaseAll
+    ]
+):
+    root: Annotated[
+        FakeKeyDown
+        | FakeKeyUp
+        | FakeMouseDown
+        | FakeMouseUp
+        | FakeAxisSet
+        | FakeAxisRelease
+        | FakeClick
+        | FakeKeyPress
+        | FakeScroll
+        | FakeMouseMove
+        | FakeReleaseAll,
+        Field(discriminator="type"),
+    ]
+    """
+    假输入后端发出的事件：按下、抬起、轴、一次性动作与释放全部。
     """
 
 
@@ -624,6 +954,32 @@ class CoreHealthParams(BaseModel):
     latest_frame: LatestFrame | None = None
     """
     本实例最近写进帧环的一帧；本实例还没写过帧时为 `null`。
+    """
+    lease: LeaseStatus
+    """
+    输入许可的状态。
+    """
+
+
+class FakeInputEventParams(BaseModel):
+    """
+    `fake_input.event` 的 params：假输入后端交给假输入设备的一个事件。只用于测试。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    seq: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    事件序号，在实时核的一个实例内从 1 起逐个加一。
+    """
+    at_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    交给假输入后端的时刻。
+    """
+    event: FakeInputEvent
+    """
+    事件。
     """
 
 

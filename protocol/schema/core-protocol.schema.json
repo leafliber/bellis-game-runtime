@@ -87,10 +87,38 @@
       "result": null
     }
   },
+  "x-test-device-methods": {
+    "test_lease.grant": {
+      "direction": "test_to_core",
+      "params": {
+        "$ref": "#/$defs/FakeLeaseGrantParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "test_lease.revoke": {
+      "direction": "test_to_core",
+      "params": {
+        "$ref": "#/$defs/FakeLeaseRevokeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "fake_input.event": {
+      "direction": "core_to_test",
+      "params": {
+        "$ref": "#/$defs/FakeInputEventParams"
+      },
+      "result": null
+    }
+  },
   "x-error-codes": {
     "protocol_version_mismatch": -32001,
     "frame_ring_mismatch": -32002,
-    "capture_unsupported": -32003
+    "capture_unsupported": -32003,
+    "lease_refused": -32004
   },
   "$defs": {
     "CoreHelloParams": {
@@ -746,6 +774,11 @@
           "type": "string",
           "const": "invalid",
           "description": "内容不合规则，例如步的时刻倒序、同一项持续状态出现两次、动作身份在块内重复。"
+        },
+        {
+          "type": "string",
+          "const": "stopping",
+          "description": "实时核正在停止，不再接受动作块。"
         }
       ],
       "description": "动作块被拒绝的原因。"
@@ -880,6 +913,11 @@
           "type": "string",
           "const": "released",
           "description": "到它的时刻时实时核已释放输入，见 `input.released`。"
+        },
+        {
+          "type": "string",
+          "const": "geometry_changed",
+          "description": "带坐标的动作：基准帧之后客户区的尺寸或 DPI 变了，或基准帧的几何已查不到。"
         }
       ],
       "description": "一次性动作没有执行的原因。"
@@ -947,12 +985,42 @@
         {
           "type": "string",
           "const": "frame_stale",
-          "description": "帧环中最新的帧超过了动作允许的年龄。"
+          "description": "帧环中最新的帧超过了动作允许的年龄，或本实例还没有写过帧。"
+        },
+        {
+          "type": "string",
+          "const": "lease_expired",
+          "description": "输入许可过了到期时刻，没有续约。"
+        },
+        {
+          "type": "string",
+          "const": "lease_revoked",
+          "description": "输入许可被许可源吊销，或许可源换发了更新的令牌。"
+        },
+        {
+          "type": "string",
+          "const": "lease_source_lost",
+          "description": "与许可源的连接断开；G0 的许可源是测试设备连接。"
+        },
+        {
+          "type": "string",
+          "const": "no_lease",
+          "description": "没有输入许可：许可源从未授予，或没有许可源。"
         },
         {
           "type": "string",
           "const": "stop",
           "description": "收到 `core.stop`。"
+        },
+        {
+          "type": "string",
+          "const": "core_connection_lost",
+          "description": "生命线：核连接断开。主进程收不到，只出现在测试设备的事件与日志里。"
+        },
+        {
+          "type": "string",
+          "const": "stdin_closed",
+          "description": "生命线：stdin 读到 EOF 或读取失败。"
         }
       ],
       "description": "释放全部输入的原因。"
@@ -997,12 +1065,17 @@
             }
           ],
           "description": "本实例最近写进帧环的一帧；本实例还没写过帧时为 `null`。"
+        },
+        "lease": {
+          "$ref": "#/$defs/LeaseStatus",
+          "description": "输入许可的状态。"
         }
       },
       "required": [
         "now_ns",
         "capture",
-        "inputs_held"
+        "inputs_held",
+        "lease"
       ],
       "description": "`core.health` 的 params：实时核定期发出的健康状态，也是主进程判断实时核存活的依据。"
     },
@@ -1050,6 +1123,429 @@
         "capture_ns"
       ],
       "description": "实时核最近写进帧环的一帧，是判断帧龄的依据。"
+    },
+    "LeaseStatus": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "not_granted",
+          "description": "没有许可：许可源从未授予，或没有许可源。"
+        },
+        {
+          "type": "string",
+          "const": "valid",
+          "description": "有效：令牌等于当前值且未到期。"
+        },
+        {
+          "type": "string",
+          "const": "expired",
+          "description": "过了到期时刻，没有续约。"
+        },
+        {
+          "type": "string",
+          "const": "revoked",
+          "description": "被吊销，或许可源换发了更新的令牌。"
+        },
+        {
+          "type": "string",
+          "const": "source_lost",
+          "description": "与许可源的连接已断开。"
+        }
+      ],
+      "description": "输入许可的状态。只报状态，不报令牌。"
+    },
+    "FakeLeaseGrantParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "token": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "许可令牌，只增不减：等于当前令牌即续约，大于当前令牌即换发新的许可。",
+          "maximum": 18446744073709551615
+        },
+        "expires_ns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "到期时刻，与帧环同一时钟。",
+          "maximum": 18446744073709551615
+        }
+      },
+      "required": [
+        "token",
+        "expires_ns"
+      ],
+      "description": "`test_lease.grant` 的 params：测试许可源授予或续约输入许可。只用于测试。"
+    },
+    "FakeLeaseRevokeParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "token": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "吊销这个令牌及更早的全部令牌。",
+          "maximum": 18446744073709551615
+        }
+      },
+      "required": [
+        "token"
+      ],
+      "description": "`test_lease.revoke` 的 params：测试许可源吊销输入许可。只用于测试。"
+    },
+    "FakeInputEventParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "事件序号，在实时核的一个实例内从 1 起逐个加一。",
+          "maximum": 18446744073709551615
+        },
+        "at_ns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "交给假输入后端的时刻。",
+          "maximum": 18446744073709551615
+        },
+        "event": {
+          "$ref": "#/$defs/FakeInputEvent",
+          "description": "事件。"
+        }
+      },
+      "required": [
+        "seq",
+        "at_ns",
+        "event"
+      ],
+      "description": "`fake_input.event` 的 params：假输入后端交给假输入设备的一个事件。只用于测试。"
+    },
+    "FakeInputEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "key_down"
+            },
+            "scan_code": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535,
+              "description": "扫描码（Set 1）。"
+            }
+          },
+          "required": [
+            "type",
+            "scan_code"
+          ],
+          "title": "FakeKeyDown",
+          "description": "按下一个键并保持。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "key_up"
+            },
+            "scan_code": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535,
+              "description": "扫描码（Set 1）。"
+            }
+          },
+          "required": [
+            "type",
+            "scan_code"
+          ],
+          "title": "FakeKeyUp",
+          "description": "抬起一个按住的键。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "mouse_down"
+            },
+            "button": {
+              "$ref": "#/$defs/MouseButton",
+              "description": "鼠标键。"
+            }
+          },
+          "required": [
+            "type",
+            "button"
+          ],
+          "title": "FakeMouseDown",
+          "description": "按下一个鼠标键并保持。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "mouse_up"
+            },
+            "button": {
+              "$ref": "#/$defs/MouseButton",
+              "description": "鼠标键。"
+            }
+          },
+          "required": [
+            "type",
+            "button"
+          ],
+          "title": "FakeMouseUp",
+          "description": "抬起一个按住的鼠标键。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "axis_set"
+            },
+            "axis": {
+              "type": "string",
+              "description": "轴名。"
+            },
+            "value": {
+              "type": "number",
+              "format": "double",
+              "description": "取值，范围 [-1, 1]。"
+            }
+          },
+          "required": [
+            "type",
+            "axis",
+            "value"
+          ],
+          "title": "FakeAxisSet",
+          "description": "把一个轴设为某个取值并保持。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "axis_release"
+            },
+            "axis": {
+              "type": "string",
+              "description": "轴名。"
+            }
+          },
+          "required": [
+            "type",
+            "axis"
+          ],
+          "title": "FakeAxisRelease",
+          "description": "释放一个轴，回到中立。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "click"
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "动作身份。",
+              "maximum": 18446744073709551615
+            },
+            "x": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "description": "基准帧客户区的横坐标（物理像素）。",
+              "maximum": 4294967295
+            },
+            "y": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "description": "基准帧客户区的纵坐标（物理像素）。",
+              "maximum": 4294967295
+            },
+            "button": {
+              "$ref": "#/$defs/MouseButton",
+              "description": "鼠标键。"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "x",
+            "y",
+            "button"
+          ],
+          "title": "FakeClick",
+          "description": "点击，即动作块的 `click`。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "key_press"
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "动作身份。",
+              "maximum": 18446744073709551615
+            },
+            "scan_code": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535,
+              "description": "扫描码（Set 1）。"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "scan_code"
+          ],
+          "title": "FakeKeyPress",
+          "description": "短按，即动作块的 `key_press`。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "scroll"
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "动作身份。",
+              "maximum": 18446744073709551615
+            },
+            "x": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "description": "基准帧客户区的横坐标（物理像素）。",
+              "maximum": 4294967295
+            },
+            "y": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "description": "基准帧客户区的纵坐标（物理像素）。",
+              "maximum": 4294967295
+            },
+            "notches": {
+              "type": "integer",
+              "format": "int32",
+              "description": "滚轮格数，正数向前。",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "x",
+            "y",
+            "notches"
+          ],
+          "title": "FakeScroll",
+          "description": "滚动，即动作块的 `scroll`。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "mouse_move"
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "动作身份。",
+              "maximum": 18446744073709551615
+            },
+            "dx": {
+              "type": "integer",
+              "format": "int32",
+              "description": "横向位移（鼠标计数）。",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            },
+            "dy": {
+              "type": "integer",
+              "format": "int32",
+              "description": "纵向位移（鼠标计数）。",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "dx",
+            "dy"
+          ],
+          "title": "FakeMouseMove",
+          "description": "鼠标相对位移，即动作块的 `mouse_move`。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "release_all"
+            },
+            "reason": {
+              "$ref": "#/$defs/ReleaseReason",
+              "description": "释放的原因。"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ],
+          "title": "FakeReleaseAll",
+          "description": "释放全部输入：此前按住的每一项都已逐一发出抬起或释放，这一条随后发出。"
+        }
+      ],
+      "description": "假输入后端发出的事件：按下、抬起、轴、一次性动作与释放全部。",
+      "discriminator": {
+        "propertyName": "type"
+      }
     }
   }
 }

@@ -1,0 +1,9 @@
+{
+  "seq": 8,
+  "at_ns": 5008000000,
+  "event": {
+    "type": "key_press",
+    "id": 11,
+    "scan_code": 28
+  }
+}

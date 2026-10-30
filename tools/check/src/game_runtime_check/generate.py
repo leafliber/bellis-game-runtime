@@ -133,25 +133,10 @@ def ref_name(reference: Mapping[str, Any]) -> str:
     return target.removeprefix(prefix)
 
 
-def render_methods(schema: Mapping[str, Any]) -> bytes:
-    """从 Schema 的 `x-methods`、`x-protocol-version` 与 `x-error-codes` 写出方法目录。"""
-    lines = [
-        PYTHON_HEADER,
-        '"""核协议的 JSON-RPC 方法目录、协议版本与自定义错误码。"""',
-        "",
-        "from collections.abc import Mapping",
-        "from enum import IntEnum",
-        "from typing import Final",
-        "",
-        "from core_protocol import models",
-        "from core_protocol.rpc import Direction, Method, Notification, Request",
-        "",
-        f"PROTOCOL_VERSION: Final = {int(schema['x-protocol-version'])}",
-        '"""核协议版本。握手时两端都核对，不相等即拒绝。"""',
-        "",
-    ]
+def method_constants(methods: Mapping[str, Mapping[str, Any]]) -> tuple[list[str], list[str]]:
+    """一组方法的常量定义行与常量名。"""
+    lines: list[str] = []
     constants: list[str] = []
-    methods: Mapping[str, Mapping[str, Any]] = schema["x-methods"]
     for name, method in methods.items():
         constant = name.replace(".", "_").upper()
         direction = str(method["direction"]).upper()
@@ -163,12 +148,52 @@ def render_methods(schema: Mapping[str, Any]) -> bytes:
             call = f'Request("{name}", Direction.{direction}, {params}, models.{ref_name(result)})'
         lines.append(f"{constant}: Final = {call}")
         constants.append(constant)
-    lines += [
-        "",
-        "METHODS: Final[Mapping[str, Method]] = {",
+    return lines, constants
+
+
+def method_index(variable: str, constants: list[str], doc: str) -> list[str]:
+    """按方法名索引一组方法的 `Mapping`。"""
+    return [
+        f"{variable}: Final[Mapping[str, Method]] = {{",
         *(f"    {constant}.name: {constant}," for constant in constants),
         "}",
-        '"""全部方法，按方法名索引。"""',
+        f'"""{doc}"""',
+    ]
+
+
+def render_methods(schema: Mapping[str, Any]) -> bytes:
+    """从 Schema 的 `x-methods`、`x-test-device-methods`、`x-protocol-version` 与 `x-error-codes`
+    写出方法目录。"""
+    core_lines, core_constants = method_constants(schema["x-methods"])
+    test_lines, test_constants = method_constants(schema["x-test-device-methods"])
+    lines = [
+        PYTHON_HEADER,
+        '"""核协议的 JSON-RPC 方法目录、协议版本与自定义错误码。',
+        "",
+        "`METHODS` 是核连接上的方法；`TEST_DEVICE_METHODS` 是只用于测试的测试设备连接上的方法。",
+        '"""',
+        "",
+        "from collections.abc import Mapping",
+        "from enum import IntEnum",
+        "from typing import Final",
+        "",
+        "from core_protocol import models",
+        "from core_protocol.rpc import Direction, Method, Notification, Request",
+        "",
+        f"PROTOCOL_VERSION: Final = {int(schema['x-protocol-version'])}",
+        '"""核协议版本。握手时两端都核对，不相等即拒绝。"""',
+        "",
+        *core_lines,
+        "",
+        *method_index("METHODS", core_constants, "核连接上的全部方法，按方法名索引。"),
+        "",
+        *test_lines,
+        "",
+        *method_index(
+            "TEST_DEVICE_METHODS",
+            test_constants,
+            "测试设备连接上的全部方法，按方法名索引。只用于测试。",
+        ),
         "",
         "",
         "class ErrorCode(IntEnum):",

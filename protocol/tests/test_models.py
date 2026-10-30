@@ -15,11 +15,13 @@ import pytest
 from pydantic import BaseModel, RootModel, ValidationError
 
 from core_protocol import models
-from core_protocol.methods import METHODS
-from core_protocol.rpc import Request
+from core_protocol.methods import METHODS, TEST_DEVICE_METHODS
+from core_protocol.rpc import Direction, Method, Request
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 FIXTURES = sorted(FIXTURES_DIR.glob("*/*.json"))
+ALL_METHODS: dict[str, Method] = {**METHODS, **TEST_DEVICE_METHODS}
+"""核连接与测试设备连接上的全部方法；两组没有同名的方法。"""
 
 
 def fixture_id(path: Path) -> str:
@@ -32,7 +34,7 @@ def load(name: str) -> Any:
 
 def model_for(path: Path) -> type[BaseModel]:
     """示例消息的类型：目录名是方法名，文件名以 `params` 或 `result` 开头。"""
-    method = METHODS[path.parent.name]
+    method = ALL_METHODS[path.parent.name]
     part = path.name.split(".", 1)[0]
     if part == "params":
         return method.params
@@ -60,10 +62,18 @@ def node(value: Any, path: tuple[str | int, ...]) -> Any:
 
 def test_every_method_has_its_fixtures() -> None:
     parts = {(path.parent.name, path.name.split(".", 1)[0]) for path in FIXTURES}
-    for name, method in METHODS.items():
+    for name, method in ALL_METHODS.items():
         assert (name, "params") in parts, name
         assert ((name, "result") in parts) == isinstance(method, Request), name
-    assert {name for name, _ in parts} <= METHODS.keys()
+    assert {name for name, _ in parts} <= ALL_METHODS.keys()
+
+
+def test_the_test_device_group_is_separate() -> None:
+    """测试设备连接上的方法单独成组，不与核连接的方法同名，方向只在测试一方与实时核之间。"""
+    assert not METHODS.keys() & TEST_DEVICE_METHODS.keys()
+    test_directions = {Direction.CORE_TO_TEST, Direction.TEST_TO_CORE}
+    assert {method.direction for method in TEST_DEVICE_METHODS.values()} == test_directions
+    assert not {method.direction for method in METHODS.values()} & test_directions
 
 
 @pytest.mark.parametrize("path", FIXTURES, ids=fixture_id)
@@ -127,6 +137,22 @@ def test_type_tag_selects_the_union_branch() -> None:
         models.Executed,
         models.Dropped,
     ]
+    events = {
+        "key-down": models.FakeKeyDown,
+        "key-up": models.FakeKeyUp,
+        "mouse-down": models.FakeMouseDown,
+        "mouse-up": models.FakeMouseUp,
+        "axis-set": models.FakeAxisSet,
+        "axis-release": models.FakeAxisRelease,
+        "click": models.FakeClick,
+        "key-press": models.FakeKeyPress,
+        "scroll": models.FakeScroll,
+        "mouse-move": models.FakeMouseMove,
+        "release-all": models.FakeReleaseAll,
+    }
+    for case, branch in events.items():
+        params = load(f"fake_input.event/params.{case}.json")
+        assert isinstance(models.FakeInputEventParams.model_validate(params).event.root, branch)
 
 
 @pytest.mark.parametrize("path", FIXTURES, ids=fixture_id)

@@ -1,0 +1,8 @@
+{
+  "seq": 11,
+  "at_ns": 5011000000,
+  "event": {
+    "type": "release_all",
+    "reason": "lease_expired"
+  }
+}

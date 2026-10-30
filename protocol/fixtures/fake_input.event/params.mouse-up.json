@@ -1,0 +1,8 @@
+{
+  "seq": 4,
+  "at_ns": 5004000000,
+  "event": {
+    "type": "mouse_up",
+    "button": "right"
+  }
+}

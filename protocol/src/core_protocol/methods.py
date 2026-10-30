@@ -1,5 +1,8 @@
 # 由 `uv run generate` 从 core/crates/core-protocol 生成，不要手改。
-"""核协议的 JSON-RPC 方法目录、协议版本与自定义错误码。"""
+"""核协议的 JSON-RPC 方法目录、协议版本与自定义错误码。
+
+`METHODS` 是核连接上的方法；`TEST_DEVICE_METHODS` 是只用于测试的测试设备连接上的方法。
+"""
 
 from collections.abc import Mapping
 from enum import IntEnum
@@ -50,7 +53,24 @@ METHODS: Final[Mapping[str, Method]] = {
     INPUT_RELEASED.name: INPUT_RELEASED,
     CORE_HEALTH.name: CORE_HEALTH,
 }
-"""全部方法，按方法名索引。"""
+"""核连接上的全部方法，按方法名索引。"""
+
+TEST_LEASE_GRANT: Final = Request(
+    "test_lease.grant", Direction.TEST_TO_CORE, models.FakeLeaseGrantParams, models.Empty
+)
+TEST_LEASE_REVOKE: Final = Request(
+    "test_lease.revoke", Direction.TEST_TO_CORE, models.FakeLeaseRevokeParams, models.Empty
+)
+FAKE_INPUT_EVENT: Final = Notification(
+    "fake_input.event", Direction.CORE_TO_TEST, models.FakeInputEventParams
+)
+
+TEST_DEVICE_METHODS: Final[Mapping[str, Method]] = {
+    TEST_LEASE_GRANT.name: TEST_LEASE_GRANT,
+    TEST_LEASE_REVOKE.name: TEST_LEASE_REVOKE,
+    FAKE_INPUT_EVENT.name: FAKE_INPUT_EVENT,
+}
+"""测试设备连接上的全部方法，按方法名索引。只用于测试。"""
 
 
 class ErrorCode(IntEnum):
@@ -59,3 +79,4 @@ class ErrorCode(IntEnum):
     PROTOCOL_VERSION_MISMATCH = -32001
     FRAME_RING_MISMATCH = -32002
     CAPTURE_UNSUPPORTED = -32003
+    LEASE_REFUSED = -32004
