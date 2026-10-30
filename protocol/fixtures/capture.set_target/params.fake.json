@@ -1,5 +1,14 @@
 {
   "target": {
-    "type": "fake"
+    "type": "fake",
+    "surface": {
+      "name": "bellis-game-runtime-fake-display-example",
+      "size_bytes": 460992,
+      "layout_version": 1,
+      "slot_count": 2,
+      "slot_stride": 230464,
+      "max_width": 320,
+      "max_height": 180
+    }
   }
 }

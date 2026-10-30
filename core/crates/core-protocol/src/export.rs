@@ -199,9 +199,19 @@ pub fn fixtures() -> Vec<Fixture> {
         id: "continuous-policy".to_owned(),
         generation: 4,
     };
-    let (width, height, slots): (u32, u32, u32) = (1920, 1080, 3);
-    let stride = (frame_ring::SLOT_PIXELS_OFFSET + u64::from(width) * u64::from(height) * 4)
-        .next_multiple_of(frame_ring::SLOT_ALIGN);
+    let ring = |name: &str, width: u32, height: u32, slots: u32| {
+        let stride = (frame_ring::SLOT_PIXELS_OFFSET + u64::from(width) * u64::from(height) * 4)
+            .next_multiple_of(frame_ring::SLOT_ALIGN);
+        FrameRingAttachParams {
+            name: name.into(),
+            size_bytes: frame_ring::SLOTS_OFFSET + u64::from(slots) * stride,
+            layout_version: frame_ring::LAYOUT_VERSION,
+            slot_count: slots,
+            slot_stride: stride,
+            max_width: width,
+            max_height: height,
+        }
+    };
     vec![
         Fixture::params::<CoreHello>(
             None,
@@ -218,15 +228,7 @@ pub fn fixtures() -> Vec<Fixture> {
         ),
         Fixture::params::<FrameRingAttach>(
             None,
-            &FrameRingAttachParams {
-                name: "bellis-game-runtime-frames-example".into(),
-                size_bytes: frame_ring::SLOTS_OFFSET + u64::from(slots) * stride,
-                layout_version: frame_ring::LAYOUT_VERSION,
-                slot_count: slots,
-                slot_stride: stride,
-                max_width: width,
-                max_height: height,
-            },
+            &ring("bellis-game-runtime-frames-example", 1920, 1080, 3),
         ),
         Fixture::result::<FrameRingAttach>(None, &Empty {}),
         Fixture::params::<CaptureSetTarget>(
@@ -242,7 +244,9 @@ pub fn fixtures() -> Vec<Fixture> {
         Fixture::params::<CaptureSetTarget>(
             Some("fake"),
             &CaptureSetTargetParams {
-                target: CaptureTarget::Fake(FakeTarget {}),
+                target: CaptureTarget::Fake(FakeTarget {
+                    surface: ring("bellis-game-runtime-fake-display-example", 320, 180, 2),
+                }),
             },
         ),
         Fixture::result::<CaptureSetTarget>(None, &Empty {}),

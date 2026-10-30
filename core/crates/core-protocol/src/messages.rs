@@ -84,11 +84,14 @@ pub struct WindowTarget {
     pub title: Option<String>,
 }
 
-/// 假采集源，只用于自动测试。
+/// 假采集源，只用于自动测试：从测试一侧创建并写入的假显示面取帧。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "FakeTarget")]
-pub struct FakeTarget {}
+pub struct FakeTarget {
+    /// 假显示面的共享内存名与布局参数。假显示面与帧环同一布局，参数的含义与核对同 `frame_ring.attach`。
+    pub surface: FrameRingAttachParams,
+}
 
 // ---------------------------------------------------------------- 控制产出者
 
