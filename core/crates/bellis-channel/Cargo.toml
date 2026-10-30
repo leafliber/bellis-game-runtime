@@ -1,0 +1,26 @@
+[package]
+name = "bellis-channel"
+version = "0.0.0"
+description = "本机通道 bellis-channel/1 的客户端与最小 JSON-RPC 2.0 对端，与 Bellis 的实现逐字节兼容"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+hmac.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true
