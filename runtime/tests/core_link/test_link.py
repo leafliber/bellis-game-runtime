@@ -360,4 +360,6 @@ def test_options_build_the_command_line() -> None:
         "250",
         "--health-interval-ms",
         "51",
+        "--max-frame-age-ms",
+        "500",
     ]

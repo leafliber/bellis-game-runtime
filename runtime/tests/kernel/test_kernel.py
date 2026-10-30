@@ -6,12 +6,13 @@
 import asyncio
 import functools
 import logging
-from collections.abc import Awaitable, Callable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
 from typing import Any
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from core_protocol import models
 from game_runtime.kernel import (
     CONTROL_SUBMIT,
     ControlGrant,
@@ -29,6 +30,7 @@ from game_runtime.kernel import (
     ResolvedEntry,
     ServiceToken,
     State,
+    Submission,
     Tier,
     Transition,
     catalog,
@@ -120,8 +122,42 @@ class FakeCore:
         await self._event(grant.generation).wait()
         self.log.append(f"输入已释放 {grant.generation}")
 
+    async def submit(
+        self,
+        grant: ControlGrant,
+        steps: Sequence[models.ControlStep],
+        *,
+        base_frame: int,
+        valid_for: float,
+        start_delay: float = 0.0,
+    ) -> Submission:
+        """记下提交；真实的提交见 `CoreLink.submit` 与 `test_actions.py`。"""
+        self.log.append(
+            f"提交 {grant.producer}#{grant.generation}：{len(steps)} 步，基准帧 {base_frame}"
+        )
+        block = models.ActionBlock(
+            producer=models.Producer(id=grant.producer, generation=grant.generation),
+            seq=1,
+            base_frame=base_frame,
+            start_ns=0,
+            deadline_ns=round((start_delay + valid_for) * 1e9),
+            steps=list(steps),
+        )
+        return _Accepted(block)
+
     def _event(self, generation: int) -> asyncio.Event:
         return self._released.setdefault(generation, asyncio.Event())
+
+
+class _Accepted:
+    """`FakeCore.submit` 的结果：总是接受，没有一次性动作的结果。"""
+
+    def __init__(self, block: models.ActionBlock) -> None:
+        self.block = block
+        self.result: models.Accepted | models.Rejected = models.Accepted()
+
+    async def outcomes(self) -> Mapping[int, models.Executed | models.Dropped]:
+        return {}
 
 
 def make_plugin(
@@ -433,6 +469,33 @@ async def test_control_submit_goes_only_to_designated_producer() -> None:
     with pytest.raises(ControlRevokedError):
         grant.check()
     assert h.producer_overlaps == []
+
+
+@run
+async def test_the_grant_submits_through_the_core_only_while_active() -> None:
+    log: list[str] = []
+    h = Harness(log, producer("step", log))
+    h.kernel.add([entry("step", grant=[CONTROL_SUBMIT])])
+    await h.kernel.set_control_producer("step")
+    grant = h.kernel.active_control
+    assert grant is not None
+    steps = [models.ControlStep(offset_ns=0, held=[], actions=[])]
+
+    submission = await grant.submit(steps, base_frame=7, valid_for=0.5)
+    assert isinstance(submission.result, models.Accepted)
+    assert submission.block.producer == models.Producer(id="step", generation=1)
+    assert log[-1] == "提交 step#1：1 步，基准帧 7"
+
+    # 资格收回后什么也不发。
+    await h.kernel.set_control_producer(None)
+    sent = len(log)
+    with pytest.raises(ControlRevokedError):
+        await grant.submit(steps, base_frame=7, valid_for=0.5)
+    assert not any(line.startswith("提交") for line in log[sent:])
+    # 没有接到实时核的资格（只在测试里手工造出）不能提交。
+    detached = ControlGrant("step", "step#9", 9, lambda: True)
+    with pytest.raises(RuntimeError, match="没有接到实时核"):
+        await detached.submit(steps, base_frame=7, valid_for=0.5)
 
 
 def test_manifest_rules() -> None:
