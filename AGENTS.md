@@ -19,6 +19,8 @@
 | 格式化 | `uv run ruff format`；`cargo fmt --all` |
 | 给某个 Python 包加依赖 | `uv add --package <发行名> <依赖>` |
 | 核对 `uv.lock` 未过期 | `uv lock --check` |
+| 打开合成游戏的窗口 | `uv run synthetic-game` |
+| 改了合成游戏的台词后重新生成字体子集（要联网，见[字体](docs/modules/offline-tools.md#字体)） | `uv run python -m synthetic_game.font_subset` |
 
 `uv run check --linux` 首次运行要构建镜像。容器不写回仓库：虚拟环境、cargo target 与工具缓存放在每个检出目录各自的 `bellis-game-runtime-check-work-<路径摘要>` 卷里，uv 与 cargo 的下载缓存放在共用的 `bellis-game-runtime-check-uv-cache`、`bellis-game-runtime-check-cargo-registry` 卷里。这些卷都只是缓存，删掉只会让下次检查重新下载与编译；工作树删掉后它的卷会留下，用 `docker volume ls --filter name=bellis-game-runtime-check` 列出后 `docker volume rm` 清理。
 
