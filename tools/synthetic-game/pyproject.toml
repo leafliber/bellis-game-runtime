@@ -1,0 +1,23 @@
+[project]
+name = "synthetic-game"
+version = "0.0.0"
+description = "合成游戏夹具：无窗口的状态机、Pillow 渲染与 tkinter 窗口外壳"
+requires-python = "==3.12.*"
+dependencies = [
+    "pillow>=13.0.0",
+]
+
+[project.scripts]
+synthetic-game = "synthetic_game.shell:main"
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "synthetic_game"
+
+[dependency-groups]
+dev = [
+    "fonttools>=4.68.0",
+]
