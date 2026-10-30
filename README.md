@@ -1,6 +1,6 @@
 # Bellis Game Runtime
 
-Bellis 的游戏运行时：负责游戏画面采集、感知（OCR、VLM 等）、VLA 控制策略、唯一的输入代理（Input Broker），以及控制模型的数据与训练。它是独立仓库和独立进程，通过公共契约向 Bellis 主播内核提供游戏能力，逐帧控制不经过 Bellis。
+Bellis 的游戏运行时：负责游戏画面采集、感知（OCR、VLM 等）、VLA 控制策略、唯一的输入代理（Input Broker），以及控制模型的数据与训练。它是独立仓库和独立进程，通过公共契约向 Bellis 宿主提供游戏能力，逐帧控制不经过 Bellis。
 
 ## 目标
 

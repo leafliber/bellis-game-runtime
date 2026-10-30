@@ -1,7 +1,10 @@
 .DS_Store
-node_modules/
 __pycache__/
 .venv/
+.ruff_cache/
+.pytest_cache/
+target/
+reports/
 .env
 .env.*
 !.env.example

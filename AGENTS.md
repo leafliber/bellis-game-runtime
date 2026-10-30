@@ -27,7 +27,7 @@
 
 **平台**（总体约束见[总体架构](docs/architecture.md#平台)）
 - 不依赖 POSIX 专有语义：不用信号做停止协议，不靠文件权限位、uid、符号链接做安全判断，不写死 `/tmp` 等路径。
-- 子进程用 `spawn`，不用 `shell` 和 `detached`；停止按 RPC → 关 stdin → 超时强制终止的顺序（Bellis R-06）。
+- 子进程用 `subprocess.Popen` 以参数列表直接启动可执行文件，不用 `shell=True`，也不用 `DETACHED_PROCESS`、`CREATE_BREAKAWAY_FROM_JOB` 或 `start_new_session` 脱离父进程；停止按 RPC → 关 stdin → 超时强制终止的顺序（Bellis R-06）。
 - 本机通道只用本仓库的 `bellis-channel/1` 实现，认证先于任何数据；画面与声音只走共享内存。
 - 路径比较前先规范化；换行统一 LF。
 
