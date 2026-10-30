@@ -3,13 +3,18 @@
 入口是 console script `synthetic-game`（`uv run synthetic-game`）。在 Windows 上建窗之前先把进程
 声明为按显示器感知 DPI v2，客户区就是物理像素，WGC 采到的尺寸等于缓冲尺寸。
 tkinter 只在建窗时导入，没有 tk 的环境也能导入本模块并测试其中与 tk 无关的转换。
+
+外壳按固定频率重画窗口（缺省 30 Hz），画面内容没变也重画：WGC 只在窗口内容变化时出帧，
+静止的画面不重画就没有新帧，帧龄会一直增长。真实游戏一般也每帧都在绘制。
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from PIL import Image
@@ -29,7 +34,11 @@ WINDOW_TITLE = "Bellis Synthetic Game"
 WINDOW_CLASS = "BellisSyntheticGame"
 """Tk 的类名（X11 的 WM_CLASS）。Windows 上的 Win32 窗口类由 Tk 固定为 `TkTopLevel`，不受它影响。"""
 
-FRAME_INTERVAL_MS = 16
+DEFAULT_REDRAW_HZ = 30.0
+"""缺省的重画频率。"""
+
+MAX_REDRAW_HZ = 1000.0
+"""重画频率的上限：Tk 的定时器以毫秒计。"""
 
 WHEEL_DELTA = 120
 """Windows 一格滚轮的增量。"""
@@ -91,29 +100,63 @@ class WheelAccumulator:
         return notches
 
 
+def check_redraw_hz(hz: float) -> float:
+    """重画频率须在 (0, `MAX_REDRAW_HZ`] 之内。"""
+    if not 0 < hz <= MAX_REDRAW_HZ:
+        raise ValueError(f"重画频率须大于 0、不超过 {MAX_REDRAW_HZ:g} Hz：{hz}")
+    return hz
+
+
+class RedrawSchedule:
+    """按固定频率排定重画的时刻。
+
+    下一次重画排在上一次排定的时刻加一个周期，不随每次重画的耗时累积漂移；落后超过一个周期时
+    不追赶，从现在重新排。
+    """
+
+    def __init__(self, hz: float, start: float) -> None:
+        self._period = 1.0 / check_redraw_hz(hz)
+        self._next = start
+
+    def delay_ms(self, now: float) -> int:
+        """刚重画完一次（现在是 `now` 秒）：到下一次重画的毫秒数，至少 1。"""
+        self._next += self._period
+        if self._next < now:
+            self._next = now
+        return max(1, round((self._next - now) * 1000))
+
+
 class Shell:
     """把一个 `SyntheticGame` 显示在一个 Tk 顶层窗口里。
 
     客户区里只有一个显示帧的标签，它的原点与客户区左上角重合、大小等于分辨率。
+    `run` 之后按 `redraw_hz` 重画，见模块说明。
     """
 
-    def __init__(self, root: tk.Tk | tk.Toplevel, game: SyntheticGame) -> None:
+    def __init__(
+        self,
+        root: tk.Tk | tk.Toplevel,
+        game: SyntheticGame,
+        redraw_hz: float = DEFAULT_REDRAW_HZ,
+    ) -> None:
         import tkinter as tk
 
         from PIL import ImageTk
 
         self.root = root
         self.game = game
+        self.redraw_hz = check_redraw_hz(redraw_hz)
         width, height = game.config.width, game.config.height
         root.title(WINDOW_TITLE)
         root.geometry(f"{width}x{height}")
         root.resizable(False, False)
-        self._photo: ImageTk.PhotoImage = ImageTk.PhotoImage("RGBA", (width, height))
+        self.photo: ImageTk.PhotoImage = ImageTk.PhotoImage("RGBA", (width, height))
         # 无边框、无内边距的标签正好是图像大小，放在客户区原点。
         self.screen = tk.Label(
-            root, image=self._photo, borderwidth=0, highlightthickness=0, padx=0, pady=0
+            root, image=self.photo, borderwidth=0, highlightthickness=0, padx=0, pady=0
         )
         self.screen.place(x=0, y=0, width=width, height=height)
+        self._image = Image.new("RGBA", (width, height))
         self._shown = 0
         self._wheel = WheelAccumulator()
         # 绑定在根窗口上：标签的事件经绑定标签也会送到这里，Windows 把滚轮送给焦点窗口也能收到。
@@ -127,28 +170,37 @@ class Shell:
         self.refresh()
 
     def run(self) -> None:
-        self._schedule()
+        schedule = RedrawSchedule(self.redraw_hz, time.monotonic())
+
+        def tick() -> None:
+            self.redraw()
+            self.root.after(schedule.delay_ms(time.monotonic()), tick)
+
+        tick()
         self.root.mainloop()
 
-    def refresh(self) -> None:
-        """取当前帧；帧号变了才更新窗口内容。"""
+    def refresh(self) -> bool:
+        """取当前帧；帧号变了就更新窗口内容并返回真。输入处理完立即调用，不等下一次重画。"""
         frame = self.game.frame()
-        if frame.number != self._shown:
-            image = Image.frombuffer(
-                "RGBA", (frame.width, frame.height), frame.data, "raw", "BGRA", frame.stride, 1
-            )
-            self._photo.paste(image)
-            self._shown = frame.number
+        if frame.number == self._shown:
+            return False
+        self._image = Image.frombuffer(
+            "RGBA", (frame.width, frame.height), frame.data, "raw", "BGRA", frame.stride, 1
+        )
+        self.photo.paste(self._image)
+        self._shown = frame.number
+        return True
+
+    def redraw(self) -> None:
+        """重画一次：取当前帧，内容没变也把它重新贴进窗口，让窗口重绘。"""
+        if not self.refresh():
+            self.photo.paste(self._image)
 
     def press_keysym(self, keysym: str) -> None:
         key = KEYSYMS.get(keysym)
         if key is not None:
             self.game.handle(Press(key))
             self.refresh()
-
-    def _schedule(self) -> None:
-        self.refresh()
-        self.root.after(FRAME_INTERVAL_MS, self._schedule)
 
     def _client_point(self, event: tk.Event[tk.Misc]) -> tuple[int, int]:
         # 用屏幕坐标减去标签原点，不依赖事件送达的是哪个窗口。
@@ -174,7 +226,15 @@ class Shell:
         self.press_keysym(event.keysym)
 
 
-def parse_config(argv: Sequence[str] | None) -> GameConfig:
+@dataclass(frozen=True)
+class ShellOptions:
+    """命令行给出的游戏配置与外壳选项。"""
+
+    game: GameConfig = field(default_factory=GameConfig)
+    redraw_hz: float = DEFAULT_REDRAW_HZ
+
+
+def parse_args(argv: Sequence[str] | None) -> ShellOptions:
     defaults = GameConfig()
     parser = argparse.ArgumentParser(
         prog="synthetic-game", description="Run the synthetic game fixture in a window."
@@ -190,9 +250,16 @@ def parse_config(argv: Sequence[str] | None) -> GameConfig:
         default=defaults.choice_seconds,
         help="duration of the timed choice",
     )
+    parser.add_argument(
+        "--redraw-hz",
+        type=float,
+        default=DEFAULT_REDRAW_HZ,
+        help="how often the window is redrawn, even when the picture has not changed",
+    )
     args = parser.parse_args(argv)
     try:
-        return GameConfig(args.width, args.height, args.text_cps, args.choice_seconds)
+        game = GameConfig(args.width, args.height, args.text_cps, args.choice_seconds)
+        return ShellOptions(game, check_redraw_hz(args.redraw_hz))
     except ValueError as error:
         parser.error(str(error))
 
@@ -200,9 +267,9 @@ def parse_config(argv: Sequence[str] | None) -> GameConfig:
 def main(argv: Sequence[str] | None = None) -> int:
     import tkinter as tk
 
-    config = parse_config(argv)
+    options = parse_args(argv)
     declare_per_monitor_dpi_awareness()
     root = tk.Tk(className=WINDOW_CLASS)
-    shell = Shell(root, SyntheticGame(config, MonotonicClock()))
+    shell = Shell(root, SyntheticGame(options.game, MonotonicClock()), options.redraw_hz)
     shell.run()
     return 0
