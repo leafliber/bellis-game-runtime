@@ -1,0 +1,22 @@
+# 合成游戏字体子集的来源说明。
+# 由 `uv run python -m synthetic_game.font_subset` 生成，不要手改。
+
+[source]
+family = "Noto Sans SC Regular"
+version = "Version 2.004;hotconv 1.0.118;makeotfexe 2.5.65603"
+release = "https://github.com/notofonts/noto-cjk/releases/tag/Sans2.004"
+url = "https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf"
+sha256 = "faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9"
+license_url = "https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/LICENSE"
+license_sha256 = "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+copyright = "© 2014-2021 Adobe (http://www.adobe.com/)."
+trademark = "Noto is a trademark of Google Inc."
+license = "SIL Open Font License 1.1，全文见 OFL.txt"
+reserved_font_names = "无：原字体的版权声明与许可都没有声明 Reserved Font Name"
+
+[subset]
+file = "SyntheticGameSansSC-Regular.otf"
+family = "Synthetic Game Sans SC"
+postscript_name = "SyntheticGameSansSC-Regular"
+sha256 = "26299db9c676fec539faec08c2d73bf7a4a44406a5d569d2b6e56e3e879aaf9f"
+characters = 275
