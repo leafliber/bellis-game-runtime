@@ -51,6 +51,8 @@ typeCheckingMode = "strict"
 
 [tool.pytest]
 testpaths = ["protocol", "runtime", "tools"]
-addopts = ["--import-mode=importlib", "-ra"]
+# 真机手动测试缺省不选；`-m manual` 写在命令行上时覆盖这里的 -m。
+addopts = ["--import-mode=importlib", "-ra", "-m", "not manual"]
+markers = ["manual: 真机手动测试，需要 Windows 交互桌面，不在 uv run check 中"]
 strict = true
 filterwarnings = ["error"]

@@ -9,6 +9,11 @@
   此后没有实例在运行时，新的等待也立即完成。
 
 实例被强制终止或崩溃（退出码非 0）时没有进程发出按键抬起，等待保留到下一个实例的 `core_start`。
+
+配置了采集（`CoreLinkOptions.capture`）时，第一次 `start` 创建帧环；每个实例就绪后先挂接帧环，
+再设定采集目标，然后才开始发心跳。帧环跨实例保留，`stop` 在实时核退出之后销毁它。同一时刻只有
+一个实例：上一个实例退出之后才能再 `start`，所以帧环只挂接给一个实时核，新实例从帧环头部的
+`write_seq` 续写帧号。
 """
 
 import asyncio
@@ -25,9 +30,11 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from core_protocol.methods import (
+    CAPTURE_SET_TARGET,
     CORE_HEALTH,
     CORE_HELLO,
     CORE_STOP,
+    FRAME_RING_ATTACH,
     INPUT_RELEASED,
     PRODUCER_HEARTBEAT,
     PRODUCER_REVOKE,
@@ -54,8 +61,10 @@ from game_runtime.channel import (
     listen,
     session_credentials,
 )
+from game_runtime.core_link.capture import CaptureConfig
 from game_runtime.core_link.process import ManagedProcess, StopResult, StopStage, StopTimeouts
 from game_runtime.core_link.process import base_environment as _base_environment
+from game_runtime.frame_ring import FrameRing
 from game_runtime.kernel import ControlGrant, Kernel
 
 logger = logging.getLogger(__name__)
@@ -89,9 +98,11 @@ class CoreLinkOptions:
     start_timeout: float = 10.0
     """从拉起到收到 `core.hello` 与 `input.released(core_start)` 的时限。"""
     rpc_timeout: float = 2.0
-    """发给实时核的请求（`producer.revoke`）的截止时间。"""
+    """发给实时核的请求（`producer.revoke`、`frame_ring.attach`、`capture.set_target`）的截止时间。"""
     stop: StopTimeouts = field(default_factory=StopTimeouts)
     """停止各步的时限。"""
+    capture: CaptureConfig | None = None
+    """帧环与采集目标；`None` 时不建帧环，也不设定采集目标。"""
 
     def __post_init__(self) -> None:
         timeouts = (
@@ -168,6 +179,9 @@ class CoreLink:
         self._last_health: CoreHealthParams | None = None
         self._last_health_at_ns: int | None = None
         self._last_returncode: int | None = None
+        self._exited: _Instance | None = None
+        """最近一个已退出的实例；`stop` 等它的善后做完。"""
+        self._frames: FrameRing | None = None
 
     def bind_control(self, source: Callable[[], ControlGrant | None]) -> None:
         """给出当前的提交资格，通常是 `lambda: kernel.active_control`。资格有效时才发心跳。"""
@@ -194,6 +208,15 @@ class CoreLink:
         return self._last_health
 
     @property
+    def frames(self) -> FrameRing | None:
+        """帧环，供宿主代码读帧（`read_latest`、`latest_frame_number`，帧龄用 `frame_age_ns`）。
+
+        配置了采集时由第一次 `start` 创建，跨实时核重启保留，`stop` 在实时核退出后销毁；其余时候
+        为 None。帧环归 `CoreLink` 所有，宿主只读，不关闭它。
+        """
+        return self._frames
+
+    @property
     def healthy(self) -> bool:
         """`health_timeout` 内收到过运行中实例的 `core.health`。"""
         at = self._last_health_at_ns
@@ -203,12 +226,26 @@ class CoreLink:
     # 启动与停止
 
     async def start(self) -> None:
-        """拉起实时核，等到它握手并发出 `input.released(core_start)`。
+        """拉起实时核，等到它握手并发出 `input.released(core_start)`；配置了采集时再挂接帧环、
+        设定采集目标。
 
-        失败时已终止子进程并清理，抛 `CoreStartError`。
+        失败时已终止子进程并清理（帧环保留到 `stop`），抛 `CoreStartError`。
         """
+        # 上一个实例退出之后 `_instance` 才清空：帧环同一时刻只挂接给一个实时核。
         if self._instance is not None:
             raise RuntimeError("实时核已在运行")
+        capture = self._options.capture
+        if capture is not None and self._frames is None:
+            self._frames = FrameRing.create(
+                capture.max_width, capture.max_height, slot_count=capture.slot_count
+            )
+            logger.info(
+                "已创建帧环 %s：最大 %d×%d，%d 个槽",
+                self._frames.name,
+                capture.max_width,
+                capture.max_height,
+                capture.slot_count,
+            )
         self._instances += 1
         number = self._instances
         loop = asyncio.get_running_loop()
@@ -261,17 +298,34 @@ class CoreLink:
             await process.stop(timeouts=self._options.stop)
             await self._finish(instance)
             raise CoreStartError(reason)
+        if capture is not None and self._frames is not None:
+            try:
+                await self._attach_capture(instance, capture, self._frames)
+            except (ChannelError, RpcError) as error:
+                await self._stop_instance(instance)
+                raise CoreStartError(f"实时核 {number} 没有接受帧环或采集目标：{error}") from error
         instance.tasks.append(loop.create_task(self._send_heartbeats(instance)))
         instance.tasks.append(loop.create_task(self._watch_health(instance)))
 
     async def stop(self) -> StopResult:
-        """按 R-06 的顺序停止实时核：`core.stop` → 关 stdin → 强制终止。
+        """按 R-06 的顺序停止实时核：`core.stop` → 关 stdin → 强制终止；实时核退出后销毁帧环。
 
-        没有在运行时返回上次的退出码。
+        没有在运行时返回上次的退出码。强制终止后仍未确认退出时保留帧环。返回时已退出实例的连接、
+        监听与凭据都已关闭。
         """
         instance = self._instance
         if instance is None:
-            return StopResult(StopStage.ALREADY_EXITED, self._last_returncode)
+            if self._exited is not None:
+                await self._finish(self._exited)
+            result = StopResult(StopStage.ALREADY_EXITED, self._last_returncode)
+        else:
+            result = await self._stop_instance(instance)
+        if self._instance is None and self._frames is not None:
+            self._frames.close()
+            self._frames = None
+        return result
+
+    async def _stop_instance(self, instance: _Instance) -> StopResult:
         for task in instance.tasks:
             task.cancel()
         peer = instance.peer
@@ -285,6 +339,24 @@ class CoreLink:
         if result.returncode is not None:
             await self._finish(instance)
         return result
+
+    async def _attach_capture(
+        self, instance: _Instance, capture: CaptureConfig, ring: FrameRing
+    ) -> None:
+        """挂接帧环，再设定采集目标。实时核从帧环头部的 `write_seq` 续写帧号。"""
+        peer = instance.peer
+        if peer is None or not peer.connection.is_open:
+            raise ChannelError("closed", "核连接未建立")
+        timeout = self._options.rpc_timeout
+        await peer.request(FRAME_RING_ATTACH.name, _dump(ring.attach_params()), timeout=timeout)
+        params = capture.set_target_params()
+        await peer.request(CAPTURE_SET_TARGET.name, _dump(params), timeout=timeout)
+        logger.info(
+            "实时核 %d 已挂接帧环 %s，采集目标：%s",
+            instance.number,
+            ring.name,
+            params.target.root.type,
+        )
 
     # CoreControl
 
@@ -457,6 +529,7 @@ class CoreLink:
             self._release_through(None)
         if self._instance is instance:
             self._instance = None
+            self._exited = instance
             self._clean = returncode == 0
             self._last_returncode = returncode
             self._last_health_at_ns = None
@@ -482,7 +555,7 @@ class CoreLink:
 
 async def shutdown_runtime(kernel: Kernel, link: CoreLink) -> StopResult:
     """主进程的停止顺序：先停插件内核，控制产出者走完 QUIESCING（等确认超时就上报后继续），
-    再按 R-06 停实时核；实时核停止时也会释放全部输入。"""
+    再按 R-06 停实时核；实时核停止时也会释放全部输入，退出后帧环随之销毁。"""
     try:
         await kernel.shutdown()
     finally:
