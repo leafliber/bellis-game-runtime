@@ -6,15 +6,111 @@
 
 本仓库按 Bellis R-05 的规范自写 `bellis-channel/1`（GR-28），不依赖 Bellis 的 `bellis_sidecar` 包：
 
-| 实现 | 用于 |
-| --- | --- |
-| Python 客户端 | 主进程 → Bellis 宿主（语义连接） |
-| Python 服务端 | 主进程 ← 实时核（核连接） |
-| Rust 客户端 | 实时核 → Bellis 宿主（控制连接）、实时核 → 主进程（核连接） |
+| 实现 | 位置 | 用于 |
+| --- | --- | --- |
+| Python 客户端 | `runtime/src/game_runtime/channel/`（asyncio） | 主进程 → Bellis 宿主（语义连接） |
+| Python 服务端 | 同上 | 主进程 ← 实时核（核连接） |
+| Rust 客户端 | `core/crates/bellis-channel`（标准线程加阻塞 IO，不用 tokio） | 实时核 → Bellis 宿主（控制连接）、实时核 → 主进程（核连接） |
 
 - Windows 上用命名管道，其它平台用 UDS，同一抽象（Bellis D-12）。
 - 双向 HMAC 认证先于任何数据；有帧长上限与超时；篡改、重放、超长帧与超时都拒绝。
-- 正确性分三层：握手与帧格式的已知答案测试；本仓库 Python 与 Rust 的互通测试，Windows 真机实际跑命名管道，Linux 容器跑 UDS；G3 联调前与 Bellis 宿主真机互通。
+- 正确性分三层：握手与帧格式的已知答案测试；本仓库 Python 与 Rust 的互通测试，Windows 真机实际跑命名管道，Linux 容器跑 UDS；G3 联调前与 Bellis 宿主真机互通（PENDING）。
+
+### 帧格式与握手
+
+以 Bellis `main` 的提交 `e4f9c91` 为准并与之逐字节兼容，规范不在这里重抄：
+
+| 内容 | Bellis 的源 |
+| --- | --- |
+| 帧：4 字节大端负载长度、1 字节类型、负载；先查类型再查长度 | [`packages/channel/src/frame.ts`](https://github.com/leafliber/bellis/blob/e4f9c91/packages/channel/src/frame.ts) |
+| 握手的四条消息、证明的输入与顺序、状态机、上限与超时 | [`packages/channel/src/connection.ts`](https://github.com/leafliber/bellis/blob/e4f9c91/packages/channel/src/connection.ts) |
+| 握手消息的模式 | [`packages/protocol/src/channel.ts`](https://github.com/leafliber/bellis/blob/e4f9c91/packages/protocol/src/channel.ts) |
+| 监听、连接与未认证握手的上限 | [`packages/channel/src/endpoint.ts`](https://github.com/leafliber/bellis/blob/e4f9c91/packages/channel/src/endpoint.ts) |
+| JSON-RPC 2.0 对端与消息模式 | [`packages/channel/src/rpc.ts`](https://github.com/leafliber/bellis/blob/e4f9c91/packages/channel/src/rpc.ts)、[`packages/protocol/src/jsonrpc.ts`](https://github.com/leafliber/bellis/blob/e4f9c91/packages/protocol/src/jsonrpc.ts) |
+| 地址与会话密钥的编码 | [`packages/channel/src/address.ts`](https://github.com/leafliber/bellis/blob/e4f9c91/packages/channel/src/address.ts) |
+| 错误码 | [`packages/channel/src/errors.ts`](https://github.com/leafliber/bellis/blob/e4f9c91/packages/channel/src/errors.ts) |
+
+实现时容易走样、由测试向量覆盖的几点：
+
+- 证明的输入是 Node `JSON.stringify([域, 方向, 角色, 客户端随机数, 服务端随机数])` 的 UTF-8 字节：紧凑、按此顺序，域为 `bellis-channel/1`，方向为 `server` 或 `client`。随机数与证明都是 32 字节的 base64url 无填充文本；核对证明时比较解码后的字节，最后一个字符未用到的低 2 位不同也通过，与 Node 一致。
+- 消息校验与 Bellis 用的 TypeBox 等价：对象不允许多余的键；`v` 只认数 1，JSON 的 `1.0`、`1e0` 也算，布尔值不算；字符串模式整串匹配，结尾的换行不算匹配；字符串长度按码位计；JSON-RPC 的整数 id 限在安全整数范围内，`1.0` 这样的整数值也算整数。
+- JSON 负载按 `JSON.parse(payload.toString('utf8'))` 解析：非法的 UTF-8 替换为 U+FFFD，不跳过 BOM，不接受 NaN 与 Infinity，同名键取最后一个。
+- JSON-RPC 消息依次按请求、通知、成功应答、失败应答分类，都不是时回 InvalidRequest（id 为 null）；参数只用按名传递的对象；`rpc.` 前缀保留给协议，`rpc.cancel` 是取消通知。
+
+### 长度上限与超时
+
+| 项 | 取值 | 说明 |
+| --- | --- | --- |
+| 认证前单帧负载 | 1024 字节 | 只凭帧头就判定超长，以 `frame-too-large` 断开 |
+| 认证后单帧负载 | 缺省 1 MiB，可配置 | 收发两个方向都查：发送超长只报错，连接不受影响；收到超长即断开 |
+| 握手 | 缺省 2000ms，可配置 | 客户端从连上到收到 accept，服务端从接受连接到核验完证明。客户端连管道时等待忙实例也以它为限，超时报 `connect-failed` |
+| 读 | 由调用方给出 | `receive(timeout)` / `recv(timeout)` 超时报 `timeout`，连接仍可用；读到一半的帧留在缓冲区，下次接着读，不失步。通道没有连接级的空闲超时（Bellis 也没有），核连接的存活由控制产出者心跳判断（[启动与生命线](realtime-core.md#启动与生命线)） |
+| 请求 | 由调用方给出 | 超时报 `timeout` 并向对端发 `rpc.cancel` |
+| 关闭宽限 | 1000ms | Python 正常关闭时等对端收完已写出的数据，超过即强制断开 |
+| 未认证的握手 | 16 个 | 服务端超出的连接立即断开，报 `busy` |
+| 同时处理的对端请求 | 64 个 | Python 超出时回 ServerBusy；Rust 的处理函数在读线程上同步执行，没有并发 |
+
+### 地址与密钥
+
+- 地址形如 `bellis-<会话编号>-<16 字节随机数的 base32>`（RFC 4648，小写、无填充），会话编号匹配 `^[a-z0-9]{1,16}$`，与 Bellis 相同。Windows 上为 `\\.\pipe\<名字>`。其它平台为 `<名字>.sock`，放在主进程以 `tempfile.mkdtemp` 新建、只有当前用户能访问的私有目录里，路径不超过 103 字节，会话结束时删除该目录。Bellis 把 UDS 直接放在系统临时目录下；这里多一层私有目录只为减少暴露，访问控制仍靠握手（Bellis D-12）。
+- 会话密钥是 32 字节随机数，以 base64url 无填充文本交接；只接受规范编码，格式不对报 `address-invalid`，与 Bellis 的 TS 实现一致。
+- 主进程以 `session_credentials(会话编号)` 生成本次会话的地址与密钥（`ChannelCredentials`）；实时核以 `ChannelCredentials::decode(地址, 密钥文本)` 接收。怎样交给实时核见[启动与生命线](realtime-core.md#启动与生命线)。
+
+### 安全设置
+
+- Windows 的管道由 Python 服务端自己建：asyncio 自带的服务端以消息模式、缺省安全描述符建管道，也不拒绝远程客户端。这里每个实例都用字节模式（与 libuv 一致）并带 `PIPE_REJECT_REMOTE_CLIENTS`；第一个实例带 `FILE_FLAG_FIRST_PIPE_INSTANCE`，同名管道已存在时以 `address-in-use` 失败，不用同名重试；安全描述符的 DACL 为 `D:P(A;;GA;;;<当前用户 SID>)`，只允许当前用户；地址上始终留一个尚未连接的实例。接受连接仍交给 asyncio 的 IOCP proactor，用到它的内部接口（与 `start_serving_pipe` 自身相同），所以 Python 版本锁定在 3.12。
+- 提权的实时核以同一用户运行时满足这个 DACL；跨完整性级别的可达性（非提权主进程建的管道，提权的实时核连接与读写）PENDING，由 [GS-03](../plan/spikes.md) 真机验证。
+- Rust 客户端以 `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` 打开管道：连到被抢注的管道时，对端只能识别、不能冒充提权实时核的令牌。
+- POSIX 上服务端自己 bind，socket 文件已存在时报 `address-in-use`，不像 asyncio 那样删掉旧的；关闭时删除 socket 文件。
+- 这些设置只是减少暴露，认证仍只靠握手；同一用户下的恶意进程不在威胁模型内（Bellis D-12）。
+
+### 错误处理
+
+错误码与 Bellis `errors.ts` 逐字相同：`address-in-use`、`address-invalid`、`invalid-key`、`busy`、`connect-failed`、`auth-failed`、`handshake-timeout`、`frame-too-large`、`protocol-error`、`timeout`、`closed`。
+
+| 情形 | 结果 |
+| --- | --- |
+| 握手中任何失败：证明不符、消息不合法、认证前收到业务帧、超长、超时、对端关闭 | 断开连接；服务端以 `on_rejected` 报告且不交出连接；客户端核验服务端失败时不回送证明 |
+| 角色名不合法 | 客户端在连接之前就报 `protocol-error` |
+| 认证后帧超长、帧类型未知、收到握手帧、JSON 不合法 | 断开连接，`receive` / `recv` 报对应的错误 |
+| 读超时、发送超长 | 只报错，连接仍可用 |
+| 服务端的 `on_connection` 抛错 | 断开该连接，交给 `on_error` |
+| 对端请求未知方法、消息不合法、处理函数抛出 RpcError、其它异常 | 依次回 MethodNotFound、InvalidRequest（id 为 null）、原样的错误、InternalError（不外泄细节）；应答超过帧长上限时改回 InternalError |
+| 连接关闭 | 未完成的请求报 `closed`；Python 中正在处理的请求被取消 |
+
+RPC 的处理函数：Python 中每个请求在自己的任务里处理，收到 `rpc.cancel` 时取消它且不再应答；Rust 中处理函数在读线程上同步执行，须很快返回，也不能在里面向同一对端发请求，`rpc.cancel` 到达时处理早已结束，所以忽略它。
+
+### 与 Bellis 实现的出入
+
+以下出入都不影响与 Bellis 互通：
+
+- UDS 放在私有临时目录里（见上）。
+- 角色名不合法时客户端在连接之前就失败；Bellis 先连上再断开。
+- Python 中被 `rpc.cancel` 取消的处理不再应答；Bellis 的处理函数不理会中止信号时照常应答，请求方本就忽略。
+- Rust 用 serde_json 解析：不接受孤立代理项的 `\uD800` 转义，嵌套超过 128 层也拒绝，都以 `protocol-error` 断开；Node 都接受。实时核宁可断开，也不在栈上无限递归。
+- Rust 发出的 JSON-RPC 信封按 Bellis 的键顺序编码，`params` 等内层对象的键序由 serde_json 决定（启用 `preserve_order` 时为插入顺序，否则为字典序）；对端解析后相同。
+- Windows 管道的安全设置与 Rust 客户端的 SQOS（见上）；Bellis 用 libuv 的缺省值。
+
+### 测试向量
+
+`core/crates/bellis-channel/testdata/vectors.json` 由同目录的 `generate-vectors.ts` 从 Bellis 提交 `e4f9c91` 的 TypeScript 实现导出，文件里记有来源提交：握手与 JSON-RPC 的字节取自真实的 `Connection` 与 `RpcPeer`（以固定值替换 `node:crypto` 的 `randomBytes`），消息校验的结论取自 Bellis 用的同一份 TypeBox 校验，长度上限与超时从源码读出。向量含帧编解码、地址与密钥、一次完整会话（握手与各类 JSON-RPC 往来）、服务端与客户端两侧的握手结局（篡改、反射、重放、错误密钥、协议标识与版本不符、超长帧、认证前收到业务数据、提前关闭）、负载解析与消息分类。
+
+Bellis 改动通道后重新生成：
+
+1. `git -C <Bellis 仓库> archive <提交> packages/channel packages/protocol` 导出到一个空目录；
+2. 在该目录的 `node_modules/` 放入 Bellis 锁定版本的 `typebox`，并把 `node_modules/@bellis/protocol` 链接（Windows 上用目录联接）到导出的 `packages/protocol`；
+3. 在本仓库根目录运行 `node core/crates/bellis-channel/testdata/generate-vectors.ts <导出目录> <提交的完整哈希> > core/crates/bellis-channel/testdata/vectors.json`。生成是确定的，两次输出应逐字节相同。
+
+Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库的向量。
+
+### 测试覆盖
+
+| 层 | Python | Rust |
+| --- | --- | --- |
+| 已知答案 | 全部向量，服务端与客户端两侧 | 客户端一侧的握手结局与会话、全部校验规则；负载解析的两处出入按出入断言 |
+| 拒绝 | 认证前发数据、篡改与反射证明、错误密钥、抢注者、重放握手、认证前与认证后超长帧、握手超时、读超时与半帧、协议标识与版本不符、未认证握手过多、地址被占用 | 客户端一侧的同类拒绝：错误密钥、篡改证明、重放 challenge、认证前业务数据、认证前与认证后超长帧、握手超时、读超时与半帧、版本与协议标识不符 |
+| 传输 | Windows 跑命名管道，另验证 DACL 与经 SMB 回环的远程客户端被拒；Linux 容器跑 UDS | 测试服务端在命名管道或 UDS 上收发原始帧 |
+| 互通 | pytest 编译并拉起 Rust 示例 `interop_client`，与 Python 服务端握手、双向请求与通知；错误密钥被拒 | 同左 |
 
 ## 核协议
 
