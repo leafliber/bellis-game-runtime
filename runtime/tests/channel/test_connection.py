@@ -646,7 +646,7 @@ if sys.platform == "win32":
     import ctypes
     from ctypes import wintypes
 
-    from game_runtime.channel._winpipe import current_user_sid
+    from game_runtime._winsecurity import current_user_sid
 
     _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _adv = ctypes.WinDLL("advapi32", use_last_error=True)
