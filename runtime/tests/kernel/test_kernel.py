@@ -10,6 +10,8 @@ from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from typing import Any
 
 import pytest
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
 from game_runtime.kernel import (
     CONTROL_SUBMIT,
     ControlGrant,
@@ -32,7 +34,6 @@ from game_runtime.kernel import (
     catalog,
     resolve_profile,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 GAME = ServiceToken[str]("game-adapter", 1)
 

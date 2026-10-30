@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import pytest
+
 from game_runtime.channel import (
     DEFAULT_HANDSHAKE_TIMEOUT,
     DEFAULT_MAX_FRAME_BYTES,

@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from pydantic import BaseModel, RootModel, ValidationError
+
 from core_protocol import models
 from core_protocol.methods import METHODS
 from core_protocol.rpc import Request
-from pydantic import BaseModel, RootModel, ValidationError
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 FIXTURES = sorted(FIXTURES_DIR.glob("*/*.json"))

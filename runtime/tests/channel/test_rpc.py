@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+
 from game_runtime.channel import (
     ChannelError,
     Connection,

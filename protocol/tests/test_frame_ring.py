@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from core_protocol import frame_ring
 
 LAYOUT_PATH = Path(__file__).resolve().parents[1] / "frame-ring-layout.json"

@@ -4,8 +4,9 @@ import json
 from pathlib import Path
 
 import pytest
-from game_runtime.kernel import Profile, ProfilePatch, read_patch, read_profile, resolve_profile
 from pydantic import ValidationError
+
+from game_runtime.kernel import Profile, ProfilePatch, read_patch, read_profile, resolve_profile
 
 PROFILE = Profile.model_validate(
     {

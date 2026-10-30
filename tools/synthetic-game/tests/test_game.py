@@ -6,6 +6,7 @@
 from collections.abc import Callable
 
 import pytest
+
 from synthetic_game import (
     Click,
     Effect,
