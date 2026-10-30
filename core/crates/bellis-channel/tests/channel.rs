@@ -490,3 +490,50 @@ fn local_close_wakes_the_blocked_reader() {
     // 服务端看到连接断开。
     assert_eq!(server.join().unwrap(), 0);
 }
+
+#[test]
+fn after_reply_runs_once_the_reply_is_written() {
+    let key = create_session_key();
+    let (hooked, hook_fired) = mpsc::channel();
+    let (closed, client_closed) = mpsc::channel::<()>();
+    let (path, server) = serve(move |mut s: ServerStream| {
+        s.handshake(&key);
+        s.write_json(
+            FrameKind::Json,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "core.stop", "params": {}}),
+        );
+        s.write_json(
+            FrameKind::Json,
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "core.refuse"}),
+        );
+        // 客户端在钩子触发后立即关闭连接；应答若在钩子之后才写，这里就读不到。
+        client_closed.recv().unwrap();
+        (s.read_json(), s.read_json(), s.frames_until_closed())
+    });
+    let connection = connect(&path, ROLE, &key, &options()).expect("握手成功");
+    let stop_hooked = hooked.clone();
+    let handlers = Handlers::new()
+        .request_then(
+            "core.stop",
+            |_| Ok(json!({})),
+            move || stop_hooked.send("stop").unwrap(),
+        )
+        .request_then(
+            "core.refuse",
+            |_| Err(RpcError::new(7, "不行")),
+            move || hooked.send("refuse").unwrap(),
+        );
+    let rpc = RpcPeer::spawn(connection, handlers, &rpc_options()).expect("读线程");
+    let timeout = Duration::from_secs(2);
+    assert_eq!(hook_fired.recv_timeout(timeout), Ok("stop"));
+    assert_eq!(hook_fired.recv_timeout(timeout), Ok("refuse"));
+    rpc.close();
+    closed.send(()).unwrap();
+    let (stopped, refused, rest) = server.join().unwrap();
+    assert_eq!(stopped, json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    assert_eq!(
+        refused,
+        json!({"jsonrpc": "2.0", "id": 2, "error": {"code": 7, "message": "不行"}})
+    );
+    assert_eq!(rest, 0);
+}
