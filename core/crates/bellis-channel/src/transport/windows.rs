@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA,
     ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WIN32_ERROR,
+    GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT, WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING, ReadFile,
@@ -161,9 +161,17 @@ impl NamedPipeTransport {
         deadline: Option<Instant>,
     ) -> io::Result<Outcome> {
         let handles = [event.0, self.close_event.0];
-        // SAFETY: 两个句柄在 self 存活期间都有效。
-        let wait =
-            unsafe { WaitForMultipleObjects(&handles, false, wait_millis(remaining(deadline))) };
+        let wait = loop {
+            // SAFETY: 两个句柄在 self 存活期间都有效。
+            let wait = unsafe {
+                WaitForMultipleObjects(&handles, false, wait_millis(remaining(deadline)))
+            };
+            // 等待的超时按系统计时器的周期计，可能比 `Instant` 量出的截止时间早到不足一个周期；
+            // 没真正到截止时间就接着等，超时因而不早于截止时间。
+            if wait != WAIT_TIMEOUT || remaining(deadline).is_none_or(|left| left.is_zero()) {
+                break wait;
+            }
+        };
         let interrupted = wait != WAIT_OBJECT_0;
         if interrupted {
             // SAFETY: overlapped 指向本次仍在进行的 IO；IO 已完成时取消无效果，返回值不重要。
