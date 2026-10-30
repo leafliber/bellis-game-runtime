@@ -10,6 +10,7 @@ publish = false
 [workspace.dependencies]
 getrandom = "0.4.3"
 hmac = "0.13.0"
+libc = "0.2.191"
 schemars = { version = "1.2.3", features = ["preserve_order"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

@@ -119,6 +119,8 @@ pub enum CaptureError {
     NotPerMonitorDpiAwareV2,
     /// 系统不支持所需的能力。
     Unsupported(&'static str),
+    /// 采集源取到的帧不合格式。只有假采集源会报：假显示面里的槽头部不合帧环布局。
+    InvalidFrame(String),
     /// 系统调用失败。
     Os {
         /// 失败的调用。
@@ -154,6 +156,9 @@ impl fmt::Display for CaptureError {
                 f.write_str("the calling thread is not per-monitor DPI aware v2")
             }
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
+            Self::InvalidFrame(reason) => {
+                write!(f, "the capture source got an invalid frame: {reason}")
+            }
             Self::Os {
                 context,
                 code,

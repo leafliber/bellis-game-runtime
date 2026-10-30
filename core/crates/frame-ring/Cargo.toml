@@ -1,0 +1,28 @@
+[package]
+name = "frame-ring"
+version = "0.0.0"
+description = "帧环的写入方与读取方，以及只用于自动测试的假采集源"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+capture = { path = "../capture" }
+core-protocol = { path = "../core-protocol" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+] }
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
