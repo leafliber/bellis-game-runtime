@@ -4,12 +4,15 @@
 //!   再把帧环的写入方或采集目标作为命令交给采集线程，随即回应。
 //! - 采集线程独占写入方与采集源：帧环在实时核里只有这一个写方；WGC 采集源不是 `Send`，在采集线程上
 //!   创建并使用。
-//! - 采集状态与本实例最近写进帧环的一帧放在 [`FrameStatus`] 里，它有自己的锁。采集线程只在更新它的
-//!   一瞬间持锁，从不在取帧或写帧时持锁，也从不碰控制状态的锁；释放全部输入只用控制状态的锁，
-//!   所以释放不等采集线程，也不依赖写帧成功。
+//! - 采集状态、本实例最近写进帧环的一帧与客户区几何的变化放在 [`FrameStatus`] 里，它有自己的锁；最近
+//!   一帧的采集时刻另存一份原子量。采集线程只在更新它的一瞬间持锁，从不在取帧或写帧时持锁，也从不碰
+//!   控制状态的锁；释放全部输入只用控制状态的锁，帧龄的检查只读原子量，所以释放不等采集线程，也不依赖
+//!   写帧成功。
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -28,16 +31,33 @@ const RECOVER_INTERVAL: Duration = Duration::from_millis(100);
 
 // ---------------------------------------------------------------- 采集状态
 
-/// 采集状态与本实例最近写进帧环的一帧，供 `core.health` 与控制状态读取。
+/// 记几次客户区几何的变化：基准帧比最早一次记下的变化还早时，几何已查不到。
+const GEOMETRY_HISTORY: usize = 16;
+
+/// 帧的客户区几何：尺寸与 DPI。只移动窗口不改变它，所以客户区坐标照常可用。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Geometry {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) dpi: u32,
+}
+
+/// 采集状态、本实例最近写进帧环的一帧与客户区几何的变化，供 `core.health` 与控制状态读取。
+///
+/// 最近一帧的采集时刻另存一份原子量：权威检查与定时检查读帧龄时不拿这把锁。
 #[derive(Debug)]
 pub(crate) struct FrameStatus {
     inner: Mutex<StatusInner>,
+    has_latest: AtomicBool,
+    latest_capture_ns: AtomicU64,
 }
 
 #[derive(Debug)]
 struct StatusInner {
     state: CaptureState,
     latest: Option<LatestFrame>,
+    /// 客户区几何的变化点：（从这一帧起，几何），按帧号递增，至多 [`GEOMETRY_HISTORY`] 个。
+    geometry: VecDeque<(u64, Geometry)>,
 }
 
 impl Default for FrameStatus {
@@ -46,7 +66,10 @@ impl Default for FrameStatus {
             inner: Mutex::new(StatusInner {
                 state: CaptureState::Idle,
                 latest: None,
+                geometry: VecDeque::new(),
             }),
+            has_latest: AtomicBool::new(false),
+            latest_capture_ns: AtomicU64::new(0),
         }
     }
 }
@@ -62,13 +85,63 @@ impl FrameStatus {
         (inner.state, inner.latest)
     }
 
+    /// 本实例最近写进帧环的一帧的采集时刻；还没写过帧时为 `None`。不拿锁。
+    pub(crate) fn latest_capture_ns(&self) -> Option<u64> {
+        self.has_latest
+            .load(Ordering::Acquire)
+            .then(|| self.latest_capture_ns.load(Ordering::Acquire))
+    }
+
+    /// 基准帧之后客户区的尺寸或 DPI 是否变了。基准帧的几何查不到时也算变了：比本实例在当前帧环
+    /// 写出的第一帧早（旧实例或挂接之前的帧）、比最近写入的一帧晚，或早于记下的最早一次变化。
+    pub(crate) fn geometry_changed_since(&self, base_frame: u64) -> bool {
+        let inner = self.lock();
+        let Some(latest) = inner.latest else {
+            return true;
+        };
+        let Some(&(first, _)) = inner.geometry.front() else {
+            return true;
+        };
+        if base_frame > latest.frame_number || base_frame < first {
+            return true;
+        }
+        let containing = inner
+            .geometry
+            .iter()
+            .rposition(|&(from, _)| from <= base_frame);
+        containing != Some(inner.geometry.len() - 1)
+    }
+
     /// 改变采集状态，返回原来的状态。
     fn set_state(&self, state: CaptureState) -> CaptureState {
         std::mem::replace(&mut self.lock().state, state)
     }
 
-    fn set_latest(&self, latest: Option<LatestFrame>) {
-        self.lock().latest = latest;
+    /// 换了帧环：最近写入的一帧与几何都属于原来的帧环，清空。
+    fn forget(&self) {
+        let mut inner = self.lock();
+        self.has_latest.store(false, Ordering::Release);
+        inner.latest = None;
+        inner.geometry.clear();
+    }
+
+    /// 记下刚写进帧环的一帧与它的几何。只由采集线程调用（单元测试也用它造出最近一帧）。
+    pub(crate) fn record(&self, latest: LatestFrame, geometry: Geometry) {
+        let mut inner = self.lock();
+        if inner
+            .geometry
+            .back()
+            .is_none_or(|&(_, last)| last != geometry)
+        {
+            if inner.geometry.len() == GEOMETRY_HISTORY {
+                inner.geometry.pop_front();
+            }
+            inner.geometry.push_back((latest.frame_number, geometry));
+        }
+        inner.latest = Some(latest);
+        self.latest_capture_ns
+            .store(latest.capture_ns, Ordering::Release);
+        self.has_latest.store(true, Ordering::Release);
     }
 
     /// 持有锁，模拟采集一侧占着它；只用于测试释放不依赖采集一侧。
@@ -362,8 +435,8 @@ impl Pipeline {
     fn apply(&mut self, command: Command) -> bool {
         match command {
             Command::Attach(sink) => {
-                // 最近写入的一帧属于原来的帧环。
-                self.status.set_latest(None);
+                // 最近写入的一帧与几何属于原来的帧环。
+                self.status.forget();
                 self.sink = Some(sink);
             }
             Command::Target(opener) => {
@@ -444,10 +517,18 @@ impl Pipeline {
         };
         match sink.write(&self.frame) {
             Ok(frame_number) => {
-                self.status.set_latest(Some(LatestFrame {
-                    frame_number,
-                    capture_ns: self.frame.meta.captured_at_ns,
-                }));
+                let meta = &self.frame.meta;
+                self.status.record(
+                    LatestFrame {
+                        frame_number,
+                        capture_ns: meta.captured_at_ns,
+                    },
+                    Geometry {
+                        width: meta.width,
+                        height: meta.height,
+                        dpi: meta.dpi,
+                    },
+                );
                 if let Some(problem) = self.problem.take() {
                     log!("capture: frames reach the frame ring again (was: {problem})");
                 }
@@ -475,7 +556,7 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::{
-        Capture, Command, FRAME_WAIT, FrameSink, FrameStatus, Pipeline, RECOVER_INTERVAL,
+        Capture, Command, FRAME_WAIT, FrameSink, FrameStatus, Geometry, Pipeline, RECOVER_INTERVAL,
         SEARCH_INTERVAL, SourceOpener, TargetError, check_window, opener_for,
     };
     use capture::{CaptureError, CaptureSource, Frame, FrameMeta};
@@ -817,6 +898,74 @@ mod tests {
         assert_eq!(fx.state(), CaptureState::Capturing);
         fx.pipeline.step(now);
         assert_eq!(fx.latest(), latest(102, 3));
+    }
+
+    #[test]
+    fn geometry_changes_are_recorded_as_frames_are_written() {
+        let mut fx = Fixture::new();
+        fx.attach();
+        fx.target(
+            "a",
+            vec![Ok(vec![
+                Ok(Some(frame(1, 2))),
+                Ok(Some(frame(2, 2))),
+                Ok(Some(frame(3, 3))),
+            ])],
+        );
+        let now = Instant::now();
+        // 帧环帧号 101、102 宽 2，103 宽 3。
+        fx.pipeline.step(now);
+        fx.pipeline.step(now);
+        assert!(!fx.status.geometry_changed_since(101));
+        assert!(!fx.status.geometry_changed_since(102));
+        fx.pipeline.step(now);
+        assert!(fx.status.geometry_changed_since(102));
+        assert!(!fx.status.geometry_changed_since(103));
+        assert_eq!(fx.status.latest_capture_ns(), Some(3_000));
+    }
+
+    #[test]
+    fn the_geometry_of_old_unknown_and_future_frames_counts_as_changed() {
+        let status = FrameStatus::default();
+        let at = |frame_number, width, dpi| {
+            status.record(
+                LatestFrame {
+                    frame_number,
+                    capture_ns: frame_number * 10,
+                },
+                Geometry {
+                    width,
+                    height: 10,
+                    dpi,
+                },
+            );
+        };
+        assert!(status.geometry_changed_since(1), "no frames yet");
+        assert_eq!(status.latest_capture_ns(), None);
+        at(5, 100, 96);
+        at(6, 100, 96);
+        assert_eq!(status.latest_capture_ns(), Some(60));
+        assert!(!status.geometry_changed_since(5));
+        assert!(!status.geometry_changed_since(6));
+        assert!(
+            status.geometry_changed_since(4),
+            "before this instance's first frame"
+        );
+        assert!(status.geometry_changed_since(7), "not written yet");
+        at(7, 100, 144);
+        assert!(status.geometry_changed_since(6), "the DPI changed");
+        assert!(!status.geometry_changed_since(7));
+        let mut last = 7;
+        for width in 0..u32::try_from(super::GEOMETRY_HISTORY).unwrap() {
+            last += 1;
+            at(last, 200 + width, 96);
+        }
+        // 最早记下的变化被挤掉了：更早的基准帧查不到，算作变了。
+        assert!(status.geometry_changed_since(7));
+        assert!(!status.geometry_changed_since(last));
+        status.forget();
+        assert!(status.geometry_changed_since(last));
+        assert_eq!(status.latest_capture_ns(), None);
     }
 
     #[test]
