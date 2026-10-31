@@ -6,6 +6,8 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+audio-capture = { path = "../audio-capture" }
+audio-ring = { path = "../audio-ring" }
 bellis-channel = { path = "../bellis-channel" }
 capture = { path = "../capture" }
 core-protocol = { path = "../core-protocol" }

@@ -14,7 +14,6 @@ mod error;
 mod fake;
 mod reader;
 mod ring;
-mod shm;
 mod writer;
 
 #[cfg(test)]

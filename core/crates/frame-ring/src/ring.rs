@@ -11,7 +11,7 @@ use core_protocol::frame_ring::{
 use core_protocol::messages::FrameRingAttachParams;
 
 use crate::error::FrameRingError;
-use crate::shm::SharedMemory;
+use shared_memory::SharedMemory;
 
 /// BGRA8 每个像素的字节数。
 const BYTES_PER_PIXEL: u64 = 4;

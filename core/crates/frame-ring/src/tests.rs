@@ -14,11 +14,11 @@ use core_protocol::frame_ring::{
 use core_protocol::messages::{FakeTarget, FrameRingAttachParams};
 
 use crate::ring::{header as offsets, write_header};
-use crate::shm::{Created, SharedMemory};
 use crate::{
     FAKE_DPI, FakeCapture, FrameRingError, FrameRingReader, FrameRingWriter, ReadError,
     ReadOutcome, SlotMeta, WriteError,
 };
+use shared_memory::{Created, SharedMemory};
 
 fn unique_name() -> String {
     static NEXT: AtomicU32 = AtomicU32::new(0);

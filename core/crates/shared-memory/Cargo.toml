@@ -1,0 +1,24 @@
+[package]
+name = "shared-memory"
+version = "0.0.0"
+description = "按名字打开主进程创建的共享内存并经原子操作访问，帧环与音频环共用"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# 只用于测试：让测试自己创建共享内存（生产中只有主进程创建）。
+testing = []
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+] }
+
+[lints]
+workspace = true

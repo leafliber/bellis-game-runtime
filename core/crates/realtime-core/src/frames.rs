@@ -211,17 +211,28 @@ pub(crate) fn opener_for(target: CaptureTarget) -> Result<Box<dyn SourceOpener>,
     }
 }
 
-/// 窗口识别规则须有进程名，并给出窗口类与标题至少一个。
-fn check_window(window: &WindowTarget) -> Result<(), TargetError> {
-    if window.process_name.is_empty() {
-        return Err(TargetError::Invalid("process_name is empty"));
+/// 窗口识别规则须有进程名，并给出窗口类与标题至少一个。音频目标的窗口规则同样（`audio` 模块）。
+pub(crate) fn check_window_rule(
+    process_name: &str,
+    window_class: Option<&str>,
+    title: Option<&str>,
+) -> Result<(), &'static str> {
+    if process_name.is_empty() {
+        return Err("process_name is empty");
     }
-    if window.window_class.is_none() && window.title.is_none() {
-        return Err(TargetError::Invalid(
-            "give window_class or title along with process_name",
-        ));
+    if window_class.is_none() && title.is_none() {
+        return Err("give window_class or title along with process_name");
     }
     Ok(())
+}
+
+fn check_window(window: &WindowTarget) -> Result<(), TargetError> {
+    check_window_rule(
+        &window.process_name,
+        window.window_class.as_deref(),
+        window.title.as_deref(),
+    )
+    .map_err(TargetError::Invalid)
 }
 
 #[cfg(windows)]
@@ -346,6 +357,8 @@ impl Capture {
                 // 线程结束（采集源与写入方都已丢弃）时随之丢弃，等待方由此得知。
                 let _exited = exited_sender;
                 run(&receiver, status);
+                // 先于 `_exited` 丢弃：等待方得知结束时，命令已一定送不到。
+                drop(receiver);
             })?;
         Ok((
             Self {

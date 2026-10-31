@@ -3,6 +3,26 @@
 version = 4
 
 [[package]]
+name = "audio-capture"
+version = "0.0.0"
+dependencies = [
+ "mono-clock",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "audio-ring"
+version = "0.0.0"
+dependencies = [
+ "audio-capture",
+ "core-protocol",
+ "serde",
+ "serde_json",
+ "shared-memory",
+]
+
+[[package]]
 name = "bellis-channel"
 version = "0.0.0"
 dependencies = [
@@ -113,10 +133,9 @@ version = "0.0.0"
 dependencies = [
  "capture",
  "core-protocol",
- "libc",
  "serde",
  "serde_json",
- "windows",
+ "shared-memory",
 ]
 
 [[package]]
@@ -231,6 +250,8 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "realtime-core"
 version = "0.0.0"
 dependencies = [
+ "audio-capture",
+ "audio-ring",
  "bellis-channel",
  "capture",
  "core-protocol",
@@ -350,6 +371,14 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "shared-memory"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "windows",
 ]
 
 [[package]]
