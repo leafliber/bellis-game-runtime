@@ -137,8 +137,10 @@ if sys.platform == "win32":
                     shell.wait(10)
                 if shell.poll() is None:
                     shell.kill()
-            meta = result.meta
-            size = directory_size(result.path)
+            meta, path = result.meta, result.path
+            assert meta is not None
+            assert path is not None
+            size = directory_size(path)
             minutes = elapsed / 60
             audio = meta.audio
             print(
@@ -161,7 +163,7 @@ if sys.platform == "win32":
             )
             assert meta.state == "complete"
             assert meta.reader_overflows == 0
-            return result.path
+            return path
 
         path = asyncio.run(main())
         recording = Recording.open(path)

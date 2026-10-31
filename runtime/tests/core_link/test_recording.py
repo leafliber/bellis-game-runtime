@@ -195,6 +195,8 @@ def test_a_live_recording_replays_to_the_same_results(
                 result = await session.stop("seconds")
             assert result.drained
             assert result.core.stage is StopStage.SHUTDOWN
+            assert result.meta is not None
+            assert result.path is not None
             assert result.meta.state == "complete"
             assert result.meta.reader_overflows == 0
             return result.path, player

@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 check-adapters = "game_runtime.adapter.check:main"
+observe = "game_runtime.observe.cli:main"
 record = "game_runtime.recording.cli:record_main"
 recording = "game_runtime.recording.cli:recording_main"
 replay = "game_runtime.recording.cli:replay_main"
