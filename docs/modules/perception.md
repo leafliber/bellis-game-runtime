@@ -28,15 +28,85 @@
 
 ## OCR
 
-普通插件 `ocr@1`（GR-10）：
+普通插件 `ocr`（GR-10）提供 `ocr@1`，依赖 `game-adapter@1`，不申请权限：它只识别调用方交来的帧，自己不取帧，所以不申请 `frames.read`。代码在 `runtime/src/game_runtime/ocr/`。
 
 - PP-OCRv5 系列模型经 ONNX Runtime 运行；不引入 PaddlePaddle 框架本身，前后处理用 RapidOCR 一类的现成封装或自写，随 GS-04 确定。
-- 只识别游戏适配包给出的 ROI（如名字栏、对白框、选项、审判发言区），不扫整帧。
-- 输出每行文字、识别框（客户区物理像素）、置信度、帧号与变换版本；识别框直接作为[定位与吸附](step-control.md#定位与吸附)的目标。
+- 只识别游戏适配包给出的 ROI（如名字栏、对白框、选项、审判发言区）或调用方给出的矩形，不扫整帧。
 - 服务另提供签名的固定文字项所用的 `read_lines`，见[固定文字的 OCR 接口](#固定文字的-ocr-接口)。
 - 先在 CPU 上运行，GPU 执行器为可选项。
 - 识别语言按游戏适配包声明（《魔女审判》为简体中文）。
-- 具体版本与许可在 GS-04 后确定，模型文件作为制品管理（[游戏适配包](game-adapter.md#位置与版本库边界)）。Windows 自带 OCR 作为 GS-04 的对照基线。
+- 具体版本与许可在 GS-04 后确定，模型文件作为制品管理（[模型制品](game-adapter.md#模型制品)）。Windows 自带 OCR 作为 GS-04 的对照基线。
+
+### 接口
+
+| 方法 | 输入 | 失败 |
+| --- | --- | --- |
+| `recognize(frame, roi)` | 帧与适配包里的 ROI 名；归一化矩形按这一帧的宽高换算为物理像素（[坐标](game-adapter.md#声明文件)） | 没有声明即 `LookupError`；尚未标定即 `NotCalibratedError`，不回退到其它区域，也不猜坐标（[尚未标定](game-adapter.md#尚未标定)） |
+| `recognize_rect(frame, rect)` | 帧与客户区物理像素的矩形，含左边与上边、不含右边与下边 | 为空或超出帧即 `ValueError` |
+| `check_language(frame, screen)` | 画面 `screen` 的稳定帧 | 见下文[语言核对的执行](#语言核对的执行) |
+| `read_lines(frame, rect)` | 同 `recognize_rect`，只返回各行文字；同步，见[固定文字的 OCR 接口](#固定文字的-ocr-接口) | 同 `recognize_rect`；服务已停用即 `OcrClosedError` |
+
+前三项是协程；`read_lines` 是同步方法，在调用方的线程里阻塞到识别做完，不能在事件循环里调用。四项都交给同一个工作线程，见下文[线程与时延](#线程与时延)。`OcrService` 满足 `scene@1` 的 `TextReader`（[固定文字的 OCR 接口](#固定文字的-ocr-接口)）：同一个 `ocr@1`，`scene@1` 只以这一项取用。
+
+- **帧**：BGRA8，自上而下逐行，带宽、高、行跨度、帧号与变换版本，即帧环读出的 `RingFrame`；接口只要求这几项（`FrameLike`），录制回放的帧满足它即可。识别期间帧的像素不能改变。
+- **输出** `OcrResult`：帧号、变换版本、ROI 名（按矩形识别时为空）、识别的区域，以及从上到下、从左到右排列的行。每行是文字、识别框（客户区物理像素，含左边与上边、不含右边与下边）与识别置信度（[0, 1]）；置信度低于配置 `min_confidence`（缺省 0.5）的行丢弃。识别框直接作为[定位与吸附](step-control.md#定位与吸附)的目标。
+- **固定文字的比较**：语言核对与画面签名的固定文字项都按[语言核对](game-adapter.md#语言核对)的规则（`RoiText.matches`）比较。
+- 读出的文字是不可信数据（见上文）。
+
+### 线程与时延
+
+- 识别在 `ocr@1` 自己的一个工作线程里按调用的先后串行进行，事件循环只等结果；ONNX Runtime 推理时释放 GIL。`read_lines` 可以在多个线程里同时调用，同样排队。排队的时间计入调用的时延，调用方不应堆积请求。
+- 调用方被取消时，还没开始的识别不再进行，已开始的照常做完、结果丢弃。停用时不再接受新的识别，等在途的做完，排队的以 `OcrClosedError` 结束。
+- 激活时核对与加载模型同样在线程里进行。
+- 配置 `threads` 设 ONNX Runtime 的算子内线程数，缺省 4，`null` 由 ONNX Runtime 自定；与游戏同机运行时取多少随 GS-04 定。每次识别的时延按 GS-04 的口径实测，未测前 PENDING。
+
+### 引擎
+
+当前实现是 GS-04 的候选之一：检测与识别两个模型，前后处理自写，只用 numpy 与 OpenCV（`engine.py`）。流程与参数取 PaddleOCR 3.x 通用 OCR 产线的缺省值：
+
+- **检测**：短边不足 64 时放大到 64、长边超过 4000 时缩小（上限随 GS-04 定），宽高取 32 的倍数；DB 后处理取概率大于 0.3 的区域的最小外接矩形，区域内平均概率不低于 0.6 才保留，按面积乘 1.5 除以周长向外扩张。
+- **识别**：检测框透视变换为水平的行图，高缩放到 48、宽按比例，每 6 行一批；CTC 贪心解码，置信度为保留下来的字的概率均值。
+- 不做文档方向分类、文本行方向分类与扭曲矫正：游戏的文字是正的。
+
+另加两步，配置里可关掉，关掉即 PaddleOCR 原样的后处理；是否保留随 GS-04 定：
+
+- **同行合并**：纵向重叠不少于较矮者一半的水平框算同一行，相邻两框的间隙不超过较高者的高度即合并为一个外接矩形。DB 常把一行在全角标点处断开，或把行末的句号单独检出成小框。
+- **识别前加宽**：水平框左右各加宽行高的 1/4 再裁出行图，识别框仍报检测框本身。DB 常漏掉画在字格左下角的行末标点。
+
+模型组有 `ppocrv5-mobile`（缺省）与 `ppocrv5-server`，配置 `model` 选择，缺省随 GS-04 重新确定。
+
+### 模型制品
+
+清单在 `runtime/src/game_runtime/ocr/models.py`，管理规则见[模型制品](game-adapter.md#模型制品)；配置 `data_dir` 是本地数据目录，绝对路径，缺省按[术语](../architecture.md#术语)中的位置与 `BELLIS_GAME_RUNTIME_DATA`。都是 GS-04 的候选：
+
+| 制品 | 来源 | 许可 |
+| --- | --- | --- |
+| 检测与识别模型（mobile、server 各两个 ONNX 文件） | PP-OCRv5 的模型作者 PaddlePaddle 只发布 Paddle 格式的权重，转换要装 PaddlePaddle；ONNX 文件取自 RapidOCR 项目（RapidAI）在魔搭社区的模型仓库 `RapidAI/RapidOCR`，钉在标签 v3.10.0，摘要与 RapidOCR 3.10.0 的 `default_models.yaml` 一致；原始权重为 Hugging Face 上 PaddlePaddle 的 `PP-OCRv5_mobile_det` 等四个仓库 | Apache-2.0（RapidOCR 模型仓库与 PaddlePaddle 的原始权重） |
+| 识别字表 `ppocrv5_dict.txt`（18383 字） | 模型作者的 PaddleOCR 仓库标签 v3.0.0 的 `ppocr/utils/dict/`，与 ONNX 文件内嵌的字表逐行相同 | Apache-2.0 |
+
+激活时识别模型的类别数须等于字表的字数加 2（CTC 的空白与空格），不等即激活失败。
+
+### 语言核对的执行
+
+`check_language(frame, screen)` 按[语言核对](game-adapter.md#语言核对)：取适配包里画面 `screen` 的各项，逐项识别它的 ROI 并比较，给出每一项的识别结果与是否相符，各项都相符才通过。固定文字为空即 `NotCalibratedError`，核对不能通过；这个画面没有声明任何一项即 `LookupError`。调用方给出稳定帧与它所在的画面；何时核对、不符时怎样停下并上报由使用方（逐步控制）决定。
+
+激活时，适配包的语言版本不在所选模型组核对过的语言里（当前只有 `zh-Hans`，含带地区的如 `zh-Hans-CN`）即激活失败。
+
+### GS-04 的评测工具
+
+离线工具 `tools/gs04-ocr/`（`uv run gs04`），不进运行时。
+
+- **样本**：一个目录，含 `samples.toml` 与它引用的图像。`samples.toml` 可写顶层 `game`（适配包 `id`，ROI 名按它换算）；每个 `[[samples]]` 有 `image`（相对 `samples.toml` 的 PNG，整个客户区）、`category`（类别：对白 `dialogue`、名字 `name`、选项 `choice`、审判发言 `trial`，也可以是其它标识）、`roi`（ROI 名）或 `rect`（物理像素矩形，二者恰好写一个），以及 `text`（真值，多行以换行分隔）。《魔女审判》的样本与真值只存本地数据目录（C-1、C-4、C-5），建议放在 `samples/gs04/<游戏>/` 下。
+- **合成样本**：`uv run gs04 synth <目录>` 渲染合成游戏的每句台词（显示完的与逐字显示到一半的）、名字、选项提问、选项、坏结局的文字与标题菜单的按钮，真值已知，用来验证工具本身；`--width`、`--height` 改分辨率。
+- **评测**：`uv run gs04 eval <样本目录>` 对每个样本识别一次，按类别与总计给出字符准确率与时延分布；`--engine` 选 `ppocrv5-mobile`、`ppocrv5-server` 或 `windows`；`--threads`（0 由 ONNX Runtime 自定）、`--det-max-side`（检测输入的长边上限）、`--no-merge`、`--no-pad` 对照引擎的配置。
+- **字符准确率**：1 减去编辑距离之和除以真值字数之和，预测与真值都先各行依次连接并去掉空白；另给出两边先做 NFKC 归一（全角与半角标点视为相同）后的值。
+- **时延**：每个样本一次识别的墙钟时间（裁出、检测与识别，不含排队），给出 p50、p90、p95、p99、最大与均值；第一次调用含预热，单独记录、不计入分布。
+- **Windows 自带 OCR**（`Windows.Media.Ocr`）：只在 Windows 上，是评测工具的可选依赖（`uv run --extra windows-ocr gs04 eval … --engine windows`），系统须装有简体中文的 OCR 语言组件；它直接识别同一区域裁出的图像，不经本仓库的前后处理。
+- **报告**写到不入库的 `reports/gs04/`：JSON 与 Markdown 各一份，含日期、系统与 CPU、引擎及其配置、模型制品的摘要、ONNX Runtime 版本、每个样本的预测与真值，以及上面的统计。结论由维护者写回技术基线 GR-10。
+
+### OCR 的依赖
+
+运行时：onnxruntime（MIT），随它装入的 flatbuffers（Apache-2.0）与 protobuf（BSD-3-Clause）；numpy 与 opencv-python-headless 同下文 `scene@1` 的[依赖](#依赖)。评测工具的可选依赖 `windows-ocr`：pywinrt 的 `winrt-runtime` 与 `winrt-Windows.*` 各包（MIT），只在 Windows 上安装。版本见 `uv.lock`；模型制品的许可见上文[模型制品](#模型制品)。
 
 ## 画面变化与签名
 
@@ -92,6 +162,7 @@ def read_lines(self, frame: RingFrame, rect: PixelRect) -> Sequence[str]: ...
 - 识别 `frame` 在 `rect`（客户区物理像素，含左边与上边、不含右边与下边）内的文字，按阅读顺序返回各行。
 - 在 `scene@1` 的工作线程里同步调用，可以阻塞；须能在多个线程里同时调用。识别不了时抛异常，该项不可判。
 - 同一 ROI 的像素没变时，`scene@1` 沿用上次读出的各行，不再调用（按 ROI 与像素内容的摘要缓存最近 32 项）。
+- `ocr@1` 的 `OcrService.read_lines` 实现这一接口，见 OCR 的[接口](#接口)。
 
 ### 输出
 
