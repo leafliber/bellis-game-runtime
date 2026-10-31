@@ -3,6 +3,9 @@
 //! Windows 上是命名文件映射（`OpenFileMappingW` 与 `MapViewOfFile`），其它平台是 POSIX 共享内存
 //! （`shm_open` 与 `mmap`）。对映射的访问一律经原子操作：[`SharedMemory::u64_at`]、
 //! [`SharedMemory::u32_at`]、[`SharedMemory::store`] 与 [`SharedMemory::load`]。
+//!
+//! 帧环（`frame-ring`）与音频环（`audio-ring`）都经它访问主进程创建的共享内存。本 crate 只打开，不创建；
+//! 只用于测试的 [`Created`] 在 `testing` 特性下才有。
 
 #[cfg(unix)]
 mod unix;
@@ -14,8 +17,8 @@ use unix as sys;
 #[cfg(windows)]
 use windows as sys;
 
-#[cfg(test)]
-pub(crate) use sys::Created;
+#[cfg(feature = "testing")]
+pub use sys::Created;
 
 use std::io;
 use std::ptr::NonNull;
@@ -23,7 +26,7 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// 一段映射到本进程的共享内存；drop 时解除映射，不删除共享内存本身。
 #[derive(Debug)]
-pub(crate) struct SharedMemory {
+pub struct SharedMemory {
     ptr: NonNull<u8>,
     len: usize,
 }
@@ -34,8 +37,16 @@ unsafe impl Send for SharedMemory {}
 unsafe impl Sync for SharedMemory {}
 
 impl SharedMemory {
-    /// 打开名为 `name` 的共享内存，映射它开头的 `len` 字节。共享内存比 `len` 小时失败。
-    pub(crate) fn open(name: &str, len: usize) -> io::Result<Self> {
+    /// 打开名为 `name` 的共享内存，映射它开头的 `len` 字节。
+    ///
+    /// # Errors
+    ///
+    /// `len` 为 0、名字不合法、共享内存不存在、比 `len` 小或映射失败时返回系统给出的错误。
+    ///
+    /// # Panics
+    ///
+    /// 映射的起点没有按 8 字节对齐时 panic（映射总是按页对齐的）。
+    pub fn open(name: &str, len: usize) -> io::Result<Self> {
         if len == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -62,8 +73,13 @@ impl SharedMemory {
         unsafe { self.ptr.as_ptr().add(offset) }
     }
 
-    /// `offset` 处的 u64；`offset` 须是 8 的倍数且在映射内，否则 panic。
-    pub(crate) fn u64_at(&self, offset: usize) -> &AtomicU64 {
+    /// `offset` 处的 u64。
+    ///
+    /// # Panics
+    ///
+    /// `offset` 不是 8 的倍数或不在映射内时 panic。
+    #[must_use]
+    pub fn u64_at(&self, offset: usize) -> &AtomicU64 {
         assert!(offset.is_multiple_of(8), "u64 at {offset} is misaligned");
         let ptr = self.range(offset, 8);
         // SAFETY: 在映射内且 8 字节对齐（映射起点按页对齐）；映射活得与 `self` 一样久；
@@ -71,16 +87,25 @@ impl SharedMemory {
         unsafe { AtomicU64::from_ptr(ptr.cast()) }
     }
 
-    /// `offset` 处的 u32；`offset` 须是 4 的倍数且在映射内，否则 panic。
-    pub(crate) fn u32_at(&self, offset: usize) -> &AtomicU32 {
+    /// `offset` 处的 u32。
+    ///
+    /// # Panics
+    ///
+    /// `offset` 不是 4 的倍数或不在映射内时 panic。
+    #[must_use]
+    pub fn u32_at(&self, offset: usize) -> &AtomicU32 {
         assert!(offset.is_multiple_of(4), "u32 at {offset} is misaligned");
         let ptr = self.range(offset, 4);
         // SAFETY: 同 `u64_at`，对齐为 4 字节。
         unsafe { AtomicU32::from_ptr(ptr.cast()) }
     }
 
-    /// 以 Relaxed 的原子写把 `src` 复制到 `offset` 起；对齐的部分每次写 8 字节。越界时 panic。
-    pub(crate) fn store(&self, offset: usize, src: &[u8]) {
+    /// 以 Relaxed 的原子写把 `src` 复制到 `offset` 起；对齐的部分每次写 8 字节。
+    ///
+    /// # Panics
+    ///
+    /// 越出映射时 panic。
+    pub fn store(&self, offset: usize, src: &[u8]) {
         let base = self.range(offset, src.len());
         let head = base.align_offset(8).min(src.len());
         let (head_bytes, rest) = src.split_at(head);
@@ -103,8 +128,12 @@ impl SharedMemory {
         }
     }
 
-    /// 以 Relaxed 的原子读把 `offset` 起的 `dst.len()` 字节复制到 `dst`；越界时 panic。
-    pub(crate) fn load(&self, offset: usize, dst: &mut [u8]) {
+    /// 以 Relaxed 的原子读把 `offset` 起的 `dst.len()` 字节复制到 `dst`。
+    ///
+    /// # Panics
+    ///
+    /// 越出映射时 panic。
+    pub fn load(&self, offset: usize, dst: &mut [u8]) {
         let base = self.range(offset, dst.len());
         let head = base.align_offset(8).min(dst.len());
         let (head_bytes, rest) = dst.split_at_mut(head);

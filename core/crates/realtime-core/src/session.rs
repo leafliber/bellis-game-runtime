@@ -24,24 +24,27 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use audio_ring::AudioRingWriter;
 use bellis_channel::{
     ChannelError, Connection, ConnectionOptions, Handlers, Message, RpcError, RpcErrorCode,
     RpcKind, RpcOptions, RpcPeer, classify, connect,
 };
 use core_protocol::PROTOCOL_VERSION;
 use core_protocol::messages::{
-    ActionBlock, ActionSubmitResult, CaptureSetTargetParams, CoreHelloParams, CoreHelloResult,
-    Empty, FrameRingAttachParams, InputReleasedParams, ProducerHeartbeatParams,
-    ProducerRevokeParams, ReleaseReason,
+    ActionBlock, ActionSubmitResult, AudioRingAttachParams, AudioSetTargetParams,
+    CaptureSetTargetParams, CoreHealthParams, CoreHelloParams, CoreHelloResult, Empty,
+    FrameRingAttachParams, InputReleasedParams, ProducerHeartbeatParams, ProducerRevokeParams,
+    ReleaseReason,
 };
 use core_protocol::methods::{
-    ActionReceipt, ActionSubmit, CaptureSetTarget, CoreHealth, CoreHello, CoreStop,
-    FrameRingAttach, InputReleased, Method, Notification, ProducerHeartbeat, ProducerRevoke,
-    error_code,
+    ActionReceipt, ActionSubmit, AudioRingAttach, AudioSetTarget, CaptureSetTarget, CoreHealth,
+    CoreHello, CoreStop, FrameRingAttach, InputReleased, Method, Notification, ProducerHeartbeat,
+    ProducerRevoke, error_code,
 };
 use frame_ring::FrameRingWriter;
 use serde_json::{Map, Value, json};
 
+use crate::audio::{self, Audio, AudioStatus, AudioThread, audio_opener_for};
 use crate::config::{HELLO_TIMEOUT, InputSetup, Launch, Options};
 use crate::control::{Control, Limits, Notice, Notices};
 use crate::fake::{Post, TestDevice, connect_test_device};
@@ -57,6 +60,9 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 会话结束时等采集线程停掉采集源的时限。等不到也照常退出：输入此前已经释放。
 const CAPTURE_STOP_WAIT: Duration = Duration::from_millis(500);
+
+/// 会话结束时等音频线程停掉音频源的时限。等不到也照常退出：输入此前已经释放。
+const AUDIO_STOP_WAIT: Duration = Duration::from_millis(500);
 
 /// 会话结束时等核连接的发送队列写完的时限。等不到也照常退出：输入此前已经释放。
 const OUTBOX_FLUSH_WAIT: Duration = Duration::from_millis(200);
@@ -165,7 +171,7 @@ pub fn run(
         return Err(error);
     }
 
-    let (capture, capture_thread) = match Capture::spawn(frames) {
+    let (media, media_threads) = match Media::spawn(frames) {
         Ok(spawned) => spawned,
         Err(error) => {
             finish_device(device);
@@ -175,7 +181,7 @@ pub fn run(
     let (ended, end) = mpsc::channel();
     let peer = RpcPeer::spawn(
         connection,
-        handlers(&control, &outbox, &Arc::new(capture), ended.clone()),
+        handlers(&control, &outbox, &media, ended.clone()),
         &RpcOptions {
             timeout: RPC_TIMEOUT,
         },
@@ -183,7 +189,7 @@ pub fn run(
     let peer = match peer {
         Ok(peer) => Arc::new(peer),
         Err(error) => {
-            stop_capture(capture_thread);
+            media_threads.stop();
             finish_device(device);
             return Err(StartError::Thread(error));
         }
@@ -197,7 +203,7 @@ pub fn run(
         options.max_frame_age.as_millis()
     );
 
-    let workers = start_workers(&control, &outbox, &peer, options, &ended, stdin);
+    let workers = start_workers(&control, &media, &outbox, &peer, options, &ended, stdin);
     drop(ended);
     let workers = match workers {
         Ok(workers) => workers,
@@ -206,7 +212,7 @@ pub fn run(
             Outbox::log(&control.release_on_exit(ReleaseReason::CoreConnectionLost));
             outbox.close(OUTBOX_FLUSH_WAIT);
             finish_device(device);
-            stop_capture(capture_thread);
+            media_threads.stop();
             peer.close();
             return Err(StartError::Thread(error));
         }
@@ -231,7 +237,7 @@ pub fn run(
     outbox.close(OUTBOX_FLUSH_WAIT);
     // 释放全部输入的抬起写给测试一方之后才断开它。
     finish_device(device);
-    stop_capture(capture_thread);
+    media_threads.stop();
     peer.close();
     Ok(reason)
 }
@@ -268,13 +274,56 @@ fn start_input(
     }
 }
 
-/// 停掉采集线程；释放已在此前完成，等不到它结束也照常退出。
-fn stop_capture(capture: CaptureThread) {
-    if !capture.stop(CAPTURE_STOP_WAIT) {
-        log!(
-            "the capture thread did not stop within {}ms",
-            CAPTURE_STOP_WAIT.as_millis()
-        );
+/// 处理函数经它把命令交给采集线程与音频线程；健康线程从这里读音频的状态。
+struct Media {
+    capture: Capture,
+    audio: Audio,
+    audio_status: Arc<AudioStatus>,
+}
+
+/// 采集线程与音频线程本身，会话结束时停掉。
+struct MediaThreads {
+    capture: CaptureThread,
+    audio: AudioThread,
+}
+
+impl Media {
+    /// 启动采集线程与音频线程；两者互不依赖，也都不碰控制状态。
+    fn spawn(frames: Arc<FrameStatus>) -> io::Result<(Arc<Self>, MediaThreads)> {
+        let audio_status = Arc::new(AudioStatus::default());
+        let (capture, capture_thread) = Capture::spawn(frames)?;
+        let (audio, audio_thread) = match Audio::spawn(Arc::clone(&audio_status)) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                stop_thread("capture", capture_thread.stop(CAPTURE_STOP_WAIT));
+                return Err(error);
+            }
+        };
+        Ok((
+            Arc::new(Self {
+                capture,
+                audio,
+                audio_status,
+            }),
+            MediaThreads {
+                capture: capture_thread,
+                audio: audio_thread,
+            },
+        ))
+    }
+}
+
+impl MediaThreads {
+    /// 停掉采集线程与音频线程；释放已在此前完成，等不到它们结束也照常退出。
+    fn stop(self) {
+        stop_thread("capture", self.capture.stop(CAPTURE_STOP_WAIT));
+        stop_thread("audio", self.audio.stop(AUDIO_STOP_WAIT));
+    }
+}
+
+fn stop_thread(name: &str, stopped: bool) {
+    if !stopped {
+        log!("the {name} thread did not stop in time");
     }
 }
 
@@ -456,9 +505,9 @@ fn capture_stopped() -> RpcError {
 
 /// `frame_ring.attach`：打开并核对帧环，把写入方交给采集线程。帧号从帧环头部的 `write_seq` 续写。
 fn attach_handler(
-    capture: &Arc<Capture>,
+    media: &Arc<Media>,
 ) -> impl Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync + 'static {
-    let capture = Arc::clone(capture);
+    let media = Arc::clone(media);
     move |params| {
         let params: FrameRingAttachParams =
             parse(params).map_err(|error| invalid_params(FrameRingAttach::NAME, &error))?;
@@ -478,16 +527,19 @@ fn attach_handler(
             params.name,
             writer.last_frame_number()
         );
-        capture.attach(writer).map_err(|_| capture_stopped())?;
+        media
+            .capture
+            .attach(writer)
+            .map_err(|_| capture_stopped())?;
         Ok(empty())
     }
 }
 
 /// `capture.set_target`：核对目标，交给采集线程；旧的采集源先停掉。
 fn set_target_handler(
-    capture: &Arc<Capture>,
+    media: &Arc<Media>,
 ) -> impl Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync + 'static {
-    let capture = Arc::clone(capture);
+    let media = Arc::clone(media);
     move |params| {
         let params: CaptureSetTargetParams =
             parse(params).map_err(|error| invalid_params(CaptureSetTarget::NAME, &error))?;
@@ -501,7 +553,70 @@ fn set_target_handler(
             RpcError::new(code, error.to_string())
         })?;
         log!("capture target: {opener}");
-        capture.set_target(opener).map_err(|_| capture_stopped())?;
+        media
+            .capture
+            .set_target(opener)
+            .map_err(|_| capture_stopped())?;
+        Ok(empty())
+    }
+}
+
+fn audio_stopped() -> RpcError {
+    RpcError::new(RpcErrorCode::INTERNAL_ERROR, "the audio thread has stopped")
+}
+
+/// `audio_ring.attach`：打开并核对音频环，把写入方交给音频线程。块号从音频环头部的 `write_seq` 续写。
+fn audio_attach_handler(
+    media: &Arc<Media>,
+) -> impl Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync + 'static {
+    let media = Arc::clone(media);
+    move |params| {
+        let params: AudioRingAttachParams =
+            parse(params).map_err(|error| invalid_params(AudioRingAttach::NAME, &error))?;
+        let writer = AudioRingWriter::attach(&params).map_err(|error| {
+            log!(
+                "{} {:?} refused: {error}",
+                AudioRingAttach::NAME,
+                params.name
+            );
+            RpcError::new(
+                i64::from(error_code::AUDIO_RING_MISMATCH),
+                error.to_string(),
+            )
+        })?;
+        log!(
+            "attached audio ring {:?} ({}); block numbers continue after {}",
+            params.name,
+            writer.format(),
+            writer.last_block_number()
+        );
+        media.audio.attach(writer).map_err(|_| audio_stopped())?;
+        Ok(empty())
+    }
+}
+
+/// `audio.set_target`：核对目标，交给音频线程；旧的音频源先停掉。
+fn audio_target_handler(
+    media: &Arc<Media>,
+) -> impl Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync + 'static {
+    let media = Arc::clone(media);
+    move |params| {
+        let params: AudioSetTargetParams =
+            parse(params).map_err(|error| invalid_params(AudioSetTarget::NAME, &error))?;
+        let opener = audio_opener_for(params.target).map_err(|error| {
+            log!("{} refused: {error}", AudioSetTarget::NAME);
+            let code = match &error {
+                audio::TargetError::Invalid(_) => RpcErrorCode::INVALID_PARAMS,
+                audio::TargetError::Unsupported(_) => i64::from(error_code::CAPTURE_UNSUPPORTED),
+                audio::TargetError::Output(_) => i64::from(error_code::AUDIO_RING_MISMATCH),
+            };
+            RpcError::new(code, error.to_string())
+        })?;
+        log!("audio target: {opener}");
+        media
+            .audio
+            .set_target(opener)
+            .map_err(|_| audio_stopped())?;
         Ok(empty())
     }
 }
@@ -509,7 +624,7 @@ fn set_target_handler(
 fn handlers(
     control: &Arc<Control>,
     outbox: &Arc<Outbox>,
-    capture: &Arc<Capture>,
+    media: &Arc<Media>,
     ended: Sender<Ended>,
 ) -> Handlers {
     let heartbeat = {
@@ -560,8 +675,10 @@ fn handlers(
         .request(ProducerRevoke::NAME, revoke)
         .request_then(CoreStop::NAME, stop, stopped)
         .request(ActionSubmit::NAME, submit_handler(control, outbox))
-        .request(FrameRingAttach::NAME, attach_handler(capture))
-        .request(CaptureSetTarget::NAME, set_target_handler(capture))
+        .request(FrameRingAttach::NAME, attach_handler(media))
+        .request(CaptureSetTarget::NAME, set_target_handler(media))
+        .request(AudioRingAttach::NAME, audio_attach_handler(media))
+        .request(AudioSetTarget::NAME, audio_target_handler(media))
 }
 
 /// `action.submit`：校验并交给调度线程，不在读线程上执行任何一步。参数解析不了（未知字段、类型不对）
@@ -594,9 +711,18 @@ fn submit_handler(
     }
 }
 
+/// `core.health` 的内容：控制状态与画面采集由 [`Control::health`] 给出（它先读时刻），音频的状态随后从
+/// 音频线程的状态读出，不持控制状态的锁。
+fn health(control: &Control, audio: &AudioStatus) -> CoreHealthParams {
+    let mut health = control.health();
+    (health.audio, health.latest_audio) = audio.snapshot();
+    health
+}
+
 /// 启动调度、发送、健康与两条生命线的线程，返回会在进入停止后结束、需要等待的线程。
 fn start_workers(
     control: &Arc<Control>,
+    media: &Arc<Media>,
     outbox: &Arc<Outbox>,
     peer: &Arc<RpcPeer>,
     options: &Options,
@@ -615,10 +741,10 @@ fn start_workers(
             move || control.run_scheduler(|notices| outbox.post(notices))
         })?;
     let health = thread::Builder::new().name("core-health".into()).spawn({
-        let (control, outbox) = (Arc::clone(control), Arc::clone(outbox));
+        let (control, media, outbox) = (Arc::clone(control), Arc::clone(media), Arc::clone(outbox));
         let interval = options.health_interval;
         move || loop {
-            outbox.notify::<CoreHealth>(&control.health());
+            outbox.notify::<CoreHealth>(&health(&control, &media.audio_status));
             if control.wait_stopping(interval) {
                 return;
             }

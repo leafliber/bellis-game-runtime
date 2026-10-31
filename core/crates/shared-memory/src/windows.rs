@@ -19,7 +19,7 @@ fn os_error(error: &windows::core::Error) -> io::Error {
 }
 
 /// 打开名为 `name` 的文件映射并映射开头的 `len` 字节。
-pub(super) fn open(name: &str, len: usize) -> io::Result<NonNull<u8>> {
+pub(crate) fn open(name: &str, len: usize) -> io::Result<NonNull<u8>> {
     if name.contains('\0') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -43,7 +43,7 @@ pub(super) fn open(name: &str, len: usize) -> io::Result<NonNull<u8>> {
 /// # Safety
 ///
 /// `ptr` 须来自 [`open`]，之后不再访问这段内存。
-pub(super) unsafe fn close(ptr: NonNull<u8>, _len: usize) {
+pub(crate) unsafe fn close(ptr: NonNull<u8>, _len: usize) {
     let view = MEMORY_MAPPED_VIEW_ADDRESS {
         Value: ptr.as_ptr().cast(),
     };
@@ -53,15 +53,20 @@ pub(super) unsafe fn close(ptr: NonNull<u8>, _len: usize) {
 
 /// 测试用：以缺省的安全描述符创建一个文件映射，drop 时关闭句柄（最后一个句柄与视图关闭后映射消失）。
 /// 生产中只有主进程创建文件映射，DACL 只允许当前用户。
-#[cfg(test)]
+#[cfg(feature = "testing")]
 #[derive(Debug)]
-pub(crate) struct Created {
+pub struct Created {
     handle: windows::Win32::Foundation::HANDLE,
 }
 
-#[cfg(test)]
+#[cfg(feature = "testing")]
 impl Created {
-    pub(crate) fn new(name: &str, len: usize) -> io::Result<Self> {
+    /// 创建名为 `name`、大小为 `len` 字节的共享内存。
+    ///
+    /// # Errors
+    ///
+    /// 同名的已存在或创建失败时返回系统给出的错误。
+    pub fn new(name: &str, len: usize) -> io::Result<Self> {
         use windows::Win32::Foundation::{
             ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE,
         };
@@ -91,7 +96,7 @@ impl Created {
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "testing")]
 impl Drop for Created {
     fn drop(&mut self) {
         // SAFETY: `handle` 来自 `CreateFileMappingW`，之后不再使用。

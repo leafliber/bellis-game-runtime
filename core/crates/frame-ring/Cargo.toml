@@ -9,20 +9,12 @@ publish.workspace = true
 [dependencies]
 capture = { path = "../capture" }
 core-protocol = { path = "../core-protocol" }
-
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_Memory",
-] }
+shared-memory = { path = "../shared-memory" }
 
 [dev-dependencies]
 serde.workspace = true
 serde_json.workspace = true
+shared-memory = { path = "../shared-memory", features = ["testing"] }
 
 [lints]
 workspace = true
