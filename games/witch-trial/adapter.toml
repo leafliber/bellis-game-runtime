@@ -1,0 +1,118 @@
+# 《魔法少女的魔女审判》适配包。
+# 格式见 docs/modules/game-adapter.md 的“格式”，本游戏特有的适配见 docs/games/witch-trial.md。
+# ROI、画面签名、语言核对的固定文字与阅读节奏尚未标定，在本机截图与录制上按 C-5 标定；
+# 这里不写任何猜测的坐标。
+
+id = "witch-trial"
+name = "魔法少女的魔女审判"
+version = "0.1.0"
+
+[window]
+process_name = "manosaba.exe"
+window_class = "UnityWndClass"
+title = "manosaba"
+
+[resolution]
+width = 2560
+height = 1440
+
+[language]
+tag = "zh-Hans"
+fixed_texts = [] # 尚未标定
+
+[compliance]
+basis = "docs/compliance.md 的《魔法少女的魔女审判》，合规确认 C-1、C-2、C-4"
+text_source = "screen"
+training = false
+demonstrations = false
+recording_quota_gb = 50
+models = [
+    # 已确认启用安全沙箱的接入点；各用途的型号经 GS-07 对照后再加。
+    { vendor = "volcengine-ark", model = "glm-5-3-flash-260828" },
+]
+
+[whitelist]
+# 只允许左键点击；快进、自动、回想与存读档不进白名单，可用的按键由 GS-05 普查后再加。
+click_buttons = ["left"]
+press_keys = []
+scroll = false
+click_regions = ["client"]
+# 暂定值，GS-05 核对。
+press_duration = 0.05
+max_rate = 2
+# 不允许长按。
+hold_keys = []
+hold_buttons = []
+
+# 画面类型映射见 docs/games/witch-trial.md 的“运行要求”。
+
+[[screens]]
+id = "dialogue"
+title = "对白"
+type = "对话"
+
+[[screens]]
+id = "choice"
+title = "选项"
+type = "选择"
+
+[[screens]]
+id = "trial"
+title = "审判"
+type = "计时选择"
+
+[[screens]]
+id = "settings"
+title = "设置"
+type = "设置"
+
+[[screens]]
+id = "save-load"
+title = "存读档"
+type = "存读档"
+
+[[screens]]
+id = "bad-ending"
+title = "坏结局"
+type = "坏结局"
+
+[risk]
+# 暂为空，随 GS-05 补充；通用禁用词表仍生效。
+
+[rois]
+client = { title = "整个客户区", rect = [0.0, 0.0, 1.0, 1.0] }
+# 以下尚未标定。
+speaker = { title = "名字栏" }
+dialogue = { title = "对白框" }
+choices = { title = "选项" }
+trial-statement = { title = "审判发言区" }
+
+# 以下签名尚未标定。
+
+[[signatures]]
+id = "dialogue"
+screen = "dialogue"
+
+[[signatures]]
+id = "choice"
+screen = "choice"
+
+[[signatures]]
+id = "trial"
+screen = "trial"
+
+[[signatures]]
+id = "bad-ending"
+screen = "bad-ending"
+
+[[notes]]
+id = "characters"
+title = "角色表"
+
+[[notes]]
+id = "evidence"
+title = "证据与证词本"
+
+[[notes]]
+id = "open-questions"
+title = "尚未解决的疑点与矛盾"
