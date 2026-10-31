@@ -1,0 +1,206 @@
+"""本仓库的适配包：都通过校验；合成游戏的声明与它的实现一致；《魔女审判》只写了必需部分。
+
+合成游戏见 `docs/modules/offline-tools.md` 的“合成游戏”，《魔女审判》见
+`docs/games/witch-trial.md` 的“适配包”。
+"""
+
+import pytest
+
+from core_protocol.models import MouseButton
+from game_runtime.adapter import (
+    GAMES_DIR,
+    GENERIC_NAMES,
+    Adapter,
+    NormalizedRect,
+    NotCalibratedError,
+    c2_allows,
+    load_adapter,
+)
+from game_runtime.adapter.check import check_games_dir, check_package, package_dirs
+from game_runtime.core_link import WindowRule
+from synthetic_game import GameConfig, Key, SceneType
+from synthetic_game.layout import Layout, Rect
+from synthetic_game.shell import WINDOW_TITLE
+from synthetic_game.story import UI
+
+SET1 = {Key.ENTER: 0x1C, Key.SPACE: 0x39, Key.ESCAPE: 0x01, Key.UP: 0xE048, Key.DOWN: 0xE050}
+"""合成游戏用到的键的 Set 1 扫描码。"""
+
+
+@pytest.fixture(scope="module")
+def synthetic() -> Adapter:
+    return load_adapter(GAMES_DIR / "synthetic-game")
+
+
+@pytest.fixture(scope="module")
+def witch_trial() -> Adapter:
+    return load_adapter(GAMES_DIR / "witch-trial")
+
+
+def test_every_package_in_the_repository_passes_the_check() -> None:
+    directories = package_dirs(GAMES_DIR)
+
+    assert {directory.name for directory in directories} >= {"synthetic-game", "witch-trial"}
+    assert check_games_dir(GAMES_DIR) == []
+    for directory in directories:
+        assert check_package(directory).id == directory.name
+
+
+# 合成游戏
+
+
+def test_synthetic_game_is_fully_declared(synthetic: Adapter) -> None:
+    assert synthetic.uncalibrated() == ()
+
+
+def test_synthetic_window_rule_matches_the_window_shell(synthetic: Adapter) -> None:
+    assert synthetic.window_rule() == WindowRule(
+        process_name="python.exe", window_class="TkTopLevel", title=WINDOW_TITLE
+    )
+
+
+def test_synthetic_resolution_is_the_default_config(synthetic: Adapter) -> None:
+    config = GameConfig()
+
+    assert (synthetic.resolution.width, synthetic.resolution.height) == (
+        config.width,
+        config.height,
+    )
+
+
+def _layout_rects(layout: Layout) -> dict[str, Rect]:
+    options = [layout.choice_option(index) for index in range(3)]
+    return {
+        "client": layout.full,
+        "speaker": layout.speaker_box(),
+        "dialogue": layout.dialogue_text(),
+        "continue-marker": layout.continue_marker(),
+        "choice-prompt": layout.choice_prompt(),
+        "choices": Rect(options[0].left, options[0].top, options[-1].right, options[-1].bottom),
+        "timer-bar": layout.timer_bar(),
+        "menu-start": layout.menu_button(0),
+        "menu-shop": layout.menu_button(1),
+        "menu-help": layout.menu_button(2),
+        "shop-list": layout.shop_list(),
+        "shop-leave": layout.shop_leave(),
+        "popup-text": layout.popup_text(),
+        "popup-ok": layout.popup_ok(),
+        "ending-text": layout.ending_text(),
+        "ending-retry": layout.ending_retry(),
+    }
+
+
+@pytest.mark.parametrize(("width", "height"), [(1280, 720), (2560, 1440)])
+def test_synthetic_rois_are_the_render_layout(synthetic: Adapter, width: int, height: int) -> None:
+    expected = {
+        name: (rect.left, rect.top, rect.right, rect.bottom)
+        for name, rect in _layout_rects(Layout(width, height)).items()
+    }
+
+    actual = {name: tuple(synthetic.roi(name).to_pixels(width, height)) for name in synthetic.rois}
+
+    assert actual == expected
+
+
+def test_synthetic_screens_map_to_the_truth_scene_types(synthetic: Adapter) -> None:
+    # 合成游戏的真值直接用通用画面类型的名称。
+    assert {scene.value for scene in SceneType} <= GENERIC_NAMES
+    assert {screen.id: screen.type for screen in synthetic.screens} == {
+        "title-menu": SceneType.MENU,
+        "dialogue": SceneType.DIALOGUE,
+        "choice": SceneType.CHOICE,
+        "timed-choice": SceneType.TIMED_CHOICE,
+        "shop": SceneType.SHOP,
+        "bad-ending": SceneType.BAD_ENDING,
+    }
+
+
+def test_synthetic_language_check_reads_the_title_menu_buttons(synthetic: Adapter) -> None:
+    check = synthetic.language_check()
+
+    assert synthetic.language.tag == "zh-Hans"
+    assert [(item.screen, item.roi, item.text) for item in check] == [
+        ("title-menu", "menu-start", UI.menu_start),
+        ("title-menu", "menu-shop", UI.menu_shop),
+        ("title-menu", "menu-help", UI.menu_help),
+    ]
+
+
+def test_synthetic_whitelist_covers_the_inputs_the_game_handles(synthetic: Adapter) -> None:
+    whitelist = synthetic.whitelist
+
+    assert set(whitelist.press_keys) == set(SET1.values())
+    assert set(SET1) == set(Key)
+    assert whitelist.click_buttons == (MouseButton.LEFT,)
+    assert whitelist.scroll
+    assert not whitelist.allows_hold
+
+
+# 《魔女审判》
+
+
+def test_witch_trial_required_parts(witch_trial: Adapter) -> None:
+    assert witch_trial.window_rule() == WindowRule(
+        process_name="manosaba.exe", window_class="UnityWndClass", title="manosaba"
+    )
+    assert (witch_trial.resolution.width, witch_trial.resolution.height) == (2560, 1440)
+    assert witch_trial.language.tag == "zh-Hans"
+    assert {screen.id: screen.type for screen in witch_trial.screens} == {
+        "dialogue": "对话",
+        "choice": "选择",
+        "trial": "计时选择",
+        "settings": "设置",
+        "save-load": "存读档",
+        "bad-ending": "坏结局",
+    }
+    assert [note.title for note in witch_trial.notes] == [
+        "角色表",
+        "证据与证词本",
+        "尚未解决的疑点与矛盾",
+    ]
+
+
+def test_witch_trial_compliance(witch_trial: Adapter) -> None:
+    compliance = witch_trial.compliance
+
+    assert compliance.text_source == "screen"
+    assert not compliance.training
+    assert not compliance.demonstrations
+    assert compliance.recording_quota_gb == 50
+    assert compliance.models
+    assert all(c2_allows(entry.vendor, entry.model) for entry in compliance.models)
+
+
+def test_witch_trial_whitelist_has_no_long_press_scroll_or_keys(witch_trial: Adapter) -> None:
+    whitelist = witch_trial.whitelist
+
+    assert whitelist.click_buttons == (MouseButton.LEFT,)
+    assert whitelist.press_keys == ()
+    assert not whitelist.scroll
+    assert not whitelist.allows_hold
+    assert whitelist.max_hold is None
+
+
+def test_witch_trial_calibration_is_pending_without_guessed_coordinates(
+    witch_trial: Adapter,
+) -> None:
+    assert witch_trial.roi("client") == NormalizedRect(0.0, 0.0, 1.0, 1.0)
+    assert {name for name, roi in witch_trial.rois.items() if roi.rect is not None} == {"client"}
+    assert witch_trial.uncalibrated() == (
+        "ROI speaker（名字栏）",
+        "ROI dialogue（对白框）",
+        "ROI choices（选项）",
+        "ROI trial-statement（审判发言区）",
+        "签名 dialogue",
+        "签名 choice",
+        "签名 trial",
+        "签名 bad-ending",
+        "语言核对的固定文字",
+        "阅读节奏",
+    )
+    with pytest.raises(NotCalibratedError):
+        witch_trial.roi("dialogue")
+    with pytest.raises(NotCalibratedError):
+        witch_trial.language_check()
+    with pytest.raises(NotCalibratedError):
+        witch_trial.require_pacing()

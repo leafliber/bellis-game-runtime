@@ -1,0 +1,127 @@
+# 合成游戏的适配包，声明格式的第一个样例。
+# 格式见 docs/modules/game-adapter.md 的“格式”，合成游戏见 docs/modules/offline-tools.md 的“合成游戏”。
+
+id = "synthetic-game"
+name = "合成游戏"
+version = "0.1.0"
+
+[window]
+# 窗口外壳：拥有窗口的进程是 uv 管理的 python.exe；Win32 窗口类由 Tk 固定为 TkTopLevel，
+# 所有 Tk 程序都相同，须与标题一起用。
+process_name = "python.exe"
+window_class = "TkTopLevel"
+title = "Bellis Synthetic Game"
+
+[resolution]
+# GameConfig 的缺省分辨率。
+width = 1280
+height = 720
+
+[language]
+tag = "zh-Hans"
+
+# 标题菜单三个按钮的文字（story.py 的 Ui）。
+[[language.fixed_texts]]
+screen = "title-menu"
+roi = "menu-start"
+text = "开始"
+
+[[language.fixed_texts]]
+screen = "title-menu"
+roi = "menu-shop"
+text = "商店"
+
+[[language.fixed_texts]]
+screen = "title-menu"
+roi = "menu-help"
+text = "说明"
+
+[compliance]
+basis = "合成游戏是本仓库的测试夹具，不受任何游戏条款约束（GR-30）"
+text_source = "screen"
+training = true
+demonstrations = true
+recording_quota_gb = 10
+models = [
+    { vendor = "volcengine-ark", model = "glm-5-3-flash-260828" },
+]
+
+[whitelist]
+# 合成游戏只响应左键点击、滚动与下列按键（docs/modules/offline-tools.md 的“输入与真值”）。
+click_buttons = ["left"]
+# 回车、空格、Esc、上、下；上下是扩展键。
+press_keys = [0x1C, 0x39, 0x01, 0xE048, 0xE050]
+scroll = true
+click_regions = ["client"]
+press_duration = 0.05
+max_rate = 10
+hold_keys = []
+hold_buttons = []
+
+# 画面类型映射即 docs/modules/offline-tools.md “画面与转换”表的第二列；弹窗是叠加层，不是画面。
+
+[[screens]]
+id = "title-menu"
+title = "标题菜单"
+type = "菜单"
+
+[[screens]]
+id = "dialogue"
+title = "对话"
+type = "对话"
+
+[[screens]]
+id = "choice"
+title = "选项"
+type = "选择"
+
+[[screens]]
+id = "timed-choice"
+title = "计时选择"
+type = "计时选择"
+
+[[screens]]
+id = "shop"
+title = "商店"
+type = "商店"
+
+[[screens]]
+id = "bad-ending"
+title = "坏结局"
+type = "坏结局"
+
+[risk]
+
+# ROI 是 tools/synthetic-game/src/synthetic_game/layout.py 在设计稿 1280×720 下的矩形除以 1280×720，
+# 由 runtime/tests/adapter/test_packages.py 核对。
+[rois]
+client = { title = "整个客户区", rect = [0.0, 0.0, 1.0, 1.0] }
+speaker = { title = "名字栏", rect = [0.046875, 0.590278, 0.21875, 0.659722] }
+dialogue = { title = "对白文字", rect = [0.0625, 0.694444, 0.9375, 0.930556] }
+continue-marker = { title = "继续标记", rect = [0.9296875, 0.902778, 0.9484375, 0.933333] }
+choice-prompt = { title = "选项提问", rect = [0.109375, 0.097222, 0.890625, 0.236111] }
+choices = { title = "选项按钮", rect = [0.28125, 0.319444, 0.71875, 0.686111] }
+timer-bar = { title = "计时条", rect = [0.1875, 0.819444, 0.8125, 0.852778] }
+menu-start = { title = "菜单的“开始”", rect = [0.359375, 0.416667, 0.640625, 0.505556] }
+menu-shop = { title = "菜单的“商店”", rect = [0.359375, 0.538889, 0.640625, 0.627778] }
+menu-help = { title = "菜单的“说明”", rect = [0.359375, 0.661111, 0.640625, 0.75] }
+shop-list = { title = "商店列表", rect = [0.0625, 0.180556, 0.921875, 0.819444] }
+shop-leave = { title = "商店的“离开”", rect = [0.78125, 0.854167, 0.9375, 0.951389] }
+popup-text = { title = "弹窗文字", rect = [0.296875, 0.347222, 0.703125, 0.541667] }
+popup-ok = { title = "弹窗的“确定”", rect = [0.421875, 0.569444, 0.578125, 0.652778] }
+ending-text = { title = "坏结局文字", rect = [0.15625, 0.402778, 0.84375, 0.597222] }
+ending-retry = { title = "坏结局的“重来”", rect = [0.421875, 0.666667, 0.578125, 0.763889] }
+
+[pacing]
+min_action_interval = 0.2
+read_base = 0.5
+read_per_char = 0.02
+voice_unknown_wait = 2.0
+
+[[notes]]
+id = "characters"
+title = "人物"
+
+[[notes]]
+id = "clues"
+title = "线索"
