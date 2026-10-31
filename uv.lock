@@ -9,6 +9,7 @@ members = [
     "bellis-game-runtime-fetch-models",
     "bellis-game-runtime-gs03-probe",
     "bellis-game-runtime-gs04-ocr",
+    "bellis-game-runtime-gs06-eval",
     "core-protocol",
     "synthetic-game",
 ]
@@ -130,6 +131,21 @@ requires-dist = [
     { name = "winrt-windows-storage-streams", marker = "sys_platform == 'win32' and extra == 'windows-ocr'", specifier = ">=4!10.0.28000.2705" },
 ]
 provides-extras = ["windows-ocr"]
+
+[[package]]
+name = "bellis-game-runtime-gs06-eval"
+version = "0.0.0"
+source = { editable = "tools/gs06-eval" }
+dependencies = [
+    { name = "bellis-game-runtime" },
+    { name = "numpy" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "bellis-game-runtime", editable = "runtime" },
+    { name = "numpy", specifier = ">=2.5.4" },
+]
 
 [[package]]
 name = "black"

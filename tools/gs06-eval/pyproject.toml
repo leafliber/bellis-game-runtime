@@ -1,0 +1,24 @@
+# GS-06 配音检测的离线评测（`docs/modules/perception.md` 的“GS-06 的评测”）。
+# 只用于探针，不进运行时；提供 `uv run gs06`。
+[project]
+name = "bellis-game-runtime-gs06-eval"
+version = "0.0.0"
+description = "GS-06 配音检测的离线评测：WAV 输入、能量真值、离线混合、判定延迟与误判率，以及 SAPI 自测样本"
+requires-python = "==3.12.*"
+dependencies = [
+    "bellis-game-runtime",
+    "numpy>=2.5.4",
+]
+
+[project.scripts]
+gs06 = "gs06_eval.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "gs06_eval"
+
+[tool.uv.sources]
+bellis-game-runtime = { workspace = true }
