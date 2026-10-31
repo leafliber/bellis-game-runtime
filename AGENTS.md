@@ -16,6 +16,8 @@
 | 在本机 Docker 的 Linux 容器里跑同一检查 | `uv run check --linux` |
 | 只跑 Python 测试 | `uv run pytest` |
 | 只跑 Rust 测试 | `cargo test --workspace` |
+| 校验 `games/` 下的全部适配包，列出尚未标定的项；给出目录时只校验这几个 | `uv run check-adapters`；`uv run check-adapters games/<id>` |
+| 只跑适配包格式、两个适配包与 `game-adapter@1` 的测试 | `uv run pytest runtime/tests/adapter` |
 | 只跑实时核的启动、生命线、心跳、采集主循环与动作块测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link` |
 | 只跑动作块、假输入后端与失效释放的联调测试，并打印假后端上的释放时延 | `uv run pytest runtime/tests/core_link/test_actions.py -s` |
 | 格式化 | `uv run ruff format`；`cargo fmt --all` |
