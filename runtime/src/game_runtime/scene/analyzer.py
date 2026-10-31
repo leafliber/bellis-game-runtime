@@ -1,0 +1,72 @@
+"""一帧的判别：变化与稳定加画面签名，得出 `SceneState`。
+
+输出见 `docs/modules/perception.md` 的“输出”。结果只取决于依次处理的帧与当时 OCR 是否可用，
+时刻取帧的采集时刻，不读墙钟；实时运行与回放按同样的顺序处理同样的帧即得到同样的结果。
+"""
+
+from dataclasses import dataclass
+
+from game_runtime.frame_ring import RingFrame
+from game_runtime.frames import check_frame
+from game_runtime.scene.change import ChangeDetector, ChangeParams, Stability, bgra_view
+from game_runtime.scene.signatures import (
+    SignatureJudge,
+    SignatureResult,
+    TextReader,
+    Verdict,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SceneState:
+    """一帧的判别结果。"""
+
+    frame_number: int
+    capture_ns: int
+    transform_version: int
+    width: int
+    height: int
+    stability: Stability
+    stable_ns: int
+    """稳定时长，纳秒。"""
+    changed_fraction: float
+    """与上一处理帧相比变化的格子比例。"""
+    verdict: Verdict
+    screen: str | None
+    """`verdict` 为 `SCREEN` 时的画面 `id`。"""
+    matched: tuple[str, ...]
+    """最高档中命中的签名 `id`（画面与歧义时）。"""
+    signatures: tuple[SignatureResult, ...]
+    """每个参与判别的签名的结果；停用时为空。"""
+    detail: str | None
+    """停用时的分辨率、不可判时是哪些签名、歧义时是哪些画面。"""
+
+
+class SceneAnalyzer:
+    """逐帧判别。不是线程安全的：同一时刻只在一个工作线程里调用 `analyze`。"""
+
+    def __init__(self, judge: SignatureJudge, params: ChangeParams | None = None) -> None:
+        self.judge = judge
+        self._change = ChangeDetector(params)
+
+    def analyze(self, frame: RingFrame, reader: TextReader | None) -> SceneState:
+        """判别一帧；`reader` 为 None 即 OCR 不可用。"""
+        check_frame(frame)
+        bgra = bgra_view(frame)
+        change = self._change.update(bgra, frame.capture_ns)
+        judgement = self.judge.judge(frame, bgra, reader)
+        return SceneState(
+            frame_number=frame.frame_number,
+            capture_ns=frame.capture_ns,
+            transform_version=frame.transform_version,
+            width=frame.width,
+            height=frame.height,
+            stability=change.stability,
+            stable_ns=change.stable_ns,
+            changed_fraction=change.changed_fraction,
+            verdict=judgement.verdict,
+            screen=judgement.screen,
+            matched=judgement.matched,
+            signatures=judgement.signatures,
+            detail=judgement.detail,
+        )

@@ -13,6 +13,7 @@ from game_runtime.kernel.kernel import Kernel, KernelOptions
 from game_runtime.kernel.manifest import Manifest, NoConfig, Tier
 from game_runtime.kernel.plugin import (
     AUDIO_READ,
+    FRAMES_READ,
     Catalog,
     Disposer,
     Plugin,
@@ -33,6 +34,7 @@ from game_runtime.kernel.status import EntryStatus, Reason, ReasonCode, State, T
 __all__ = [
     "AUDIO_READ",
     "CONTROL_SUBMIT",
+    "FRAMES_READ",
     "Catalog",
     "Clock",
     "ControlGrant",

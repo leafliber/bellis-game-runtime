@@ -200,8 +200,8 @@ class Renderer:
         layout = self._layout
         self._background(draw, DIALOGUE_BACKGROUNDS.get(view.node, DIALOGUE_BACKGROUND))
         # 一座简化的钟楼剪影，让不同节点的画面不只是底色不同。
-        draw.rectangle(_box(layout.rect(560, 60, 720, 420)), fill=PANEL)
-        draw.ellipse(_box(layout.rect(590, 100, 690, 200)), fill=WHITE)
+        draw.rectangle(_box(layout.clock_tower()), fill=PANEL)
+        draw.ellipse(_box(layout.clock_face()), fill=WHITE)
         draw.rectangle(_box(layout.dialogue_box()), fill=PANEL, outline=MUTED)
         speaker = layout.speaker_box()
         draw.rectangle(_box(speaker), fill=BUTTON)

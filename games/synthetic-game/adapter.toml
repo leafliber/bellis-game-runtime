@@ -96,6 +96,7 @@ type = "坏结局"
 # 由 runtime/tests/adapter/test_packages.py 核对。
 [rois]
 client = { title = "整个客户区", rect = [0.0, 0.0, 1.0, 1.0] }
+clock-tower = { title = "对话背景的钟楼", rect = [0.4375, 0.083333, 0.5625, 0.583333] }
 speaker = { title = "名字栏", rect = [0.046875, 0.590278, 0.21875, 0.659722] }
 dialogue = { title = "对白文字", rect = [0.0625, 0.694444, 0.9375, 0.930556] }
 continue-marker = { title = "继续标记", rect = [0.9296875, 0.902778, 0.9484375, 0.933333] }
@@ -111,6 +112,70 @@ popup-text = { title = "弹窗文字", rect = [0.296875, 0.347222, 0.703125, 0.5
 popup-ok = { title = "弹窗的“确定”", rect = [0.421875, 0.569444, 0.578125, 0.652778] }
 ending-text = { title = "坏结局文字", rect = [0.15625, 0.402778, 0.84375, 0.597222] }
 ending-retry = { title = "坏结局的“重来”", rect = [0.421875, 0.666667, 0.578125, 0.763889] }
+
+# 画面签名。颜色取自 tools/synthetic-game/src/synthetic_game/render.py，点取在各画面固定不变的区域里
+# （设计稿 1280×720 的坐标除以 1280×720）；判别规则见 docs/modules/perception.md 的“画面签名的判别”。
+# 弹窗不是画面：弹窗压暗了整个画面，显示时不命中任何签名。
+
+[[signatures]]
+id = "title-menu"
+screen = "title-menu"
+pixels = [
+    { at = [0.03125, 0.055556], color = "#1A2440", tolerance = 6 }, # 左上角的底色
+    { at = [0.96875, 0.944444], color = "#1A2440", tolerance = 6 }, # 右下角的底色
+]
+texts = [{ roi = "menu-start", text = "开始" }]
+
+[[signatures]]
+# 对话的底色随剧情节点变化，改看钟楼：钟面的中心、钟楼的下部与对白框的左侧。
+id = "dialogue"
+screen = "dialogue"
+pixels = [
+    { at = [0.5, 0.208333], color = "#F5F5F0", tolerance = 6 },
+    { at = [0.453125, 0.416667], color = "#181A26", tolerance = 6 },
+    { at = [0.046875, 0.833333], color = "#181A26", tolerance = 6 },
+]
+# 钟面模板由 synthetic_game.anchors 从渲染裁出，不进版本库。
+anchors = [
+    { roi = "clock-tower", template_sha256 = "4d02eb5968a54d373230cdfe53774c5c56c82430866f6dcc7c4d53d1918f8b69", min_score = 0.9 },
+]
+
+[[signatures]]
+id = "choice"
+screen = "choice"
+pixels = [
+    { at = [0.03125, 0.055556], color = "#222838", tolerance = 6 }, # 底色
+    { at = [0.1171875, 0.111111], color = "#181A26", tolerance = 6 }, # 提问面板的左上部
+]
+
+[[signatures]]
+# 计时选择是选项加上计时条：比选项多一处计时条上的点，叠加优先级更高。计时条已走与未走的部分
+# （#DC5A3C 与 #464650）都在容差内，选项画面上这里的底色不在。
+id = "timed-choice"
+screen = "timed-choice"
+priority = 1
+pixels = [
+    { at = [0.03125, 0.055556], color = "#222838", tolerance = 6 },
+    { at = [0.1171875, 0.111111], color = "#181A26", tolerance = 6 },
+    { at = [0.5, 0.836111], color = "#915046", tolerance = 75 },
+]
+
+[[signatures]]
+id = "shop"
+screen = "shop"
+pixels = [
+    { at = [0.03125, 0.055556], color = "#283830", tolerance = 6 },
+    { at = [0.03125, 0.972222], color = "#283830", tolerance = 6 },
+]
+
+[[signatures]]
+id = "bad-ending"
+screen = "bad-ending"
+pixels = [
+    { at = [0.03125, 0.055556], color = "#480E12", tolerance = 6 },
+    { at = [0.96875, 0.944444], color = "#480E12", tolerance = 6 },
+]
+texts = [{ roi = "ending-retry", text = "重来" }]
 
 [pacing]
 min_action_interval = 0.2

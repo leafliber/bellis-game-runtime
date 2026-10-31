@@ -13,8 +13,10 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from core_protocol import models
+from game_runtime.frames import MemoryFrameSource
 from game_runtime.kernel import (
     CONTROL_SUBMIT,
+    FRAMES_READ,
     ControlGrant,
     ControlRevokedError,
     Kernel,
@@ -268,6 +270,7 @@ class Harness:
         *plugins: type[Plugin[Any]],
         auto_release: bool = True,
         options: KernelOptions | None = None,
+        frames: MemoryFrameSource | None = None,
     ) -> None:
         self.log = log
         self.clock = ManualClock()
@@ -281,6 +284,7 @@ class Harness:
             clock=self.clock,
             options=options,
             on_transition=self._record,
+            frames=frames,
         )
 
     def _record(self, transition: Transition) -> None:
@@ -394,6 +398,77 @@ async def test_plugin_only_reaches_declared_services() -> None:
 
 
 @run
+async def test_optional_dependency_does_not_block_and_is_probed_when_used() -> None:
+    log: list[str] = []
+    contexts: list[PluginContext[Any]] = []
+
+    async def on_activate(ctx: PluginContext[Any]) -> None:
+        contexts.append(ctx)
+        log.append(f"激活 {ctx.entry_id}：拿到{ctx.optional(GAME)}")
+        ctx.register(lambda: log.append(f"撤销 {ctx.entry_id}"))
+
+    prober = make_plugin("prober", inject=[f"{GAME.ref}?"], on_activate=on_activate)
+    h = Harness(log, adapter(log), prober)
+    h.kernel.add([entry("prober"), entry("adapter", disabled=True)])
+    await h.kernel.settled()
+
+    # 可选依赖不在也照常激活，探测得到 None。
+    assert h.state("prober") is State.ACTIVE
+    assert h.kernel.status("prober").reasons == ()
+    assert log == ["激活 prober：拿到None"]
+    [ctx] = contexts
+
+    await h.kernel.enable("adapter")
+    assert ctx.optional(GAME) == "窗口识别"
+    # 提供方停用时依赖方不随之停用，下次探测得到 None。
+    await h.kernel.disable("adapter")
+    assert h.state("prober") is State.ACTIVE
+    assert ctx.optional(GAME) is None
+    assert log == ["激活 prober：拿到None", "激活 adapter", "撤销 adapter"]
+
+    with pytest.raises(LookupError, match="game-adapter@1 是 prober 的可选依赖，用 optional 探测"):
+        ctx.service(GAME)
+    with pytest.raises(LookupError, match="prober 没有声明可选依赖 other@1"):
+        ctx.optional(ServiceToken[str]("other", 1))
+
+
+@run
+async def test_optional_dependency_with_another_major_is_absent() -> None:
+    found: list[object] = []
+
+    async def on_activate(ctx: PluginContext[Any]) -> None:
+        found.append(ctx.optional(GAME))
+
+    log: list[str] = []
+    prober = make_plugin("prober", inject=[f"{GAME.ref}?"], on_activate=on_activate)
+    h = Harness(log, adapter(log, major=2), prober)
+    h.kernel.add([entry("adapter"), entry("prober")])
+    await h.kernel.settled()
+
+    assert h.state("prober") is State.ACTIVE
+    assert found == [None]
+
+
+@run
+async def test_required_service_cannot_be_probed_as_optional() -> None:
+    errors: list[str] = []
+
+    async def on_activate(ctx: PluginContext[Any]) -> None:
+        try:
+            ctx.optional(GAME)
+        except LookupError as error:
+            errors.append(str(error))
+
+    log: list[str] = []
+    strict = make_plugin("strict", inject=[GAME.ref], on_activate=on_activate)
+    h = Harness(log, adapter(log), strict)
+    h.kernel.add([entry("adapter"), entry("strict")])
+    await h.kernel.settled()
+
+    assert errors == ["strict 没有声明可选依赖 game-adapter@1"]
+
+
+@run
 async def test_missing_declared_service_fails_activation() -> None:
     liar = make_plugin("liar", provides=[GAME.ref])
     h = Harness([], liar, options=KernelOptions(retry_delays=()))
@@ -429,6 +504,33 @@ async def test_ungranted_permission_keeps_plugin_waiting() -> None:
     assert log == ["激活 ocr-b"]
     # 插件只看到自己申请且已授予的权限。
     assert seen == [frozenset({"frames.read"})]
+
+
+@run
+async def test_frames_go_only_to_plugins_that_ask_for_them() -> None:
+    seen: dict[str, object] = {}
+
+    async def on_activate(ctx: PluginContext[Any]) -> None:
+        try:
+            seen[ctx.entry_id] = ctx.frames
+        except (PermissionError, LookupError) as error:
+            seen[ctx.entry_id] = f"{type(error).__name__}：{error}"
+
+    reader = make_plugin("reader", permissions=[FRAMES_READ], on_activate=on_activate)
+    other = make_plugin("other", on_activate=on_activate)
+    frames = MemoryFrameSource()
+    h = Harness([], reader, other, frames=frames)
+    h.kernel.add([entry("reader", grant=[FRAMES_READ]), entry("other", grant=[FRAMES_READ])])
+    await h.kernel.settled()
+
+    assert seen == {"reader": frames, "other": "PermissionError：other 没有申请权限 frames.read"}
+
+    # 宿主没有给出帧源。
+    seen.clear()
+    bare = Harness([], reader)
+    bare.kernel.add([entry("reader", grant=[FRAMES_READ])])
+    await bare.kernel.settled()
+    assert seen == {"reader": "LookupError：宿主没有给出帧源"}
 
 
 @run
@@ -503,6 +605,11 @@ def test_manifest_rules() -> None:
         return Manifest.model_validate({"id": "p", "version": "1", "tier": "ordinary", **fields})
 
     assert manifest(provides=["a@1"], inject=["b.c@2"]).inject == ("b.c@2",)
+    optional = manifest(inject=["b@1", "c@2?"])
+    assert optional.required == (("b", 1),)
+    assert optional.optional == (("c", 2),)
+    with pytest.raises(ValidationError, match="inject 中服务名重复：b"):
+        manifest(inject=["b@1", "b@2?"])
     with pytest.raises(ValidationError, match="必须是关键平面"):
         manifest(permissions=[CONTROL_SUBMIT])
     assert manifest(tier="critical", permissions=[CONTROL_SUBMIT]).is_control_producer
@@ -511,6 +618,8 @@ def test_manifest_rules() -> None:
     with pytest.raises(ValidationError, match="inject 中服务名重复：b"):
         manifest(inject=["b@1", "b@1"])
     for bad in (
+        {"provides": ["a@1?"]},
+        {"inject": ["a@1??"]},
         {"inject": ["a"]},
         {"inject": ["A@1"]},
         {"permissions": ["a b"]},

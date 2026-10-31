@@ -1,4 +1,4 @@
-"""插件与插件拿到的收窄上下文：取得依赖、提供服务、注册副作用。"""
+"""插件与插件拿到的收窄上下文：取得依赖、提供服务、注册副作用、读音频与取帧。"""
 
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
@@ -7,6 +7,7 @@ from typing import Any, ClassVar, cast
 from pydantic import BaseModel
 
 from game_runtime.audio_ring import AudioReader
+from game_runtime.frames import FrameSource
 from game_runtime.kernel.control import ControlGrant
 from game_runtime.kernel.manifest import Manifest, parse_ref
 from game_runtime.kernel.service import ServiceRegistry, ServiceToken
@@ -16,6 +17,9 @@ type Disposer = Callable[[], Awaitable[None] | None]
 
 AUDIO_READ = "audio.read"
 """读音频环的权限：插件经 `PluginContext.audio` 读。"""
+
+FRAMES_READ = "frames.read"
+"""读帧的权限：插件经 `PluginContext.frames` 取帧。"""
 
 
 class Registrations:
@@ -52,6 +56,7 @@ class PluginContext[C: BaseModel]:
         registry: ServiceRegistry,
         registrations: Registrations,
         audio: AudioReader | None = None,
+        frames: FrameSource | None = None,
     ) -> None:
         self.entry_id = entry_id
         """profile 条目 id。"""
@@ -63,11 +68,13 @@ class PluginContext[C: BaseModel]:
         """已授予的权限：激活时清单申请的权限都已授予。"""
         self.control = control
         """控制产出者的提交资格；不是控制产出者时为 None。"""
-        self._inject = frozenset(parse_ref(ref) for ref in manifest.inject)
+        self._inject = frozenset(manifest.required)
+        self._optional = frozenset(manifest.optional)
         self._provides = frozenset(parse_ref(ref) for ref in manifest.provides)
         self._registry = registry
         self._registrations = registrations
         self._audio = audio
+        self._frames = frames
 
     @property
     def audio(self) -> AudioReader:
@@ -82,12 +89,38 @@ class PluginContext[C: BaseModel]:
             raise LookupError("宿主没有给出音频")
         return self._audio
 
-    def service[T](self, token: ServiceToken[T]) -> T:
-        """取得清单 `inject` 中声明的服务。"""
+    @property
+    def frames(self) -> FrameSource:
+        """帧源（`next_frame`），见 `docs/modules/perception.md` 的“取帧”。
+
+        清单没有申请 `frames.read` 时抛 `PermissionError`；宿主没有给出帧源时抛 `LookupError`。
+        """
         self._alive()
-        if (token.name, token.major) not in self._inject:
+        if FRAMES_READ not in self.permissions:
+            raise PermissionError(f"{self.entry_id} 没有申请权限 {FRAMES_READ}")
+        if self._frames is None:
+            raise LookupError("宿主没有给出帧源")
+        return self._frames
+
+    def service[T](self, token: ServiceToken[T]) -> T:
+        """取得清单 `inject` 中声明的必需服务。"""
+        self._alive()
+        key = (token.name, token.major)
+        if key in self._optional:
+            raise LookupError(f"{token.ref} 是 {self.entry_id} 的可选依赖，用 optional 探测")
+        if key not in self._inject:
             raise LookupError(f"{self.entry_id} 没有声明依赖 {token.ref}")
         return cast(T, self._registry.get(token.name, token.major))
+
+    def optional[T](self, token: ServiceToken[T]) -> T | None:
+        """探测清单 `inject` 中声明为可选的服务：此刻可用即返回实现，否则为 None。
+
+        每次用到时探测，不要留住返回的实现：提供方停用时依赖方不随之停用。
+        """
+        self._alive()
+        if (token.name, token.major) not in self._optional:
+            raise LookupError(f"{self.entry_id} 没有声明可选依赖 {token.ref}")
+        return cast(T | None, self._registry.find(token.name, token.major))
 
     def provide[T](self, token: ServiceToken[T], impl: T) -> None:
         """提供清单 `provides` 中声明的服务；只能在激活期间调用，激活成功后才发布。"""
