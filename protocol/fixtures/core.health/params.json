@@ -10,5 +10,10 @@
     "frame_number": 1200,
     "capture_ns": 5683000000
   },
-  "lease": "valid"
+  "lease": "valid",
+  "audio": "capturing",
+  "latest_audio": {
+    "block_number": 570,
+    "capture_ns": 5688000000
+  }
 }

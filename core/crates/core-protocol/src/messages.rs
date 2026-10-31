@@ -94,6 +94,71 @@ pub struct FakeTarget {
     pub surface: FrameRingAttachParams,
 }
 
+// ---------------------------------------------------------------- 音频环挂接与音频目标
+
+/// `audio_ring.attach` 的 params：主进程创建的音频环的共享内存名与布局参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AudioRingAttachParams {
+    /// 共享内存名。
+    pub name: String,
+    /// 共享内存的总字节数。
+    pub size_bytes: u64,
+    /// 音频环的布局版本。
+    pub layout_version: u32,
+    /// 块槽数。
+    pub block_count: u32,
+    /// 相邻两块槽起点之间的字节数。
+    pub block_stride: u64,
+    /// 一块最多的采样点数。
+    pub block_capacity: u32,
+    /// 采样率（Hz）。
+    pub sample_rate: u32,
+    /// 声道数。
+    pub channels: u32,
+    /// 样本格式。
+    pub sample_format: u32,
+}
+
+/// `audio.set_target` 的 params。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AudioSetTargetParams {
+    /// 音频目标。
+    pub target: AudioTarget,
+}
+
+/// 音频目标：按窗口识别规则认定的游戏进程，或测试用的假音频源。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AudioTarget {
+    Window(AudioWindowTarget),
+    Fake(FakeAudioTarget),
+}
+
+/// 采这个窗口所属进程及其子进程的声音。识别规则与 `capture.set_target` 的 `window` 相同。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "AudioWindowTarget")]
+pub struct AudioWindowTarget {
+    /// 进程的可执行文件名，不区分大小写。
+    pub process_name: String,
+    /// 窗口类名，全等匹配；`null` 表示不按窗口类匹配。
+    pub window_class: Option<String>,
+    /// 窗口标题，全等匹配；`null` 表示不按标题匹配。
+    pub title: Option<String>,
+}
+
+/// 假音频源，只用于自动测试：从测试一侧创建并写入的假音频输出取声音。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeAudioTarget")]
+pub struct FakeAudioTarget {
+    /// 假音频输出的共享内存名与布局参数。假音频输出与音频环同一布局，参数的含义与核对同
+    /// `audio_ring.attach`。
+    pub output: AudioRingAttachParams,
+}
+
 // ---------------------------------------------------------------- 控制产出者
 
 /// 控制产出者的身份与代次。
@@ -433,6 +498,20 @@ pub struct CoreHealthParams {
     pub latest_frame: Option<LatestFrame>,
     /// 输入许可的状态。
     pub lease: LeaseStatus,
+    /// 音频的采集状态。
+    pub audio: CaptureState,
+    /// 本实例最近写进音频环的一块；本实例还没写过块时为 `null`。
+    pub latest_audio: Option<LatestAudio>,
+}
+
+/// 实时核最近写进音频环的一块。只用于诊断与测试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LatestAudio {
+    /// 音频环中的块号。
+    pub block_number: u64,
+    /// 这一块第一个采样点的采集时刻，与帧环的采集时刻同一时钟。
+    pub capture_ns: u64,
 }
 
 /// 实时核最近写进帧环的一帧，是判断帧龄的依据。
@@ -461,15 +540,15 @@ pub enum LeaseStatus {
     SourceLost,
 }
 
-/// 采集状态。
+/// 采集状态，画面与声音各报一个。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureState {
-    /// 还没有挂接帧环或设定采集目标。
+    /// 还没有挂接环（帧环或音频环）或设定目标。
     Idle,
-    /// 没有采集源：找不到目标窗口或采集源失效，正在定期重新识别；没有帧。
+    /// 没有采集源或音频源：找不到目标窗口、目标进程已退出或源已失效，正在定期重新识别；没有新的帧或声音。
     Searching,
-    /// 有采集源，帧写入帧环；窗口最小化等可恢复的情形下暂时没有新帧。
+    /// 有采集源或音频源，写入环中；画面在窗口最小化等可恢复的情形下暂时没有新帧。
     Capturing,
 }
 

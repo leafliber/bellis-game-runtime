@@ -1,6 +1,6 @@
 """帧环的二进制布局，见 `docs/modules/core-protocol.md` 的“帧环与音频环”。
 
-布局的源是 Rust 的 `core_protocol::frame_ring`；这里是手写的镜像，由 `tests/test_frame_ring.py`
+布局的源是 Rust 的 `core_protocol::frame_ring`；这里是手写的镜像，由 `tests/test_ring_layouts.py`
 与 Rust 导出的 `protocol/frame-ring-layout.json` 逐字段核对。整数按本机字节序。
 """
 

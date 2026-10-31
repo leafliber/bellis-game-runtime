@@ -23,6 +23,12 @@ FRAME_RING_ATTACH: Final = Request(
 CAPTURE_SET_TARGET: Final = Request(
     "capture.set_target", Direction.MAIN_TO_CORE, models.CaptureSetTargetParams, models.Empty
 )
+AUDIO_RING_ATTACH: Final = Request(
+    "audio_ring.attach", Direction.MAIN_TO_CORE, models.AudioRingAttachParams, models.Empty
+)
+AUDIO_SET_TARGET: Final = Request(
+    "audio.set_target", Direction.MAIN_TO_CORE, models.AudioSetTargetParams, models.Empty
+)
 PRODUCER_HEARTBEAT: Final = Notification(
     "producer.heartbeat", Direction.MAIN_TO_CORE, models.ProducerHeartbeatParams
 )
@@ -45,6 +51,8 @@ METHODS: Final[Mapping[str, Method]] = {
     CORE_HELLO.name: CORE_HELLO,
     FRAME_RING_ATTACH.name: FRAME_RING_ATTACH,
     CAPTURE_SET_TARGET.name: CAPTURE_SET_TARGET,
+    AUDIO_RING_ATTACH.name: AUDIO_RING_ATTACH,
+    AUDIO_SET_TARGET.name: AUDIO_SET_TARGET,
     PRODUCER_HEARTBEAT.name: PRODUCER_HEARTBEAT,
     ACTION_SUBMIT.name: ACTION_SUBMIT,
     PRODUCER_REVOKE.name: PRODUCER_REVOKE,
@@ -80,3 +88,4 @@ class ErrorCode(IntEnum):
     FRAME_RING_MISMATCH = -32002
     CAPTURE_UNSUPPORTED = -32003
     LEASE_REFUSED = -32004
+    AUDIO_RING_MISMATCH = -32005

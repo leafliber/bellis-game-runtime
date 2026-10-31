@@ -11,10 +11,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::messages::{
-    ActionBlock, ActionReceiptParams, ActionSubmitResult, CaptureSetTargetParams, CoreHealthParams,
-    CoreHelloParams, CoreHelloResult, Empty, FakeInputEventParams, FakeLeaseGrantParams,
-    FakeLeaseRevokeParams, FrameRingAttachParams, InputReleasedParams, ProducerHeartbeatParams,
-    ProducerRevokeParams,
+    ActionBlock, ActionReceiptParams, ActionSubmitResult, AudioRingAttachParams,
+    AudioSetTargetParams, CaptureSetTargetParams, CoreHealthParams, CoreHelloParams,
+    CoreHelloResult, Empty, FakeInputEventParams, FakeLeaseGrantParams, FakeLeaseRevokeParams,
+    FrameRingAttachParams, InputReleasedParams, ProducerHeartbeatParams, ProducerRevokeParams,
 };
 
 /// 消息的发送方。
@@ -130,6 +130,10 @@ methods! {
     FrameRingAttach = "frame_ring.attach", MainToCore, FrameRingAttachParams => Empty;
     /// 设定采集目标。
     CaptureSetTarget = "capture.set_target", MainToCore, CaptureSetTargetParams => Empty;
+    /// 音频环挂接：告诉实时核主进程创建的音频环。
+    AudioRingAttach = "audio_ring.attach", MainToCore, AudioRingAttachParams => Empty;
+    /// 设定音频目标。
+    AudioSetTarget = "audio.set_target", MainToCore, AudioSetTargetParams => Empty;
     /// 控制产出者心跳。
     ProducerHeartbeat = "producer.heartbeat", MainToCore, ProducerHeartbeatParams;
     /// 提交动作块。
@@ -163,16 +167,19 @@ pub mod error_code {
     pub const PROTOCOL_VERSION_MISMATCH: i32 = -32001;
     /// `frame_ring.attach` 打不开共享内存，或帧环头部与参数不符；`capture.set_target` 的假显示面同样。
     pub const FRAME_RING_MISMATCH: i32 = -32002;
-    /// `capture.set_target` 的目标在这个平台或系统上不支持。
+    /// `capture.set_target` 或 `audio.set_target` 的目标在这个平台或系统上不支持。
     pub const CAPTURE_UNSUPPORTED: i32 = -32003;
     /// `test_lease.grant` 不被接受：令牌小于当前令牌、已吊销或已过期，或到期时刻已过。只用于测试。
     pub const LEASE_REFUSED: i32 = -32004;
+    /// `audio_ring.attach` 打不开共享内存，或音频环头部与参数不符；`audio.set_target` 的假音频输出同样。
+    pub const AUDIO_RING_MISMATCH: i32 = -32005;
 
     /// 全部自定义错误码及其名字，供导出 Schema。
-    pub const ALL: [(&str, i32); 4] = [
+    pub const ALL: [(&str, i32); 5] = [
         ("protocol_version_mismatch", PROTOCOL_VERSION_MISMATCH),
         ("frame_ring_mismatch", FRAME_RING_MISMATCH),
         ("capture_unsupported", CAPTURE_UNSUPPORTED),
         ("lease_refused", LEASE_REFUSED),
+        ("audio_ring_mismatch", AUDIO_RING_MISMATCH),
     ];
 }

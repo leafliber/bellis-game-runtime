@@ -1,0 +1,16 @@
+{
+  "target": {
+    "type": "fake",
+    "output": {
+      "name": "bellis-game-runtime-fake-audio-example",
+      "size_bytes": 5696,
+      "layout_version": 1,
+      "block_count": 8,
+      "block_stride": 704,
+      "block_capacity": 160,
+      "sample_rate": 16000,
+      "channels": 1,
+      "sample_format": 1
+    }
+  }
+}

@@ -133,6 +133,98 @@ class CaptureTarget(RootModel[WindowTarget | FakeTarget]):
     """
 
 
+class AudioRingAttachParams(BaseModel):
+    """
+    `audio_ring.attach` 的 params：主进程创建的音频环的共享内存名与布局参数。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    name: str
+    """
+    共享内存名。
+    """
+    size_bytes: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    共享内存的总字节数。
+    """
+    layout_version: Annotated[int, Field(ge=0, le=4294967295)]
+    """
+    音频环的布局版本。
+    """
+    block_count: Annotated[int, Field(ge=0, le=4294967295)]
+    """
+    块槽数。
+    """
+    block_stride: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    相邻两块槽起点之间的字节数。
+    """
+    block_capacity: Annotated[int, Field(ge=0, le=4294967295)]
+    """
+    一块最多的采样点数。
+    """
+    sample_rate: Annotated[int, Field(ge=0, le=4294967295)]
+    """
+    采样率（Hz）。
+    """
+    channels: Annotated[int, Field(ge=0, le=4294967295)]
+    """
+    声道数。
+    """
+    sample_format: Annotated[int, Field(ge=0, le=4294967295)]
+    """
+    样本格式。
+    """
+
+
+class AudioWindowTarget(BaseModel):
+    """
+    采这个窗口所属进程及其子进程的声音。识别规则与 `capture.set_target` 的 `window` 相同。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["window"] = "window"
+    process_name: str
+    """
+    进程的可执行文件名，不区分大小写。
+    """
+    window_class: str | None = None
+    """
+    窗口类名，全等匹配；`null` 表示不按窗口类匹配。
+    """
+    title: str | None = None
+    """
+    窗口标题，全等匹配；`null` 表示不按标题匹配。
+    """
+
+
+class FakeAudioTarget(BaseModel):
+    """
+    假音频源，只用于自动测试：从测试一侧创建并写入的假音频输出取声音。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["fake"] = "fake"
+    output: AudioRingAttachParams
+    """
+    假音频输出的共享内存名与布局参数。假音频输出与音频环同一布局，参数的含义与核对同
+    `audio_ring.attach`。
+    """
+
+
+class AudioTarget(RootModel[AudioWindowTarget | FakeAudioTarget]):
+    root: Annotated[AudioWindowTarget | FakeAudioTarget, Field(discriminator="type")]
+    """
+    音频目标：按窗口识别规则认定的游戏进程，或测试用的假音频源。
+    """
+
+
 class Producer(BaseModel):
     """
     控制产出者的身份与代次。
@@ -466,20 +558,20 @@ class ReleaseReason(StrEnum):
 
 class CaptureState(StrEnum):
     """
-    采集状态。
+    采集状态，画面与声音各报一个。
     """
 
     IDLE = "idle"
     """
-    还没有挂接帧环或设定采集目标。
+    还没有挂接环（帧环或音频环）或设定目标。
     """
     SEARCHING = "searching"
     """
-    没有采集源：找不到目标窗口或采集源失效，正在定期重新识别；没有帧。
+    没有采集源或音频源：找不到目标窗口、目标进程已退出或源已失效，正在定期重新识别；没有新的帧或声音。
     """
     CAPTURING = "capturing"
     """
-    有采集源，帧写入帧环；窗口最小化等可恢复的情形下暂时没有新帧。
+    有采集源或音频源，写入环中；画面在窗口最小化等可恢复的情形下暂时没有新帧。
     """
 
 
@@ -525,6 +617,24 @@ class LeaseStatus(StrEnum):
     SOURCE_LOST = "source_lost"
     """
     与许可源的连接已断开。
+    """
+
+
+class LatestAudio(BaseModel):
+    """
+    实时核最近写进音频环的一块。只用于诊断与测试。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    block_number: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    音频环中的块号。
+    """
+    capture_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    这一块第一个采样点的采集时刻，与帧环的采集时刻同一时钟。
     """
 
 
@@ -813,6 +923,20 @@ class CaptureSetTargetParams(BaseModel):
     """
 
 
+class AudioSetTargetParams(BaseModel):
+    """
+    `audio.set_target` 的 params。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    target: AudioTarget
+    """
+    音频目标。
+    """
+
+
 class ProducerHeartbeatParams(BaseModel):
     """
     `producer.heartbeat` 的 params：当前控制产出者的心跳。
@@ -958,6 +1082,14 @@ class CoreHealthParams(BaseModel):
     lease: LeaseStatus
     """
     输入许可的状态。
+    """
+    audio: CaptureState
+    """
+    音频的采集状态。
+    """
+    latest_audio: LatestAudio | None = None
+    """
+    本实例最近写进音频环的一块；本实例还没写过块时为 `null`。
     """
 
 
