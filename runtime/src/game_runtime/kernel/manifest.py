@@ -10,12 +10,16 @@ from game_runtime.kernel.control import CONTROL_SUBMIT
 
 _NAME = r"[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)*"
 _REF = re.compile(rf"({_NAME})@([0-9]+)")
+_INJECT = re.compile(rf"({_NAME})@([0-9]+)(\?)?")
 
 PluginId = Annotated[str, StringConstraints(pattern=rf"^{_NAME}$", max_length=48)]
 """插件与 profile 条目的标识，例如 `ocr-sim`、`step.controller`。"""
 
 ServiceRef = Annotated[str, StringConstraints(pattern=rf"^{_NAME}@[0-9]+$")]
 """服务引用 `名字@主版本`。"""
+
+InjectRef = Annotated[str, StringConstraints(pattern=rf"^{_NAME}@[0-9]+\??$")]
+"""依赖 `名字@主版本`，末尾加 `?` 为可选依赖。"""
 
 Permission = Annotated[
     str,
@@ -33,6 +37,14 @@ def parse_ref(ref: str) -> tuple[str, int]:
     if match is None:
         raise ValueError(f"服务引用不合法：{ref}")
     return match.group(1), int(match.group(2))
+
+
+def parse_inject(ref: str) -> tuple[str, int, bool]:
+    """把依赖 `名字@主版本` 或 `名字@主版本?` 拆成名字、主版本与是否可选。"""
+    match = _INJECT.fullmatch(ref)
+    if match is None:
+        raise ValueError(f"依赖不合法：{ref}")
+    return match.group(1), int(match.group(2)), match.group(3) is not None
 
 
 class Tier(StrEnum):
@@ -59,14 +71,16 @@ class Manifest(BaseModel):
     version: Annotated[str, StringConstraints(min_length=1, max_length=32)]
     tier: Tier
     provides: tuple[ServiceRef, ...] = ()
-    inject: tuple[ServiceRef, ...] = ()
+    inject: tuple[InjectRef, ...] = ()
     permissions: tuple[Permission, ...] = ()
     config: type[BaseModel] = NoConfig
 
     @model_validator(mode="after")
     def _check(self) -> Self:
-        for field, refs in (("provides", self.provides), ("inject", self.inject)):
-            names = [parse_ref(ref)[0] for ref in refs]
+        for field, names in (
+            ("provides", [parse_ref(ref)[0] for ref in self.provides]),
+            ("inject", [parse_inject(ref)[0] for ref in self.inject]),
+        ):
             duplicates = sorted({name for name in names if names.count(name) > 1})
             if duplicates:
                 raise ValueError(f"{field} 中服务名重复：{'、'.join(duplicates)}")
@@ -75,6 +89,19 @@ class Manifest(BaseModel):
         if CONTROL_SUBMIT in self.permissions and self.tier is not Tier.CRITICAL:
             raise ValueError(f"申请 {CONTROL_SUBMIT} 的插件必须是关键平面（critical）")
         return self
+
+    @property
+    def required(self) -> tuple[tuple[str, int], ...]:
+        """必需依赖的（名字，主版本），按声明的顺序。"""
+        return tuple((name, major) for name, major, optional in self._injects() if not optional)
+
+    @property
+    def optional(self) -> tuple[tuple[str, int], ...]:
+        """可选依赖的（名字，主版本），按声明的顺序。"""
+        return tuple((name, major) for name, major, optional in self._injects() if optional)
+
+    def _injects(self) -> list[tuple[str, int, bool]]:
+        return [parse_inject(ref) for ref in self.inject]
 
     @property
     def is_control_producer(self) -> bool:

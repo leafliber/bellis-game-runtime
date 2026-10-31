@@ -17,6 +17,7 @@ from typing import Any
 from pydantic import BaseModel, JsonValue, ValidationError
 
 from game_runtime.audio_ring import AudioReader
+from game_runtime.frames import FrameSource
 from game_runtime.kernel.clock import Clock, MonotonicClock, finished_within, run_with_deadline
 from game_runtime.kernel.control import CONTROL_SUBMIT, ControlGrant, CoreControl
 from game_runtime.kernel.manifest import Manifest, parse_ref
@@ -104,11 +105,16 @@ class Kernel:
         options: KernelOptions | None = None,
         on_transition: Callable[[Transition], None] | None = None,
         audio: AudioReader | None = None,
+        frames: FrameSource | None = None,
     ) -> None:
         """`audio` 是交给申请了 `audio.read` 的插件的读音频接口（`PluginContext.audio`），
-        通常是 `CoreLink.audio_reader`；不给时插件读音频抛 `LookupError`。"""
+        通常是 `CoreLink.audio_reader`；不给时插件读音频抛 `LookupError`。
+
+        `frames` 是交给申请了 `frames.read` 的插件的帧源（`PluginContext.frames`），实时运行时
+        通常是 `RingFrameSource(link.frames)`；不给时插件取帧源抛 `LookupError`。"""
         self._catalog = catalog
         self._core = core
+        self._frames = frames
         self._clock = clock or MonotonicClock()
         self._options = options or KernelOptions()
         self._on_transition = on_transition
@@ -290,8 +296,8 @@ class Kernel:
         """WAITING 的原因：缺少或不兼容的服务、未授予的权限、控制产出者的指定与交接。"""
         manifest = entry.manifest
         reasons: list[Reason] = []
-        for ref in manifest.inject:
-            missing = self._registry.missing(*parse_ref(ref))
+        for name, major in manifest.required:
+            missing = self._registry.missing(name, major)
             if missing is not None:
                 reasons.append(missing)
         for permission in manifest.permissions:
@@ -371,6 +377,7 @@ class Kernel:
             registry=self._registry,
             registrations=registrations,
             audio=self._audio,
+            frames=self._frames,
         )
         self._set(entry, State.LOADING, ())
         try:
@@ -521,7 +528,8 @@ class Kernel:
         for other in reversed(list(self._entries.values())):
             if other is entry or other.instance is None:
                 continue
-            if not any(parse_ref(ref)[0] in names for ref in other.manifest.inject):
+            # 只有必需依赖跟着提供方停用；可选依赖在用到时探测。
+            if not any(name in names for name, _ in other.manifest.required):
                 continue
             if other.state is State.ACTIVE:
                 reason = Reason(

@@ -5,6 +5,8 @@ description = "Bellis Game Runtime 的主进程与插件"
 requires-python = "==3.12.*"
 dependencies = [
     "core-protocol",
+    "numpy>=2.5.4",
+    "opencv-python-headless>=5.0.0.93",
     "pydantic>=2.14.2",
 ]
 

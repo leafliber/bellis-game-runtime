@@ -72,6 +72,7 @@ def _layout_rects(layout: Layout) -> dict[str, Rect]:
     options = [layout.choice_option(index) for index in range(3)]
     return {
         "client": layout.full,
+        "clock-tower": layout.clock_tower(),
         "speaker": layout.speaker_box(),
         "dialogue": layout.dialogue_text(),
         "continue-marker": layout.continue_marker(),

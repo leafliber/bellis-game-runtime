@@ -74,6 +74,14 @@ class Layout:
         return self.rect(460, top, 820, top + 64)
 
     # 对话
+    def clock_tower(self) -> Rect:
+        """对话背景里的钟楼剪影。"""
+        return self.rect(560, 60, 720, 420)
+
+    def clock_face(self) -> Rect:
+        """钟楼上钟面的外接矩形。"""
+        return self.rect(590, 100, 690, 200)
+
     def dialogue_box(self) -> Rect:
         return self.rect(40, 470, 1240, 690)
 

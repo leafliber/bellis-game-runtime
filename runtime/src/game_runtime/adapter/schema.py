@@ -144,10 +144,19 @@ class Resolution(_Model):
 
 
 class RoiText(_Model):
-    """ROI 内的 OCR 固定文字：各行依次连接、去掉空白后包含 `text` 即相符。"""
+    """ROI 内的 OCR 固定文字：各行依次连接、去掉空白后包含同样去掉空白的 `text` 即相符。"""
 
     roi: Ident
     text: Text
+
+    def matches(self, lines: Iterable[str]) -> bool:
+        """OCR 在 ROI 内读出的各行（按阅读顺序）是否与这一项相符。"""
+        return _squash(self.text) in _squash("".join(lines))
+
+
+def _squash(text: str) -> str:
+    """去掉全部空白（含全角空格）。"""
+    return "".join(text.split())
 
 
 class FixedText(RoiText):

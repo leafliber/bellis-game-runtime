@@ -71,6 +71,13 @@ class ServiceRegistry:
             raise LookupError(reason.message)
         return self._services[name].impl
 
+    def find(self, name: str, major: int) -> object | None:
+        """此刻可用的服务实现；不在或主版本不同时为 None。"""
+        provision = self._services.get(name)
+        if provision is None or provision.major != major:
+            return None
+        return provision.impl
+
     def provided_by(self, provider: str) -> frozenset[str]:
         """某个插件实例提供的服务名。"""
         return frozenset(name for name, p in self._services.items() if p.provider == provider)
