@@ -11,6 +11,7 @@
 import ntpath
 import os
 import re
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -209,7 +210,11 @@ def encode_task_xml(xml: str) -> bytes:
 
 
 def decode_query_output(data: bytes) -> str:
-    """解码 `schtasks /Query /XML` 的输出：按 BOM、UTF-16LE 特征、UTF-8 依次识别，不猜代码页。"""
+    """解码 `schtasks /Query /XML` 的输出：按 BOM、UTF-16LE 特征、UTF-8 依次识别。
+
+    输出被重定向时，schtasks 按 OEM 代码页写（中文系统为 936），XML 声明却仍写 UTF-16；所以在
+    Windows 上前几种都不成立时按 OEM 代码页解码。
+    """
     if data[:2] == b"\xff\xfe":
         return data[2:].decode("utf-16-le")
     if data[:2] == b"\xfe\xff":
@@ -221,7 +226,9 @@ def decode_query_output(data: bytes) -> str:
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as error:
-        raise ValueError("读回的任务 XML 既不是 UTF-16 也不是 UTF-8，无法核对") from error
+        if sys.platform != "win32":
+            raise ValueError("读回的任务 XML 既不是 UTF-16 也不是 UTF-8，无法核对") from error
+    return data.decode("oem")
 
 
 _ELEMENT = re.compile(r"<([A-Za-z][\w.-]*)(?:\s[^>]*?)?(?:/>|>([\s\S]*?)</\1\s*>)")
