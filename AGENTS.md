@@ -45,6 +45,8 @@
 | 只核对本地数据目录里的模型制品，不联网 | `uv run fetch-models --check` |
 | 只跑 OCR 的测试（本地数据目录里没有模型时，真实推理的那部分跳过） | `uv run pytest runtime/tests/ocr` |
 | 用本地数据目录里的真实模型跑 OCR 的识别测试（模型不在时跳过并写明原因） | `uv run pytest -m ocr_model` |
+| 只跑 `narrative@1` 的测试（一句的边界与完整度、存储与留存、合成剧情按真值逐句核对、积压与中断、插件在内核中；没有 OCR 模型时真实推理的那一项跳过） | `uv run pytest runtime/tests/narrative` |
+| 用真实 OCR 模型跑一遍合成剧情的剧情记录，打印逐句的核对结果（模型不在时跳过） | `uv run pytest -m ocr_model runtime/tests/narrative -s` |
 | GS-04：渲染合成游戏的样本与真值，用来验证评测工具 | `uv run gs04 synth <目录>` |
 | GS-04：评测一个样本目录，报告写入 `reports/gs04/`（引擎 `ppocrv5-mobile`、`ppocrv5-server`） | `uv run gs04 eval <样本目录> --engine <引擎>` |
 | GS-04：以 Windows 自带 OCR 作对照基线（只在 Windows 上） | `uv run --extra windows-ocr gs04 eval <样本目录> --engine windows` |
