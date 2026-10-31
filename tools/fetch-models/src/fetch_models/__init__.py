@@ -2,8 +2,9 @@
 
 设计见 `docs/modules/game-adapter.md` 的“模型制品”。`uv run fetch-models` 下载清单里全部
 还没有或不符的制品；`--check` 只核对、不联网；`--only` 只处理指定的制品。只从清单写死的 https
-地址下载，边下载边算 SHA-256，大小与摘要都相符才改名为正式文件，不符即删除并失败。清单在运行时
-的代码里（`game_runtime.ocr.models`），文件不进版本库。
+地址下载，边下载边算 SHA-256，大小与摘要都相符才改名为正式文件，不符即删除并失败。清单在各插件
+的代码里，由 `CATALOGS` 汇总（`game_runtime.ocr.models`、`game_runtime.voice_activity.models`），
+文件不进版本库。
 """
 
 import argparse
@@ -22,7 +23,11 @@ from game_runtime.artifacts import (
     verify_artifact,
 )
 from game_runtime.local_data import local_data_dir
-from game_runtime.ocr.models import all_artifacts
+from game_runtime.ocr.models import all_artifacts as ocr_artifacts
+from game_runtime.voice_activity.models import all_artifacts as voice_activity_artifacts
+
+CATALOGS: tuple[Callable[[], Sequence[Artifact]], ...] = (ocr_artifacts, voice_activity_artifacts)
+"""各插件的制品清单；新的插件带了清单就把它的 `all_artifacts` 加在这里。"""
 
 DOWNLOAD_TIMEOUT_SECONDS = 120
 _CHUNK = 1 << 20
@@ -47,9 +52,20 @@ def _urlopen(url: str, timeout: float) -> AbstractContextManager[Response]:
     return urllib.request.urlopen(url, timeout=timeout)  # noqa: S310
 
 
+def merge_catalogs(catalogs: Iterable[Sequence[Artifact]]) -> tuple[Artifact, ...]:
+    """把几份清单并成一份：按出现的顺序，同名同版本的只留一项；内容不同即报错。"""
+    seen: dict[tuple[str, str], Artifact] = {}
+    for catalog in catalogs:
+        for artifact in catalog:
+            existing = seen.setdefault((artifact.name, artifact.version), artifact)
+            if existing != artifact:
+                raise ValueError(f"清单里的 {artifact.name} {artifact.version} 有两种不同的写法")
+    return tuple(seen.values())
+
+
 def known_artifacts() -> tuple[Artifact, ...]:
-    """清单里的全部制品。"""
-    return all_artifacts()
+    """各插件清单里的全部制品。"""
+    return merge_catalogs(catalog() for catalog in CATALOGS)
 
 
 def fetch(

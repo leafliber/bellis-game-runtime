@@ -11,7 +11,15 @@ from pathlib import Path
 
 import pytest
 
-from fetch_models import FetchError, Opener, Response, fetch, known_artifacts, run
+from fetch_models import (
+    FetchError,
+    Opener,
+    Response,
+    fetch,
+    known_artifacts,
+    merge_catalogs,
+    run,
+)
 from game_runtime.artifacts import Artifact
 
 CONTENT = b"pinned model bytes" * 1000
@@ -159,7 +167,17 @@ def test_unknown_names_are_rejected(tmp_path: Path) -> None:
         run(["--data-dir", str(tmp_path), "--only", "nothing"], artifacts=[pinned()])
 
 
-def test_the_catalog_lists_the_ocr_models() -> None:
-    names = {artifact.name for artifact in known_artifacts()}
+def test_the_catalog_lists_the_ocr_and_voice_activity_models() -> None:
+    names = [artifact.name for artifact in known_artifacts()]
 
-    assert {"ppocrv5-mobile-det", "ppocrv5-mobile-rec", "ppocrv5-dict"} <= names
+    assert {"ppocrv5-mobile-det", "ppocrv5-mobile-rec", "ppocrv5-dict", "silero-vad"} <= set(names)
+    assert len(names) == len(set(names))
+
+
+def test_catalogs_merge_in_order_and_conflicts_are_rejected() -> None:
+    a, b = pinned(), pinned(b"other", url="https://example.invalid/o.onnx")
+    b = replace(b, name="other-model")
+
+    assert merge_catalogs([[a, b], [a]]) == (a, b)
+    with pytest.raises(ValueError, match="两种不同的写法"):
+        merge_catalogs([[a], [replace(a, sha256="0" * 64)]])
