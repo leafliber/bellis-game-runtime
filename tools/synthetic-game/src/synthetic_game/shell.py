@@ -6,6 +6,9 @@ tkinter 只在建窗时导入，没有 tk 的环境也能导入本模块并测�
 
 外壳按固定频率重画窗口（缺省 30 Hz），画面内容没变也重画：WGC 只在窗口内容变化时出帧，
 静止的画面不重画就没有新帧，帧龄会一直增长。真实游戏一般也每帧都在绘制。
+
+`--autoplay <秒>` 让外壳每隔这么久自己处理一次回车短按（直接交给状态机，不经系统输入），
+画面持续变化而不需要任何真实输入，供录制的真机测试使用。
 """
 
 from __future__ import annotations
@@ -107,6 +110,13 @@ def check_redraw_hz(hz: float) -> float:
     return hz
 
 
+def check_autoplay(seconds: float) -> float:
+    """自动推进的间隔须在 [0.05, 3600] 秒之内。"""
+    if not 0.05 <= seconds <= 3600:
+        raise ValueError(f"自动推进的间隔须在 0.05 到 3600 秒之间：{seconds}")
+    return seconds
+
+
 class RedrawSchedule:
     """按固定频率排定重画的时刻。
 
@@ -138,6 +148,7 @@ class Shell:
         root: tk.Tk | tk.Toplevel,
         game: SyntheticGame,
         redraw_hz: float = DEFAULT_REDRAW_HZ,
+        autoplay: float | None = None,
     ) -> None:
         import tkinter as tk
 
@@ -146,6 +157,7 @@ class Shell:
         self.root = root
         self.game = game
         self.redraw_hz = check_redraw_hz(redraw_hz)
+        self.autoplay = None if autoplay is None else check_autoplay(autoplay)
         width, height = game.config.width, game.config.height
         root.title(WINDOW_TITLE)
         root.geometry(f"{width}x{height}")
@@ -177,6 +189,15 @@ class Shell:
             self.root.after(schedule.delay_ms(time.monotonic()), tick)
 
         tick()
+        autoplay = self.autoplay
+        if autoplay is not None:
+            period = round(autoplay * 1000)
+
+            def advance() -> None:
+                self.press_keysym("Return")
+                self.root.after(period, advance)
+
+            self.root.after(period, advance)
         self.root.mainloop()
 
     def refresh(self) -> bool:
@@ -232,6 +253,8 @@ class ShellOptions:
 
     game: GameConfig = field(default_factory=GameConfig)
     redraw_hz: float = DEFAULT_REDRAW_HZ
+    autoplay: float | None = None
+    """每隔这么久（秒）自己处理一次回车短按；None 即不自动推进。"""
 
 
 def parse_args(argv: Sequence[str] | None) -> ShellOptions:
@@ -256,10 +279,17 @@ def parse_args(argv: Sequence[str] | None) -> ShellOptions:
         default=DEFAULT_REDRAW_HZ,
         help="how often the window is redrawn, even when the picture has not changed",
     )
+    parser.add_argument(
+        "--autoplay",
+        type=float,
+        metavar="SECONDS",
+        help="press Enter by itself every SECONDS, without any real input",
+    )
     args = parser.parse_args(argv)
     try:
         game = GameConfig(args.width, args.height, args.text_cps, args.choice_seconds)
-        return ShellOptions(game, check_redraw_hz(args.redraw_hz))
+        autoplay = None if args.autoplay is None else check_autoplay(args.autoplay)
+        return ShellOptions(game, check_redraw_hz(args.redraw_hz), autoplay)
     except ValueError as error:
         parser.error(str(error))
 
@@ -270,6 +300,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     options = parse_args(argv)
     declare_per_monitor_dpi_awareness()
     root = tk.Tk(className=WINDOW_CLASS)
-    shell = Shell(root, SyntheticGame(options.game, MonotonicClock()), options.redraw_hz)
+    shell = Shell(
+        root, SyntheticGame(options.game, MonotonicClock()), options.redraw_hz, options.autoplay
+    )
     shell.run()
     return 0

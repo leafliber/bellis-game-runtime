@@ -111,7 +111,7 @@ class Kernel:
         通常是 `CoreLink.audio_reader`；不给时插件读音频抛 `LookupError`。
 
         `frames` 是交给申请了 `frames.read` 的插件的帧源（`PluginContext.frames`），实时运行时
-        通常是 `RingFrameSource(link.frames)`；不给时插件取帧源抛 `LookupError`。"""
+        通常是定序帧源 `SequencedFrameSource(link.frames)`；不给时插件取帧源抛 `LookupError`。"""
         self._catalog = catalog
         self._core = core
         self._frames = frames

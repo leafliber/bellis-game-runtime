@@ -1,8 +1,4 @@
-"""帧源：内存帧源按顺序逐帧给出，实时帧源读帧环给出最新的一帧，工作线程被取消时先做完。
-
-实时帧源读的帧环由只用于测试的假显示面写入（它就是一个帧环）；经真实实时核的联调见
-`runtime/tests/core_link/test_scene.py`。
-"""
+"""帧源：内存帧源按顺序逐帧给出，工作线程被取消时先做完。定序帧源见 `test_sequenced.py`。"""
 
 import asyncio
 import threading
@@ -10,9 +6,8 @@ import threading
 import pytest
 
 from game_runtime._threads import in_thread
-from game_runtime.frame_ring import FrameRingError, RingFrame
-from game_runtime.frame_ring.fake import FakeDisplay
-from game_runtime.frames import MemoryFrameSource, RingFrameSource, check_frame
+from game_runtime.frame_ring import RingFrame
+from game_runtime.frames import MemoryFrameSource, check_frame
 
 
 def frame(number: int, *, width: int = 4, height: int = 2, value: int = 0) -> RingFrame:
@@ -82,72 +77,6 @@ def test_memory_source_rejects_bad_frames() -> None:
     with pytest.raises(RuntimeError, match="已关闭"):
         source.push(frame(3))
     assert [f.frame_number for f in source.frames] == [2]
-
-
-# 实时帧源
-
-
-def test_ring_source_waits_for_a_frame_then_gives_the_latest() -> None:
-    async def scenario() -> None:
-        with FakeDisplay.create(4, 2) as display:
-            source = RingFrameSource(display, poll_interval=0.001)
-            waiting = asyncio.create_task(source.next_frame(0))
-            await asyncio.sleep(0.02)
-            assert not waiting.done()
-
-            display.present(bytes([7]) * 32, 4, 2, capture_ns=123, transform_version=4)
-            first = await asyncio.wait_for(waiting, 5)
-            assert first is not None
-            assert (first.frame_number, first.capture_ns, first.transform_version) == (1, 123, 4)
-            assert first.pixels == bytes([7]) * 32
-
-            # 读者处理不过来时跳过中间的帧，拿到最新的。
-            for value in (1, 2, 3):
-                display.present(bytes([value]) * 32, 4, 2)
-            latest = await asyncio.wait_for(source.next_frame(first.frame_number), 5)
-            assert latest is not None
-            assert latest.frame_number == 4
-            assert latest.pixels == bytes([3]) * 32
-
-    asyncio.run(scenario())
-
-
-class TornDisplay(FakeDisplay):
-    """测试用：把槽的 seqlock 序号改成奇数，像是写方正在写这一槽。"""
-
-    def bump_seq(self, slot: int, by: int) -> None:
-        self._open_views().slots[slot].seq += by
-
-
-def test_ring_source_retries_torn_reads() -> None:
-    async def scenario() -> None:
-        with TornDisplay.create(4, 2, slot_count=2) as display:
-            source = RingFrameSource(display, poll_interval=0.001)
-            display.present(bytes(32), 4, 2)
-            display.bump_seq(0, 1)
-            reading = asyncio.create_task(source.next_frame(0))
-            await asyncio.sleep(0.05)
-            assert not reading.done()  # 每次尝试都撕裂，稍后再读
-
-            display.bump_seq(0, 1)
-            got = await asyncio.wait_for(reading, 5)
-            assert got is not None
-            assert got.frame_number == 1
-
-    asyncio.run(scenario())
-
-
-def test_ring_source_fails_once_the_ring_is_closed() -> None:
-    async def scenario() -> None:
-        display = FakeDisplay.create(4, 2)
-        source = RingFrameSource(display)
-        display.close()
-        with pytest.raises(FrameRingError, match="已关闭"):
-            await source.next_frame(0)
-
-    asyncio.run(scenario())
-    with FakeDisplay.create(4, 2) as display, pytest.raises(ValueError, match="poll_interval"):
-        RingFrameSource(display, poll_interval=0)
 
 
 # 工作线程
