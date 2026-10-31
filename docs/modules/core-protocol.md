@@ -120,7 +120,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - 消息走 `bellis-channel/1` 帧，内容为 JSON-RPC 2.0（同 Bellis D-21）。实时核是通道客户端，主进程是服务端；两边都可以发请求与通知。
 - 握手校验协议版本；两端同仓库同发布，仍然校验。
 
-核连接承载：动作块、控制产出者心跳与代次、执行回执、输入已释放的确认、实时核健康，以及帧环挂接、采集目标与正常停止。输入许可不经核连接：主进程只能让输入停下，不能让输入继续；许可的语义见[输入许可](#输入许可)，G0 唯一的许可源在只用于测试的[测试设备连接](#测试设备连接)上。
+核连接承载：动作块、控制产出者心跳与代次、执行回执、输入已释放的确认、实时核健康，以及帧环与音频环的挂接、采集目标、音频目标与正常停止。输入许可不经核连接：主进程只能让输入停下，不能让输入继续；许可的语义见[输入许可](#输入许可)，G0 唯一的许可源在只用于测试的[测试设备连接](#测试设备连接)上。
 
 ### 约定
 
@@ -135,14 +135,15 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | --- | --- | --- |
 | -32001 | `protocol_version_mismatch` | `core.hello` 的协议版本与主进程的不相等 |
 | -32002 | `frame_ring_mismatch` | `frame_ring.attach` 打不开共享内存，或帧环头部与参数不符；`capture.set_target` 的假显示面同样 |
-| -32003 | `capture_unsupported` | `capture.set_target` 的目标在这个平台或系统上不支持：非 Windows 上的 `window`，或系统不支持 WGC |
+| -32003 | `capture_unsupported` | `capture.set_target` 或 `audio.set_target` 的目标在这个平台或系统上不支持：非 Windows 上的 `window`，或系统不支持 WGC |
 | -32004 | `lease_refused` | 只用于测试：`test_lease.grant` 不被接受，见[输入许可](#输入许可) |
+| -32005 | `audio_ring_mismatch` | `audio_ring.attach` 打不开共享内存，或音频环头部与参数不符；`audio.set_target` 的假音频输出同样 |
 
 ### 会话
 
 1. 实时核通过通道认证后先发 `core.hello`；主进程核对协议版本，不相等即以 -32001 回错并断开。握手完成前双方不发其它消息。
 2. 实时核随即发 `input.released(core_start)`（启动时已先释放全部输入），之后才处理任何产出者消息；主进程收到它才算实时核就绪。实时核立即发第一条 `core.health`，此后按周期发。
-3. 主进程先发 `frame_ring.attach`，再发 `capture.set_target`，之后才开始发心跳（主进程一侧见[读写规则](#读写规则)）。
+3. 主进程先发 `frame_ring.attach`，再发 `capture.set_target`；配置了音频时接着发 `audio_ring.attach` 与 `audio.set_target`；之后才开始发心跳（主进程一侧见帧环与音频环各自的挂接：[帧环](#读写规则)、[音频环](#音频环的读写规则)）。
 4. 当前控制产出者定期发 `producer.heartbeat`，以 `action.submit` 提交动作块；实时核以 `action.receipt` 报一次性动作的结果，每次释放全部输入后发 `input.released`。
 5. 更换控制产出者（[QUIESCING](plugin-kernel.md#生命周期)）：停止提交动作块 → `producer.revoke`，等到它的回应，即输入已释放的确认 → 撤销注册。
 6. 正常停止：主进程发 `core.stop`；实时核释放全部输入，发 `input.released`，回应写出后退出。这是 Bellis R-06 停止顺序中的 RPC 一步。
@@ -156,6 +157,8 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `core.hello` | 实时核 → 主进程 | 请求 | `CoreHelloParams` → `CoreHelloResult` | 握手 |
 | `frame_ring.attach` | 主进程 → 实时核 | 请求 | `FrameRingAttachParams` → `Empty` | 帧环挂接 |
 | `capture.set_target` | 主进程 → 实时核 | 请求 | `CaptureSetTargetParams` → `Empty` | 设定采集目标 |
+| `audio_ring.attach` | 主进程 → 实时核 | 请求 | `AudioRingAttachParams` → `Empty` | 音频环挂接 |
+| `audio.set_target` | 主进程 → 实时核 | 请求 | `AudioSetTargetParams` → `Empty` | 设定音频目标 |
 | `producer.heartbeat` | 主进程 → 实时核 | 通知 | `ProducerHeartbeatParams` | 控制产出者心跳 |
 | `action.submit` | 主进程 → 实时核 | 请求 | `ActionBlock` → `ActionSubmitResult` | 提交[动作块](#动作块) |
 | `producer.revoke` | 主进程 → 实时核 | 请求 | `ProducerRevokeParams` → `Empty` | 作废代次；回应即输入已释放的确认 |
@@ -192,6 +195,25 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - 回应表示目标已核对并交给采集线程，不等采集源建立。找不到窗口不是错误：`core.health.capture` 为 `searching`，实时核定期重新识别（[采集主循环](realtime-core.md#采集主循环)）。
 - 再次设定时先停掉旧的采集源。与 `frame_ring.attach` 的先后不限，两者都到了才开始采集。
 - 错误：`process_name` 为空或 `window_class` 与 `title` 都是 `null` 时回参数无效（-32602）；`window` 在非 Windows 上（unsupported）或系统不支持 WGC 时回 -32003；假显示面按 `frame_ring.attach` 的规则核对，不符回 -32002。被拒绝的请求不改变当前的目标。
+
+**`audio_ring.attach`**：主进程创建音频环并写好头部后发出；实时核打开共享内存，核对头部与参数一致后交给音频线程，块号从头部的 `write_seq` 续写，见[音频环](#音频环)。再次挂接即换成新的音频环。打不开或不符回 -32005。
+
+| 字段 | 含义 |
+| --- | --- |
+| `name` | 共享内存名 |
+| `size_bytes` | 共享内存的总字节数，不小于 `BLOCKS_OFFSET + block_count × block_stride` |
+| `layout_version`、`block_count`、`block_stride`、`block_capacity`、`sample_rate`、`channels`、`sample_format` | 与音频环头部的同名字段相等 |
+
+**`audio.set_target`**：`target` 是联合类型 `AudioTarget`，由主进程的音频配置给出（[音频环的挂接](#音频环的读写规则)）。
+
+| 分支 | 字段 | 含义 |
+| --- | --- | --- |
+| `window`（`AudioWindowTarget`） | `process_name`、`window_class`、`title` | 窗口识别规则，含义与核对同 `capture.set_target` 的 `window`；采这个窗口所属进程及其子进程的声音，见[目标进程](realtime-core.md#目标进程) |
+| `fake`（`FakeAudioTarget`） | `output` | 假音频源，只用于自动测试：假音频输出的共享内存名与布局参数，形式与核对同 `audio_ring.attach`，见[假音频源](realtime-core.md#假音频源) |
+
+- 回应表示目标已核对并交给音频线程，不等音频源建立。找不到窗口或进程已退出不是错误：`core.health.audio` 为 `searching`，实时核定期重新识别（[音频主循环](realtime-core.md#音频主循环)）。
+- 再次设定时先停掉旧的音频源。与 `audio_ring.attach` 的先后不限，两者都到了才开始采集。
+- 错误：窗口识别规则同 `capture.set_target`，不全回 -32602；`window` 在非 Windows 上回 -32003（unsupported）；假音频输出按 `audio_ring.attach` 的规则核对，不符回 -32005。被拒绝的请求不改变当前的目标。
 
 **控制产出者**：`Producer` 由身份 `id` 与代次 `generation` 组成。代次由主进程分配，在一个实时核的生命期内严格递增；实时核记住当前代次与已作废的最高代次。
 
@@ -250,6 +272,8 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `inputs_held` | 当前是否持有输入 |
 | `producer` | 当前控制产出者；没有时为 `null` |
 | `latest_frame` | 本实例最近写进帧环的一帧（`LatestFrame`）：`frame_number` 为它在帧环中的帧号，`capture_ns` 为采集时刻；本实例还没写过帧时为 `null`。它不前进即帧龄在增长，见[帧龄的依据](realtime-core.md#采集主循环) |
+| `audio` | 音频的采集状态，取值同 `capture`：`idle`（还没有挂接音频环或设定音频目标）、`searching`（没有音频源：找不到目标窗口、目标进程已退出或音频源已失效，正在定期重新识别）、`capturing`（有音频源）。转换见[音频主循环](realtime-core.md#音频主循环) |
+| `latest_audio` | 本实例最近写进音频环的一块（`LatestAudio`）：`block_number` 为块号，`capture_ns` 为它第一个采样点的采集时刻；本实例还没写过块时为 `null`。只用于诊断与测试，实时核的任何决定都不依据它 |
 | `lease` | 输入许可的状态（`LeaseStatus`）：`not_granted`、`valid`、`expired`、`revoked`、`source_lost`，含义见[输入许可](#输入许可)。只报状态，不报令牌；只用于诊断与测试，主进程不据它做任何决定 |
 
 ## 动作块
@@ -348,9 +372,9 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | 环 | 每项内容 |
 | --- | --- |
 | 帧环 | 帧（BGRA8，客户区）、帧号、采集时刻（QPC）、窗口与 DPI 变换版本 |
-| 音频环 | 游戏进程的 PCM 与采集时刻，与帧环同一时钟 |
+| 音频环 | 块：游戏进程的一段连续 PCM（F32，各声道交错）、块号、第一个采样点的采集时刻（QPC，与帧环同一时钟）、不连续标志 |
 
-头部是二进制布局，以 Rust 的 `#[repr(C)]` 结构为源（`core_protocol::frame_ring`），由 Rust 导出字段偏移表 `protocol/frame-ring-layout.json`；Python 的 `core_protocol.frame_ring` 手写同一布局，由测试与偏移表逐项核对；偏移表不一致时 `uv run check` 失败。音频环的布局在 G1 加入。
+头部是二进制布局，以 Rust 的 `#[repr(C)]` 结构为源（`core_protocol::frame_ring`、`core_protocol::audio_ring`），由 Rust 导出字段偏移表 `protocol/frame-ring-layout.json`、`protocol/audio-ring-layout.json`；Python 的 `core_protocol.frame_ring`、`core_protocol.audio_ring` 手写同一布局，由测试与偏移表逐项核对；偏移表不一致时 `uv run check` 失败。
 
 ### 帧环
 
@@ -449,12 +473,88 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 
 Windows 本机跑命名文件映射，Linux 容器跑 POSIX 共享内存。
 
+### 音频环
+
+共享内存的起点是环头部，从 `BLOCKS_OFFSET` 起是 `block_count` 个跨度为 `block_stride` 的块槽；每个块槽的起点是块头部，从 `BLOCK_SAMPLES_OFFSET` 起是样本值。一块是一段连续的采样点，**采样点**指同一时刻各声道的样本值，F32 时占 `channels × 4` 字节。整数与样本值按本机字节序，结构没有隐式填充，Windows 与 Linux 上布局相同。内存序、平台假设与共享内存的创建、命名、销毁都与帧环相同（[内存序与平台假设](#内存序与平台假设)、[创建、命名与销毁](#创建命名与销毁)），名字中的用途为 `audio`（如 `Local\bellis-audio-<随机数>`），参数不符回 -32005。
+
+| 常量 | 值 | 含义 |
+| --- | --- | --- |
+| `MAGIC` | 小端读出的 `b"BGRAUDIO"` | 环头部的标识 |
+| `LAYOUT_VERSION` | 1 | 头部、块头部或这些常量变化时加一 |
+| `BLOCKS_OFFSET` | 64 | 块槽 0 的偏移 |
+| `BLOCK_SAMPLES_OFFSET` | 64 | 样本值相对块槽起点的偏移 |
+| `BLOCK_ALIGN` | 64 | 块槽跨度的对齐 |
+| `SAMPLE_FORMAT_F32` | 1 | 每个样本值是 32 位 IEEE 浮点，各声道交错 |
+| `BYTES_PER_VALUE` | 4 | 一个 F32 样本值的字节数 |
+| `MAX_CHANNELS` | 2 | 声道数的上限 |
+| `MIN_SAMPLE_RATE`、`MAX_SAMPLE_RATE` | 8000、192000 | 采样率（Hz）的范围 |
+| `FLAG_DISCONTINUITY` | 1 | 块标志：这一块与上一块之间不连续 |
+| `KNOWN_FLAGS` | 1 | 已定义的全部块标志，其余位须为 0 |
+
+环头部 `AudioRingHeader`（48 字节）：主进程创建时写入除 `write_seq` 外的全部字段，此后不变。
+
+| 偏移 | 字段 | 类型 | 含义 |
+| --- | --- | --- | --- |
+| 0 | `magic` | u64 | `MAGIC` |
+| 8 | `layout_version` | u32 | `LAYOUT_VERSION` |
+| 12 | `block_count` | u32 | 块槽数，至少 2 |
+| 16 | `block_stride` | u64 | 相邻两块槽起点之间的字节数，是 `BLOCK_ALIGN` 的倍数，不小于 `BLOCK_SAMPLES_OFFSET + block_capacity × channels × 4` |
+| 24 | `block_capacity` | u32 | 一块最多的采样点数，至少 1 |
+| 28 | `sample_rate` | u32 | 采样率（Hz），在 `MIN_SAMPLE_RATE` 到 `MAX_SAMPLE_RATE` 之间 |
+| 32 | `channels` | u32 | 声道数，1 到 `MAX_CHANNELS` |
+| 36 | `sample_format` | u32 | `SAMPLE_FORMAT_F32` |
+| 40 | `write_seq` | 原子 u64 | 最新一块的块号，0 表示还没有块；只由实时核写 |
+
+块头部 `AudioBlockHeader`（32 字节）：只由实时核写。
+
+| 偏移 | 字段 | 类型 | 含义 |
+| --- | --- | --- | --- |
+| 0 | `seq` | 原子 u64 | seqlock 序号：奇数表示正在写，偶数表示稳定 |
+| 8 | `block_number` | u64 | 块号，从 1 起在本音频环内每块加一；块槽号为 `(block_number − 1) mod block_count` |
+| 16 | `capture_ns` | u64 | 第一个采样点的采集时刻，与核协议的 `_ns` 时刻同一时钟；第 i 个采样点的采集时刻为 `capture_ns + i × 10⁹ / sample_rate` |
+| 24 | `sample_count` | u32 | 采样点数，1 到 `block_capacity`；样本值占 `sample_count × channels × 4` 字节 |
+| 28 | `flags` | u32 | 块标志，目前只有 `FLAG_DISCONTINUITY`，其余位为 0 |
+
+| 实现 | 位置 | 做什么 |
+| --- | --- | --- |
+| 主进程（Python） | `runtime/src/game_runtime/audio_ring/` | 创建并写好头部、给出 `audio_ring.attach` 的参数、读最近一段、销毁；由 `CoreLink` 持有并挂接（见下文） |
+| 实时核（Rust） | `core/crates/audio-ring` | 打开与核对、写块；其中的读取方只供[假音频源](realtime-core.md#假音频源)与测试使用。实时核的音频线程是唯一的写方，见[音频主循环](realtime-core.md#音频主循环) |
+
+#### 音频环的读写规则
+
+单写者多读者的 seqlock，规则与帧环相同，以块代替帧：
+
+- **写一块**：把块槽的 `seq` 置为下一个奇数（偶数加一，崩溃后遗留的奇数加二），随后一道释放栅栏；写块头部其余字段与样本值；把 `seq` 加一成为偶数（释放）；最后把 `write_seq` 置为该块号（释放）。
+- **块号**：挂接时从头部的 `write_seq` 续写，每块加一，所以实时核重启后块号不回退。
+- **拆包**：音频源交出的一个包（[音频源接口](realtime-core.md#音频源接口)）超过 `block_capacity` 时拆成连续的几块，后面各块的采集时刻按采样率从包的采集时刻推算（向下取整到纳秒），不连续标志只在第一块上。采样点数为 0 或字节数不是 `sample_count × channels × 4` 的包不写，音频环不受影响。
+- **不连续标志**：这一块与上一块之间丢了声音或时间轴断开：本实例挂接音频环、建立新的音频源或丢弃了写不进的包之后的第一块、WASAPI 报告数据不连续、[假音频源](realtime-core.md#假音频源)读得太慢而跳过了块。读方据此重置依赖连续声音的状态。
+- **读一块**（块号 n）：读块槽的 `seq`（获取），为奇数即撕裂；复制块头部，`block_number` 不是 n 即这一块已被覆盖；块头部不合布局（`sample_count` 为 0 或超过 `block_capacity`、`flags` 有未定义的位）时重读 `seq`，变了算撕裂，没变即报音频环损坏；复制样本值，一道获取栅栏后重读 `seq`，与先前不等即撕裂。
+- **读最近一段**：读 `write_seq`（获取）得到最新的块号 W，为 0 即还没有块；从 W 起往前逐块读，直到读到的总时长不少于所求、遇到块号不大于调用方给的 `after` 的块、块号早于 `W − block_count + 1`，或某一块撕裂或已被覆盖。W 本身撕裂或已被覆盖（写方在读的期间绕了整整一圈）时从读 `write_seq` 起重试，有上限（主进程缺省 8 次），都失败时这次读取失败；更早的块撕裂或已被覆盖只说明写方已追上它，返回比它新的那些块。
+
+**挂接与读取。** 主进程一侧由 `CoreLink`（`runtime/src/game_runtime/core_link/`）实现，单写方、重启与销毁的规则与帧环相同（[读写规则](#读写规则)中的“挂接”）：
+
+- **配置**：`CoreLinkOptions.audio` 是 `AudioConfig`（`core_link/audio.py`）：`target` 为 `WindowRule`（与画面采集同一条窗口识别规则）或只用于测试的假音频输出（`FakeAudioOutput.target`）；格式缺省为 48000 Hz、2 声道；块容量缺省 960 个采样点（48 kHz 时 20 ms，放得下一个 10 ms 的包），块槽数缺省 400（包为 10 ms 时约 4 秒）。没有配置时不建音频环，也不设定音频目标。
+- **顺序**：第一次 `start` 创建音频环；每个实例挂接帧环与设定采集目标之后（配置了采集时），发 `audio_ring.attach`，再发 `audio.set_target`，然后才开始发心跳。任一请求被拒绝即按停止顺序终止该实例，`start` 报 `CoreStartError`，音频环保留到 `stop`。
+- **读取**：`read_recent(duration_ns, *, after=0)` 按上面的规则读最近一段，返回 `AudioRead`：`sample_rate`、`channels` 与按块号从小到大的 `blocks`；每个 `AudioBlock` 有 `block_number`、`capture_ns`、`sample_count`、`discontinuity` 与 `samples`（F32 交错的字节）。持续读取的一方把上次取到的最大块号作为 `after`；返回的第一块的块号大于 `after + 1` 即其间的块已被覆盖。宿主代码经 `CoreLink.audio`（`AudioRing`）读；插件经 `ctx.audio` 读（权限 `audio.read`，[注册](plugin-kernel.md#注册)），宿主以 `CoreLink.audio_reader` 交给内核，没有音频环时（没有配置音频，或第一次 `start` 之前、`stop` 之后）它返回 `None`。
+- **销毁**：`stop` 在实时核退出后销毁音频环，强制终止后仍未确认退出时保留。
+
+#### 音频环的测试
+
+| 层 | 内容 |
+| --- | --- |
+| Rust 单元 | 测试自建共享内存并写好头部：参数与头部逐项核对、共享内存缺失或太小、写读往返、拆包与推算的采集时刻、拒绝不合规则的包、块号续写、崩溃遗留的奇数 `seq`、撕裂、损坏与已被覆盖的块、写方高速写读方并发读、假音频源（只交出打开之后写入的块、按块号逐块交出、跳过被覆盖的块时标不连续、损坏的块） |
+| Python | 创建与命名、读最近一段（时长、`after`、被覆盖的旧块、撕裂的重试与放弃、损坏的块）、假音频输出、销毁 |
+| 互通 | pytest 编译并拉起 Rust 示例 `audio_ring_interop`：Python 创建、Rust 写、Python 读，重启后块号续写；头部与参数不符时 Rust 拒绝；Rust 高速写时 Python 并发读、Python 高速写假音频输出时 Rust 的假音频源并发读，读到的块都完整一致、按块号连续 |
+| 经实时核 | 真实的 `realtime-core` 上的挂接、设定音频目标、错误码、假音频输出与音频环格式不同时不写块、`core.health` 的音频状态，以及 `CoreLink` 的挂接顺序、重启续写与销毁，见[音频的验证](realtime-core.md#音频的验证) |
+
+Windows 本机跑命名文件映射，Linux 容器跑 POSIX 共享内存。
+
 ## 生成与核对
 
 | 生成物（`protocol/` 下） | 来源 |
 | --- | --- |
 | `schema/core-protocol.schema.json` | schemars 从 Rust 类型生成；`x-methods`、`x-test-device-methods`、`x-protocol-version`、`x-error-codes` 来自 `core_protocol::methods` 与协议版本常量 |
-| `frame-ring-layout.json` | Rust 以 `std::mem::offset_of!` 导出的常量与各结构的大小、对齐、字段偏移、大小与类型 |
+| `frame-ring-layout.json`、`audio-ring-layout.json` | Rust 以 `std::mem::offset_of!` 导出的帧环与音频环的常量与各结构的大小、对齐、字段偏移、大小与类型 |
 | `fixtures/<方法名>/params[.<用例>].json`、`result[.<用例>].json` | Rust 从类型的值序列化出的示例消息，两组的每个方法的 params 与 result 至少一条，每个联合类型的每个分支至少出现一次 |
 | `src/core_protocol/models.py` | datamodel-code-generator 从 Schema 生成的 Pydantic 模型 |
 | `src/core_protocol/methods.py` | 从 Schema 的 `x-methods` 与 `x-test-device-methods` 生成的两组方法目录（`METHODS`、`TEST_DEVICE_METHODS`）、协议版本与自定义错误码 |
@@ -463,13 +563,14 @@ Windows 本机跑命名文件映射，Linux 容器跑 POSIX 共享内存。
 - `uv run check` 的生成物核对把全部生成物重新生成到临时目录，与入库的逐字节比较，缺少、多余或内容不同都失败，并提示运行 `uv run generate`。
 - 生成是确定的：不含时间戳与路径，键按声明顺序，换行一律 LF，Windows 与 Linux 上的结果逐字节相同。
 - 联合类型：schemars 把每个分支内联为带 `type` 常量的对象；分支结构体以 `#[schemars(title = …)]` 写明自己的名字，生成的 Pydantic 类与 Rust 同名；导出时给以 `type` 为标签的 `oneOf` 加上 `discriminator`，datamodel-code-generator 据此生成按 `type` 选分支的 Pydantic 判别联合。整数补上 Rust 类型的上下界，`additionalProperties: false` 生成为 `extra="forbid"`。
-- 测试：Rust 与 Python 各自解析每条示例消息并往返序列化，结果与原值相等；在每个对象节点加一个未知字段都被拒绝；`type` 标签选出联合类型的分支，未知标签被拒绝。Python 的帧环布局与偏移表逐项核对；Rust 侧核对偏移表列出了每个字段且没有填充。
+- 测试：Rust 与 Python 各自解析每条示例消息并往返序列化，结果与原值相等；在每个对象节点加一个未知字段都被拒绝；`type` 标签选出联合类型的分支，未知标签被拒绝。Python 的帧环与音频环布局与各自的偏移表逐项核对；Rust 侧核对偏移表列出了每个字段且没有填充。
 
 ## 验收
 
 | 阶段 | 内容 |
 | --- | --- |
 | G0 | 生成物过期与偏移表不一致时检查失败；本机通道未认证即拒绝，篡改、重放、超长帧与超时都被拒绝；Python 与 Rust 互通，Windows 真机跑命名管道，Linux 容器跑 UDS；帧环由主进程创建、实时核写入、主进程读出，头部与参数不符时拒绝，并发读写不交出撕裂的帧；动作块的校验、调度与权威检查在假输入后端上经测试设备连接验证（[验证](realtime-core.md#动作块的验证)） |
+| G1 | 音频环由主进程创建、实时核写入、主进程读出，头部与参数不符时拒绝，并发读写不交出撕裂的块；假音频源的声音经实时核进入音频环（[音频采集](realtime-core.md#音频采集)的验证）；WASAPI 进程回环的真机核对见同一节 |
 | G3 | 与 Bellis 宿主真机互通 |
 
 ## 技术路线

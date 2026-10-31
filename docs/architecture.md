@@ -164,7 +164,7 @@ Game Runtime 为 Bellis 提供游戏能力：采集画面与声音、读懂画�
 | `runtime/` | Python uv 项目：主进程与插件 |
 | `games/<id>/` | 游戏适配包：声明文件与钩子（GR-31） |
 | `tools/` | 离线工具与合成游戏夹具 |
-| `protocol/` | 核协议的生成物（JSON Schema、Pydantic 模型、帧环偏移表、示例消息）与 Python 包 `core_protocol` |
+| `protocol/` | 核协议的生成物（JSON Schema、Pydantic 模型、帧环与音频环的偏移表、示例消息）与 Python 包 `core_protocol` |
 | `vendor/bellis-protocol/` | 锁定的 Bellis 游戏桥生成物，附来源提交与摘要 |
 | `docs/` | 文档，分工见[文档索引](README.md) |
 
