@@ -1,10 +1,12 @@
-"""真实的 `realtime-core`：握手、生命线、控制产出者心跳、时钟、帧环挂接与采集目标。
+"""真实的 `realtime-core`：握手、生命线、控制产出者心跳、时钟、帧环与音频环的挂接、
+采集目标与音频目标。
 
 `FakeMain` 由测试扮演主进程，按脚本收发核协议的消息，用来核对实时核一侧的规则；主进程一侧的实现
-（`CoreLink`、插件内核与停止顺序）见 `test_link.py` 与 `test_capture.py`。Windows 上走命名管道，
-其它平台走 UDS。
+（`CoreLink`、插件内核与停止顺序）见 `test_link.py`、`test_capture.py` 与 `test_audio.py`。
+Windows 上走命名管道，其它平台走 UDS。
 """
 
+import array
 import asyncio
 import contextlib
 import secrets
@@ -18,6 +20,8 @@ import pytest
 
 from core_protocol import models
 from core_protocol.methods import (
+    AUDIO_RING_ATTACH,
+    AUDIO_SET_TARGET,
     CAPTURE_SET_TARGET,
     CORE_HEALTH,
     CORE_HELLO,
@@ -37,6 +41,8 @@ from core_protocol.models import (
     Producer,
     ReleaseReason,
 )
+from game_runtime.audio_ring import AudioRing
+from game_runtime.audio_ring.fake import FakeAudioOutput
 from game_runtime.channel import (
     ChannelServer,
     Connection,
@@ -582,5 +588,145 @@ def test_window_targets_search_on_windows_and_are_unsupported_elsewhere(
                 assert error.code == ErrorCode.CAPTURE_UNSUPPORTED
                 assert "only available on Windows" in error.message
                 assert (await fake.snapshot()).capture is CaptureState.IDLE
+
+    run_with_core(core_exe, tmp_path, script)
+
+
+# 音频环与音频目标
+
+
+def audio_attach_params(ring: AudioRing) -> dict[str, Any]:
+    return ring.attach_params().model_dump(mode="json")
+
+
+def audio_target_params(
+    target: models.AudioWindowTarget | models.FakeAudioTarget,
+) -> dict[str, Any]:
+    params = models.AudioSetTargetParams(target=models.AudioTarget(root=target))
+    return params.model_dump(mode="json")
+
+
+def test_audio_goes_from_idle_to_capturing_and_fills_the_ring(
+    core_exe: Path, tmp_path: Path
+) -> None:
+    async def script(fake: FakeMain) -> None:
+        await fake.started()
+        with (
+            AudioRing.create(16_000, 1, block_capacity=160, block_count=8) as ring,
+            FakeAudioOutput.create(16_000, 1, block_capacity=160, block_count=8) as output,
+        ):
+            health = await fake.snapshot()
+            assert (health.audio, health.latest_audio) == (CaptureState.IDLE, None)
+            # 只挂接了音频环、还没有音频目标：仍是 idle，没有写过块。
+            assert await fake.request(AUDIO_RING_ATTACH.name, audio_attach_params(ring)) == {}
+            health = await fake.snapshot()
+            assert (health.audio, health.latest_audio) == (CaptureState.IDLE, None)
+
+            target = audio_target_params(output.target)
+            assert await fake.request(AUDIO_SET_TARGET.name, target) == {}
+            await fake.until_health(lambda h: h.audio is CaptureState.CAPTURING)
+            samples = array.array("f", [0.25] * 160).tobytes()
+            output.play(samples, capture_ns=12_345)
+            output.play(samples, capture_ns=12_345 + 10_000_000)
+            health = await fake.until_health(
+                lambda h: h.latest_audio is not None and h.latest_audio.block_number == 2
+            )
+            assert health.latest_audio == models.LatestAudio(
+                block_number=2, capture_ns=12_345 + 10_000_000
+            )
+            blocks = ring.read_recent(10**9).blocks
+            assert [(b.block_number, b.capture_ns, b.discontinuity) for b in blocks] == [
+                (1, 12_345, True),
+                (2, 12_345 + 10_000_000, False),
+            ]
+            assert all(block.samples == samples for block in blocks)
+            # 画面采集不受影响。
+            assert health.capture is CaptureState.IDLE
+
+    run_with_core(core_exe, tmp_path, script)
+
+
+def test_mismatched_audio_rings_and_bad_audio_targets_are_refused(
+    core_exe: Path, tmp_path: Path
+) -> None:
+    async def script(fake: FakeMain) -> None:
+        await fake.started()
+        with (
+            AudioRing.create(48_000, 2, block_capacity=480, block_count=4) as ring,
+            FakeAudioOutput.create(48_000, 2, block_capacity=480, block_count=4) as output,
+        ):
+            params = audio_attach_params(ring)
+            for bad in (
+                {**params, "channels": 1},
+                {**params, "name": params["name"] + "x"},
+                {**params, "sample_format": 2},
+            ):
+                error = await fake.refused(AUDIO_RING_ATTACH.name, bad)
+                assert error.code == ErrorCode.AUDIO_RING_MISMATCH, bad
+            # 假音频输出按同样的规则核对。
+            mismatched = {**output.target.output.model_dump(mode="json"), "block_count": 8}
+            error = await fake.refused(
+                AUDIO_SET_TARGET.name, {"target": {"type": "fake", "output": mismatched}}
+            )
+            assert error.code == ErrorCode.AUDIO_RING_MISMATCH
+            # 窗口识别规则须给出窗口类或标题。
+            vague = models.AudioWindowTarget(process_name="game.exe", window_class=None, title=None)
+            error = await fake.refused(AUDIO_SET_TARGET.name, audio_target_params(vague))
+            assert error.code == RpcErrorCode.INVALID_PARAMS
+            # 被拒绝的请求不改变什么。
+            assert (await fake.snapshot()).audio is CaptureState.IDLE
+            assert ring.latest_block_number() == 0
+        log = fake.log()
+        assert "audio_ring.attach" in log
+        assert "header channels is 2" in log
+
+    run_with_core(core_exe, tmp_path, script)
+
+
+def test_a_fake_output_in_another_format_is_searched_for_again(
+    core_exe: Path, tmp_path: Path
+) -> None:
+    async def script(fake: FakeMain) -> None:
+        await fake.started()
+        with (
+            AudioRing.create(48_000, 2, block_capacity=480, block_count=4) as ring,
+            FakeAudioOutput.create(16_000, 1, block_capacity=160, block_count=4) as output,
+        ):
+            # 两者各自合布局，所以目标被接受；建立音频源时才发现格式不同，不写任何块。
+            await fake.request(AUDIO_RING_ATTACH.name, audio_attach_params(ring))
+            assert (
+                await fake.request(AUDIO_SET_TARGET.name, audio_target_params(output.target)) == {}
+            )
+            health = await fake.until_health(lambda h: h.audio is not CaptureState.IDLE)
+            assert (health.audio, health.latest_audio) == (CaptureState.SEARCHING, None)
+            output.play(array.array("f", [0.5] * 160).tobytes())
+            await asyncio.sleep(0.2)
+            assert ring.latest_block_number() == 0
+        assert "audio format mismatch" in fake.log()
+
+    run_with_core(core_exe, tmp_path, script)
+
+
+def test_audio_window_targets_search_on_windows_and_are_unsupported_elsewhere(
+    core_exe: Path, tmp_path: Path
+) -> None:
+    window = models.AudioWindowTarget(
+        process_name="no-such-process-7f3a9c.exe", window_class=None, title="Bellis Test"
+    )
+
+    async def script(fake: FakeMain) -> None:
+        await fake.started()
+        with AudioRing.create(48_000, 2, block_capacity=480, block_count=4) as ring:
+            await fake.request(AUDIO_RING_ATTACH.name, audio_attach_params(ring))
+            if sys.platform == "win32":
+                assert await fake.request(AUDIO_SET_TARGET.name, audio_target_params(window)) == {}
+                health = await fake.until_health(lambda h: h.audio is not CaptureState.IDLE)
+                assert (health.audio, health.latest_audio) == (CaptureState.SEARCHING, None)
+                assert "no window matches" in fake.log()
+            else:
+                error = await fake.refused(AUDIO_SET_TARGET.name, audio_target_params(window))
+                assert error.code == ErrorCode.CAPTURE_UNSUPPORTED
+                assert "only available on Windows" in error.message
+                assert (await fake.snapshot()).audio is CaptureState.IDLE
 
     run_with_core(core_exe, tmp_path, script)
