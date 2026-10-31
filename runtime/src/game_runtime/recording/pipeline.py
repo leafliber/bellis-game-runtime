@@ -52,11 +52,12 @@ def perception_entries(
     adapter: Adapter,
     *,
     data_dir: Path,
-    results_dir: Path,
+    results_dir: Path | None,
     games_dir: Path | None = None,
 ) -> list[ResolvedEntry]:
     """插件内核的条目。模型制品与锚点模板在 `data_dir`；结果与剧情记录的 SQLite 写进
-    `results_dir`（剧情记录的本地数据目录就是它，与实时运行的剧情记录分开）。对白框不能用时不运行
+    `results_dir`（剧情记录的本地数据目录就是它，与实时运行的剧情记录分开）。`results_dir` 为 None
+    时（不录制的只读运行）不运行写文件的 `results`，剧情记录写进 `data_dir`。对白框不能用时不运行
     `narrative@1`，记一条告警。"""
     game: dict[str, str] = {"game": adapter.id}
     if games_dir is not None:
@@ -70,11 +71,12 @@ def perception_entries(
     ]
     problem = narrative_problem(adapter)
     if problem is None:
-        narrative = {"data_dir": str(results_dir)}
+        narrative = {"data_dir": str(results_dir or data_dir)}
         entries.append(_entry("narrative", "narrative", narrative, (NARRATIVE_WRITE,)))
     else:
         logger.warning("不运行 narrative@1：%s", problem)
-    entries.append(_entry("results", "results", {"directory": str(results_dir)}))
+    if results_dir is not None:
+        entries.append(_entry("results", "results", {"directory": str(results_dir)}))
     return entries
 
 

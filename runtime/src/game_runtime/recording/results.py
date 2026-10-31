@@ -10,7 +10,7 @@ import asyncio
 import dataclasses
 import enum
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Final, Self, cast
@@ -137,8 +137,9 @@ class ResultsConfig(BaseModel):
 
 
 class ResultsHub:
-    """宿主与 `results` 插件之间：插件激活时交来 `narrative@1`，宿主据此让回放等剧情记录跟上，
-    停插件内核之前等它处理完积压的更新，并写下最后的剧情记录。只在事件循环的线程里使用。"""
+    """宿主与插件之间：`results` 插件激活时交来 `narrative@1` 与输出目录，宿主据此让回放等剧情记录
+    跟上，停插件内核之前等它处理完积压的更新，并写下最后的剧情记录。不录制的只读运行没有 `results`，
+    由 `observer` 以 `track` 交来剧情记录，只等、不写。只在事件循环的线程里使用。"""
 
     def __init__(self, *, pace_backlog: int = PACE_BACKLOG) -> None:
         self.narrative: NarrativeService | None = None
@@ -152,16 +153,31 @@ class ResultsHub:
         if narrative is not None and narrative.backlog > self._pace_backlog:
             await narrative.wait_idle()
 
+    def track(self, narrative: NarrativeService) -> Callable[[], None]:
+        """还没有剧情记录时记下 `narrative`，让 `drain` 等它处理完（没有输出目录，不写文件）；
+        已有时不变。返回撤销的函数，登记为撤销函数。"""
+        if self.narrative is not None:
+            return lambda: None
+
+        def release() -> None:
+            if self.narrative is narrative:
+                self.narrative = None
+
+        self.narrative = narrative
+        return release
+
     async def drain(self, timeout: float) -> bool:
-        """等剧情记录处理完积压的更新（至多 `timeout` 秒），再把它最后的记录、范围与中断写进
-        `narrative-final.jsonl`。没有剧情记录时直接返回真；超时返回假，不写。"""
+        """等剧情记录处理完积压的更新（至多 `timeout` 秒）；有输出目录时再把它最后的记录、范围与
+        中断写进 `narrative-final.jsonl`。没有剧情记录时直接返回真；超时返回假，不写。"""
         narrative, directory = self.narrative, self.directory
-        if narrative is None or directory is None:
+        if narrative is None:
             return True
         try:
             await asyncio.wait_for(narrative.wait_idle(), timeout)
         except TimeoutError:
             return False
+        if directory is None:
+            return True
         lines = [narrative_line(record) for record in narrative.records()]
         lines += [_tagged("scope", scope) for scope in narrative.scopes]
         lines += [_tagged("discontinuity", gap) for gap in narrative.discontinuities]

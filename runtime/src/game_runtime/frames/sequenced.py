@@ -279,6 +279,11 @@ class SequencedFrameSource:
                 return None
             await self._wait()
 
+    def queued(self, after: int) -> int:
+        """接纳队列里帧号大于 `after` 的帧数，即读到 `after` 的读者还没读的帧；只读运行的状态行
+        以此显示积压。"""
+        return len(self._numbers) - bisect.bisect_right(self._numbers, after)
+
     async def wait_ended(self, count: int) -> None:
         """等到读到结束的次数达到 `count`；宿主以此等全部读者处理完已接纳的帧。"""
         while self._ended < count:

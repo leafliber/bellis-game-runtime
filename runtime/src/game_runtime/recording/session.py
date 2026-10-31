@@ -1,8 +1,8 @@
-"""录制时的实时运行：拉起实时核，帧经定序帧源进入插件与录制，声音按块录下；停止时按顺序收尾。
+"""实时运行：拉起实时核，帧经定序帧源进入插件（录制时也进入录制），声音按块录下；停止时按顺序收尾。
 
-录制工具（`uv run record`）用它；只读运行入口同时录制时复用。设计见
-`docs/modules/offline-tools.md` 的“录制工具”。不发任何输入：内核的 `CoreControl` 是 `NoControl`，
-不给实时核测试设备，也不发心跳。
+录制工具（`uv run record`）与只读运行入口（`uv run observe`，可以不录制）都用它。设计见
+`docs/modules/offline-tools.md` 的“录制工具”与“只读运行”。不发任何输入：内核的 `CoreControl` 是
+`NoControl`，不给实时核测试设备，也不发心跳。
 """
 
 import asyncio
@@ -10,6 +10,7 @@ import contextlib
 import dataclasses
 import logging
 import shutil
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -26,7 +27,7 @@ from game_runtime.core_link import (
 )
 from game_runtime.frame_ring import RingFrame
 from game_runtime.frames import DEFAULT_BACKLOG, AdmissionPolicy, SequencedFrameSource
-from game_runtime.kernel import FRAMES_READ, Kernel, State
+from game_runtime.kernel import FRAMES_READ, EntryStatus, Kernel, ResolvedEntry, State, Transition
 from game_runtime.recording.layout import (
     LIVE_DIR,
     AdmissionInfo,
@@ -84,16 +85,30 @@ class LiveOptions:
     policy: AdmissionPolicy = dataclasses.field(default_factory=AdmissionPolicy)
     backlog: int = DEFAULT_BACKLOG
     perception: bool = True
-    """同时运行感知插件（`perception_entries`），把它们的输出写进录制的 `live/`；为假时只录制。"""
+    """同时运行感知插件（`perception_entries`），录制时把它们的输出写进录制的 `live/`；为假时
+    只录制。"""
+    record: bool = True
+    """录下帧与声音。为假时（不录制的只读运行）不建录制目录、不录声音，不运行写文件的 `results`，
+    插件也不必全部激活；须运行感知插件。"""
     plugins: CatalogFactory | None = None
     """按 `ResultsHub` 给出插件目录，缺省为 `perception_catalog`；测试换成不要模型文件的 OCR 与
-    配音检测。"""
+    配音检测，只读运行另加 `observer`。"""
+    extra_entries: Sequence[ResolvedEntry] = ()
+    """排在感知插件之后的条目，如只读运行的 `observer`；插件须在 `plugins` 给出的目录里。"""
+    on_transition: Callable[[Transition], None] | None = None
+    """插件内核的条目每次变化状态或原因时调用。"""
     writer: WriterOptions = dataclasses.field(default_factory=WriterOptions)
     drain_timeout: float = DRAIN_TIMEOUT
+
+    def __post_init__(self) -> None:
+        if not (self.record or self.perception):
+            raise ValueError("不录制时须运行感知插件")
 
 
 @dataclass(frozen=True, slots=True)
 class SessionStatus:
+    """此刻的状态；不录制时录制的各项（在途的编码起）为 0 或 None。"""
+
     capture: CaptureState | None
     """画面的采集状态；还没收到 `core.health` 为 None。"""
     audio: CaptureState | None
@@ -122,15 +137,17 @@ class SessionStatus:
 
 @dataclass(frozen=True, slots=True)
 class SessionResult:
-    meta: RecordingMeta
-    path: Path
+    meta: RecordingMeta | None
+    """录制的元数据；不录制时为 None。"""
+    path: Path | None
+    """录制目录；不录制时为 None。"""
     core: StopResult
     drained: bool
     """读者在时限内处理完了已接纳的帧。"""
 
 
 class LiveSession:
-    """一次录制：`start`，按需读 `status`，`stop` 收尾。只在事件循环的线程里使用。"""
+    """一次实时运行：`start`，按需读 `status`，`stop` 收尾。只在事件循环的线程里使用。"""
 
     def __init__(self, options: LiveOptions) -> None:
         self.options = options
@@ -147,8 +164,17 @@ class LiveSession:
 
     @property
     def path(self) -> Path:
-        """录制目录。"""
+        """录制目录；不录制时抛 RuntimeError。"""
         return self._require_writer().path
+
+    @property
+    def recording_path(self) -> Path | None:
+        """录制目录；不录制或还没开始时为 None。"""
+        return None if self._writer is None else self._writer.path
+
+    def snapshot(self) -> list[EntryStatus]:
+        """插件内核各条目此刻的状态；还没开始时为空。"""
+        return [] if self._kernel is None else self._kernel.snapshot()
 
     @property
     def frames(self) -> SequencedFrameSource:
@@ -167,9 +193,10 @@ class LiveSession:
         return self._writer
 
     async def start(self) -> None:
-        """拉起实时核并挂接两个环、激活插件、建录制目录，然后开始接纳与录声音。
+        """拉起实时核并挂接两个环、建录制目录、激活插件，然后开始接纳与录声音。
 
-        实时核起不来抛 `CoreStartError`；插件没有全部激活抛 RuntimeError，此时不建录制目录。
+        实时核起不来抛 `CoreStartError`。录制时插件没有全部激活抛 RuntimeError，删掉已建的录制目录；
+        不录制时照样开始，没激活的由 `snapshot` 给出。
         """
         options = self.options
         await self.link.start()
@@ -178,64 +205,36 @@ class LiveSession:
             if ring is None:
                 raise RuntimeError("配置了采集，实时核起来后却没有帧环")
             frames = SequencedFrameSource(
-                ring, policy=options.policy, backlog=options.backlog, sink=self._sink
+                ring,
+                policy=options.policy,
+                backlog=options.backlog,
+                sink=self._sink if options.record else None,
             )
             self._frames = frames
-            game = options.adapter.id
-            root = recordings_root(options.data_dir, game)
-            writer = RecordingWriter.create(
-                root,
-                game=GameInfo(
-                    id=game,
-                    name=options.adapter.name,
-                    version=options.adapter.version,
-                    adapter_sha256=options.adapter_sha256,
-                    resolution=Resolution(
-                        width=options.adapter.resolution.width,
-                        height=options.adapter.resolution.height,
-                    ),
-                ),
-                name=options.name,
-                admission=AdmissionInfo(
-                    max_rate=options.policy.max_rate,
-                    idle_interval=options.policy.idle_interval,
-                    backlog=options.backlog,
-                ),
-                audio_format=(
-                    None
-                    if options.audio is None
-                    else (options.audio.sample_rate, options.audio.channels)
-                ),
-                tool=options.tool,
-                options=options.writer,
-            )
-            self._writer = writer
-            if options.audio is not None:
-                # 先于插件开始录声音：录下的块从配音检测读到的第一块之前就开始。
-                self._audio_task = asyncio.get_running_loop().create_task(
-                    self._record_audio(writer), name="录声音"
-                )
-            if options.perception:
-                entries = perception_entries(
+            entries = (
+                self._recording_entries()
+                if options.record
+                else perception_entries(
                     options.adapter,
                     data_dir=options.data_dir,
-                    results_dir=writer.path / LIVE_DIR,
+                    results_dir=None,
                     games_dir=options.games_dir,
                 )
-            else:
-                entries = adapter_entries(game, games_dir=options.games_dir)
+            )
+            entries += options.extra_entries
             self._readers = readers(entries, FRAMES_READ)
             kernel = Kernel(
                 catalog=(options.plugins or perception_catalog)(self._hub),
                 core=NoControl(),
                 frames=frames,
                 audio=self.link.audio_reader,
+                on_transition=options.on_transition,
             )
             self._kernel = kernel
             kernel.add(entries)
             await kernel.settled()
             inactive = [s for s in kernel.snapshot() if s.state is not State.ACTIVE]
-            if inactive:
+            if inactive and options.record:
                 reasons = "，".join(
                     f"{s.id}：{s.state.value}" + "".join(f"；{r.message}" for r in s.reasons)
                     for s in inactive
@@ -245,6 +244,51 @@ class LiveSession:
         except BaseException:
             await self._abort()
             raise
+
+    def _recording_entries(self) -> list[ResolvedEntry]:
+        """建录制目录、先于插件开始录声音，给出录制时的条目：感知插件的输出写进录制的 `live/`。"""
+        options = self.options
+        game = options.adapter.id
+        writer = RecordingWriter.create(
+            recordings_root(options.data_dir, game),
+            game=GameInfo(
+                id=game,
+                name=options.adapter.name,
+                version=options.adapter.version,
+                adapter_sha256=options.adapter_sha256,
+                resolution=Resolution(
+                    width=options.adapter.resolution.width,
+                    height=options.adapter.resolution.height,
+                ),
+            ),
+            name=options.name,
+            admission=AdmissionInfo(
+                max_rate=options.policy.max_rate,
+                idle_interval=options.policy.idle_interval,
+                backlog=options.backlog,
+            ),
+            audio_format=(
+                None
+                if options.audio is None
+                else (options.audio.sample_rate, options.audio.channels)
+            ),
+            tool=options.tool,
+            options=options.writer,
+        )
+        self._writer = writer
+        if options.audio is not None:
+            # 先于插件开始录声音：录下的块从配音检测读到的第一块之前就开始。
+            self._audio_task = asyncio.get_running_loop().create_task(
+                self._record_audio(writer), name="录声音"
+            )
+        if not options.perception:
+            return adapter_entries(game, games_dir=options.games_dir)
+        return perception_entries(
+            options.adapter,
+            data_dir=options.data_dir,
+            results_dir=writer.path / LIVE_DIR,
+            games_dir=options.games_dir,
+        )
 
     async def _sink(self, frame: RingFrame) -> None:
         await self._require_writer().write_frame(frame)
@@ -279,11 +323,11 @@ class LiveSession:
 
     def status(self) -> SessionStatus:
         health = self.link.last_health
-        frames = self.frames
-        stats = frames.stats
-        writer = self._require_writer()
-        meta = writer.meta
-        audio = meta.audio
+        stats = self.frames.stats
+        writer = self._writer
+        meta = None if writer is None else writer.meta
+        frames = None if meta is None else meta.frames
+        audio = None if meta is None else meta.audio
         return SessionStatus(
             capture=None if health is None else health.capture,
             audio=None if health is None else health.audio,
@@ -291,22 +335,22 @@ class LiveSession:
             admitted=stats.admitted,
             ring_latest=stats.latest_ring_frame,
             overflows=stats.overflows,
-            pending=writer.pending,
-            frames=meta.frames.count,
-            keyframes=meta.frames.keyframes,
-            frame_bytes=meta.frames.bytes,
+            pending=0 if writer is None else writer.pending,
+            frames=0 if frames is None else frames.count,
+            keyframes=0 if frames is None else frames.keyframes,
+            frame_bytes=0 if frames is None else frames.bytes,
             audio_blocks=0 if audio is None else audio.blocks,
             audio_gaps=0 if audio is None else audio.gaps,
-            first_capture_ns=meta.frames.first_capture_ns,
-            last_capture_ns=meta.frames.last_capture_ns,
+            first_capture_ns=None if frames is None else frames.first_capture_ns,
+            last_capture_ns=None if frames is None else frames.last_capture_ns,
         )
 
     async def stop(self, reason: str) -> SessionResult:
         """按顺序收尾：关闭定序帧源 → 等读者处理完已接纳的帧、剧情记录处理完积压的更新（各至多
         `drain_timeout`）→ 停插件内核 → 停录声音 → 按 R-06 停实时核 → 写完在途的编码、索引
-        与元数据。"""
+        与元数据。不录制时没有录声音与写录制两步。"""
         frames = self.frames
-        writer = self._require_writer()
+        writer = self._writer
         await frames.close()
         drained = True
         timeout = self.options.drain_timeout
@@ -316,7 +360,7 @@ class LiveSession:
         except TimeoutError:
             drained = False
         if not drained:
-            logger.warning("%g 秒内插件没有处理完已接纳的帧，录制时的实时输出不完整", timeout)
+            logger.warning("%g 秒内插件没有处理完已接纳的帧，实时输出不完整", timeout)
         if self._kernel is not None:
             await self._kernel.shutdown()
         audio_failure: BaseException | None = None
@@ -329,7 +373,9 @@ class LiveSession:
         core = await self.link.stop()
         failure = frames.failure or audio_failure
         if failure is not None:
-            logger.error("录制出错：%s", failure)
+            logger.error("%s出错：%s", "录制" if writer is not None else "接纳", failure)
+        if writer is None:
+            return SessionResult(None, None, core, drained)
         meta = await writer.finish(
             stop_reason="error" if failure is not None else reason,
             reader_overflows=frames.stats.overflows,

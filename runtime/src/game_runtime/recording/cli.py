@@ -1,7 +1,8 @@
 """录制、回放与导出的命令行：`uv run record`、`uv run replay`、`uv run recording`。
 
 用法见 `docs/modules/offline-tools.md` 的“录制”。这些是维护者在自己终端里运行的程序：录制按回车或
-Ctrl+C 停止，Ctrl+C 以取消主任务的方式到达，照常按顺序收尾。
+Ctrl+C 停止，Ctrl+C 以取消主任务的方式到达，照常按顺序收尾。录制与只读运行入口（`uv run observe`）
+共用运行循环 `game_runtime.observe.run.run_live`，这里只决定终端上显示什么。
 """
 
 import argparse
@@ -12,17 +13,16 @@ import logging
 import shutil
 import subprocess
 import sys
-import threading
-import time
 from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import Final
 
 from game_runtime.adapter import GAMES_DIR, Adapter, AdapterError, load_adapter
-from game_runtime.core_link import CoreLinkOptions, CoreStartError
+from game_runtime.core_link import CoreLinkOptions
 from game_runtime.frames import DEFAULT_IDLE_INTERVAL, DEFAULT_MAX_RATE, AdmissionPolicy
 from game_runtime.local_data import LocalDataError, local_data_dir
+from game_runtime.observe.run import run_live
 from game_runtime.recording.annotations import check_annotations, load_annotations
 from game_runtime.recording.export import (
     FrameSelection,
@@ -42,16 +42,15 @@ from game_runtime.recording.replay import adapter_sha256, replay
 from game_runtime.recording.results import Comparison
 from game_runtime.recording.retention import (
     GB,
-    QuotaKeeper,
     QuotaRefusedError,
     QuotaStatus,
-    StoredRecording,
     list_recordings,
     quota_bytes,
 )
 from game_runtime.recording.session import (
     LiveOptions,
     LiveSession,
+    SessionResult,
     SessionStatus,
     audio_config,
     capture_config,
@@ -59,10 +58,6 @@ from game_runtime.recording.session import (
 
 REPO_ROOT: Final = GAMES_DIR.parent
 """本仓库的根目录。"""
-STATUS_INTERVAL: Final = 2.0
-"""状态行的间隔（秒）。"""
-QUOTA_INTERVAL: Final = 5.0
-"""录制期间核对配额的间隔（秒）。"""
 
 
 def _out(line: str = "") -> None:
@@ -73,9 +68,9 @@ def _err(line: str) -> None:
     print(line, file=sys.stderr, flush=True)
 
 
-def _setup_output(verbose: bool) -> None:
+def setup_output(verbose: bool) -> None:
+    """输出含中文：终端的代码页编不出来时转义而不失败；`verbose` 时日志到 INFO。"""
     for stream in (sys.stdout, sys.stderr):
-        # 输出含中文；终端的代码页编不出来时不让程序因此失败。
         if isinstance(stream, io.TextIOWrapper):
             stream.reconfigure(errors="backslashreplace")
     logging.basicConfig(
@@ -154,7 +149,8 @@ def tool_info() -> ToolInfo:
 # 录制
 
 
-def _size(text: str) -> tuple[int, int]:
+def size_option(text: str) -> tuple[int, int]:
+    """`--max-size` 的写法：`<宽>x<高>`。"""
     width, _, height = text.lower().partition("x")
     try:
         size = int(width), int(height)
@@ -165,7 +161,8 @@ def _size(text: str) -> tuple[int, int]:
     return size
 
 
-def _data_dir(value: Path | None) -> Path:
+def data_dir_option(value: Path | None) -> Path:
+    """`--data-dir`：须为绝对路径；不给时为缺省的本地数据目录。"""
     if value is not None:
         if not value.is_absolute():
             raise LocalDataError(f"--data-dir 须为绝对路径：{value}")
@@ -186,7 +183,7 @@ def record_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-rate", type=float, default=DEFAULT_MAX_RATE)
     parser.add_argument("--idle-interval", type=float, default=DEFAULT_IDLE_INTERVAL)
     parser.add_argument(
-        "--max-size", type=_size, help="frame ring size WIDTHxHEIGHT (default: the adapter's)"
+        "--max-size", type=size_option, help="frame ring size WIDTHxHEIGHT (default: the adapter's)"
     )
     parser.add_argument(
         "--record-only", action="store_true", help="record only, without the perception plugins"
@@ -195,11 +192,11 @@ def record_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--data-dir", type=Path, help="local data directory (absolute)")
     parser.add_argument("--verbose", action="store_true", help="log at INFO level")
     args = parser.parse_args(argv)
-    _setup_output(args.verbose)
+    setup_output(args.verbose)
     try:
         adapter = load_adapter(GAMES_DIR / args.game)
         quota = quota_bytes(adapter)
-        data_dir = _data_dir(args.data_dir)
+        data_dir = data_dir_option(args.data_dir)
         policy = AdmissionPolicy(args.max_rate, args.idle_interval)
         if args.name is not None:
             check_name(args.name)
@@ -233,113 +230,37 @@ def record_main(argv: Sequence[str] | None = None) -> int:
         return 130
 
 
-def _report_delete(stored: StoredRecording) -> None:
-    _out(f"超出录制配额，删除最旧的录制：{stored.path}（{stored.state}，{_gb(stored.size)}）")
+class _RecordMonitor:
+    """录制工具的显示：开始的两行与每 2 秒一行的录制状态，不显示感知的结果。"""
 
+    def started(self, session: LiveSession, quota: QuotaStatus | None) -> None:
+        options = session.options
+        adapter = options.adapter
+        _out(f"录制 {adapter.id}（{adapter.name} {adapter.version}）到 {session.path}")
+        quota_text = "" if quota is None else f"配额 {_gb(quota.quota)}，已用 {_gb(quota.used)}；"
+        _out(
+            f"{quota_text}帧环 {options.capture.max_width}×{options.capture.max_height}；"
+            "按回车或 Ctrl+C 停止。"
+        )
 
-def _report_stuck(stored: StoredRecording) -> None:
-    _err(f"没能删干净 {stored.path}，剩下 {_gb(stored.size)} 仍计入用量")
+    def status(
+        self,
+        previous: tuple[float, SessionStatus],
+        current: tuple[float, SessionStatus],
+        quota: QuotaStatus | None,
+    ) -> None:
+        _out(_status_line(previous, current, quota))
+
+    def stopping(self) -> None:
+        pass
+
+    def finished(self, result: SessionResult) -> None:
+        pass
 
 
 async def record(options: LiveOptions, *, quota: int, seconds: float | None = None) -> int:
     """录制到按回车、Ctrl+C、`seconds` 到时、录满配额或出错为止，然后收尾。返回退出码。"""
-    adapter = options.adapter
-    root = recordings_root(options.data_dir, adapter.id)
-    keeper = QuotaKeeper(root, quota)
-    status = await asyncio.to_thread(keeper.check, _report_delete, failed=_report_stuck)
-    session = LiveSession(options)
-    try:
-        await session.start()
-    except (CoreStartError, RuntimeError) as error:
-        _err(f"没能开始录制：{error}")
-        return 1
-    keeper.set_current(session.path)
-    _out(f"录制 {adapter.id}（{adapter.name} {adapter.version}）到 {session.path}")
-    _out(
-        f"配额 {_gb(quota)}，已用 {_gb(status.used)}；"
-        f"帧环 {options.capture.max_width}×{options.capture.max_height}；"
-        "按回车或 Ctrl+C 停止。"
-    )
-    reason = "error"
-    try:
-        reason = await _wait_for_stop(session, keeper, seconds)
-        _out(f"正在收尾（{reason}）……")
-    except asyncio.CancelledError:
-        task = asyncio.current_task()
-        if task is not None:
-            task.uncancel()
-        reason = "interrupt"
-        _out("")
-        _out("收到 Ctrl+C，正在收尾（再按一次即强制退出，录制将不完整）……")
-    finally:
-        # 等待中出了别的错也照样收尾，再让错误传出去。
-        result = await session.stop(reason)
-    meta = result.meta
-    audio = meta.audio
-    final = keeper.check(_report_delete, failed=_report_stuck)
-    duration = 0.0
-    if meta.frames.first_capture_ns is not None and meta.frames.last_capture_ns is not None:
-        duration = (meta.frames.last_capture_ns - meta.frames.first_capture_ns) / 1e9
-    _out(
-        f"已停止（{meta.stop_reason}）：录制 {meta.state}，时长 {_clock(duration)}，"
-        f"帧 {meta.frames.count}（关键帧 {meta.frames.keyframes}），"
-        + (f"声音 {audio.blocks} 块（空缺 {audio.gaps}），" if audio is not None else "")
-        + f"体积 {_gb(final.current)}，剩余配额 {_gb(final.remaining)}"
-    )
-    if meta.reader_overflows:
-        _out(f"读者积压超限 {meta.reader_overflows} 次：录制时的实时结果与回放不一致")
-    if not result.drained:
-        _out("读者没有在时限内处理完已接纳的帧：live/ 里的实时输出不完整")
-    _out(f"录制目录：{result.path}")
-    _out(f"实时核：{result.core.stage.value}，退出码 {result.core.returncode}")
-    return 0 if meta.state == "complete" else 1
-
-
-async def _wait_for_stop(session: LiveSession, keeper: QuotaKeeper, seconds: float | None) -> str:
-    loop = asyncio.get_running_loop()
-    enter: asyncio.Future[None] = loop.create_future()
-
-    def read_stdin() -> None:
-        try:
-            line = sys.stdin.readline()
-        except (OSError, ValueError):
-            return
-        if line:  # 读到 EOF（stdin 不是终端）不当作回车
-            loop.call_soon_threadsafe(lambda: enter.done() or enter.set_result(None))
-
-    threading.Thread(target=read_stdin, name="录制的回车", daemon=True).start()
-    started = time.monotonic()
-    next_quota = started
-    next_status = started + STATUS_INTERVAL
-    previous = (started, session.status())
-    pump = session.frames.done
-    quota: QuotaStatus | None = None
-    while True:
-        now = time.monotonic()
-        if enter.done():
-            return "enter"
-        if seconds is not None and now - started >= seconds:
-            return "seconds"
-        if pump is not None and pump.done():
-            return "error"
-        audio = session.audio_task
-        if audio is not None and audio.done():
-            return "error"
-        if not session.link.running:
-            _err("实时核已退出")
-            return "core-exited"
-        if now >= next_quota:
-            next_quota = now + QUOTA_INTERVAL
-            quota = await asyncio.to_thread(keeper.check, _report_delete, failed=_report_stuck)
-            if quota.over:
-                _out(f"已录满配额 {_gb(quota.quota)}，停止录制")
-                return "quota"
-        if now >= next_status:
-            next_status = now + STATUS_INTERVAL
-            current = session.status()
-            _out(_status_line(previous, (now, current), quota))
-            previous = (now, current)
-        await asyncio.wait((enter,), timeout=0.2)
+    return await run_live(options, monitor=_RecordMonitor(), quota=quota, seconds=seconds)
 
 
 def _status_line(
@@ -392,9 +313,9 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--data-dir", type=Path, help="local data directory (absolute)")
     parser.add_argument("--verbose", action="store_true", help="log at INFO level")
     args = parser.parse_args(argv)
-    _setup_output(args.verbose)
+    setup_output(args.verbose)
     try:
-        data_dir = _data_dir(args.data_dir)
+        data_dir = data_dir_option(args.data_dir)
         recording = Recording.open(_resolve(args.recording, data_dir))
     except (RecordingError, LocalDataError, ValueError) as error:
         _err(f"不能回放：{error}")
@@ -469,9 +390,9 @@ def recording_main(argv: Sequence[str] | None = None) -> int:
     check = commands.add_parser("check", help="decode every frame and check the annotations")
     check.add_argument("recording")
     args = parser.parse_args(argv)
-    _setup_output(False)
+    setup_output(False)
     try:
-        data_dir = _data_dir(args.data_dir)
+        data_dir = data_dir_option(args.data_dir)
         if args.command == "list":
             return _list(data_dir, args.game)
         recording = Recording.open(_resolve(args.recording, data_dir))
