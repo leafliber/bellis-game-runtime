@@ -23,6 +23,15 @@
 | 只跑动作块、假输入后端与失效释放的联调测试，并打印假后端上的释放时延 | `uv run pytest runtime/tests/core_link/test_actions.py -s` |
 | 只跑取帧接口与 `scene@1`（变化与稳定、画面签名、模板文件、合成游戏全部画面的判别、插件在内核中）的测试 | `uv run pytest runtime/tests/frames runtime/tests/scene` |
 | 只跑 `scene@1` 经假显示面、实时核与帧环的联调测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link/test_scene.py` |
+| 按适配包录制帧、游戏声音与感知插件的实时输出，按回车或 Ctrl+C 停止（先编译 release 版 `realtime-core`；`--record-only` 只录制，见[录制工具](docs/modules/offline-tools.md#录制工具)） | `uv run record <适配包 id> --name <名字>` |
+| M0 回放一段录制，与录制时的实时输出逐条比对（`<录制>` 写目录、`<适配包 id>/<录制目录名>` 或只写 `<适配包 id>` 取最新的） | `uv run replay <录制>` |
+| 列出录制、用量与上限 | `uv run recording list [<适配包 id>]` |
+| 导出录制的帧为 PNG（`--frames <帧号,…>`、`--every <秒>`、`--stable` 或 `--all`，可加 `--start`、`--end`） | `uv run recording export-frames <录制> --stable` |
+| 导出录制的声音为 WAV（缺省 32 位浮点，`--pcm16` 为 16 位整数） | `uv run recording export-audio <录制> --start <秒> --end <秒>` |
+| 逐帧解码、核对音频与校验标注 | `uv run recording check <录制>` |
+| 只跑定序帧源、样本格式、留存、标注、导出与按录制喂入配音检测的测试 | `uv run pytest runtime/tests/frames runtime/tests/recording runtime/tests/voice_activity/test_recorded.py` |
+| 只跑录制与 M0 回放经假显示面、假音频输出与实时核的联调测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link/test_recording.py` |
+| 合成游戏 2560×1440 的窗口经 WGC 录制、量体积与 CPU 再回放比对的真机测试（需要 Windows 交互桌面与 `uv run fetch-models` 的模型，不在 `uv run check` 中；先关掉已打开的合成游戏窗口；`RECORD_SECONDS` 改时长，`RECORD_ONLY=1` 只录制） | `uv run pytest -m manual runtime/tests/core_link/test_record_window.py -s` |
 | 格式化 | `uv run ruff format`；`cargo fmt --all` |
 | 改了 `core/crates/core-protocol` 后重新生成 `protocol/` 的生成物 | `uv run generate` |
 | 给某个 Python 包加依赖 | `uv add --package <发行名> <依赖>` |
