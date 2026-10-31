@@ -94,6 +94,11 @@ id = "dialogue"
 screen = "dialogue"
 
 [[signatures]]
+# 继续标记：对白画面的组成项加上继续标记；游戏若没有继续标记，标定时连同对白框里的引用一起删去。
+id = "dialogue-continue"
+screen = "dialogue"
+
+[[signatures]]
 id = "choice"
 screen = "choice"
 
@@ -104,6 +109,14 @@ screen = "trial"
 [[signatures]]
 id = "bad-ending"
 screen = "bad-ending"
+
+# 剧情记录读文字的地方（docs/modules/game-adapter.md 的“对白框”）；引用的 ROI 与签名都尚未标定，
+# 标定前 narrative@1 激活失败并列出这些项。
+[[dialogue_boxes]]
+screen = "dialogue"
+speaker = "speaker"
+text = "dialogue"
+continue_signature = "dialogue-continue"
 
 [[notes]]
 id = "characters"

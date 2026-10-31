@@ -141,6 +141,18 @@ anchors = [
 ]
 
 [[signatures]]
+# 继续标记：对话签名的三处像素检查加上继续标记三角形里的一点（一句显示完时才画出）。与对话同级、
+# 指向对话，所以它不改变画面的结果；剧情记录按它是否命中判断继续标记是否可见。
+id = "dialogue-continue"
+screen = "dialogue"
+pixels = [
+    { at = [0.5, 0.208333], color = "#F5F5F0", tolerance = 6 },
+    { at = [0.453125, 0.416667], color = "#181A26", tolerance = 6 },
+    { at = [0.046875, 0.833333], color = "#181A26", tolerance = 6 },
+    { at = [0.9390625, 0.9125], color = "#F5F5F0", tolerance = 6 },
+]
+
+[[signatures]]
 id = "choice"
 screen = "choice"
 pixels = [
@@ -176,6 +188,13 @@ pixels = [
     { at = [0.96875, 0.944444], color = "#480E12", tolerance = 6 },
 ]
 texts = [{ roi = "ending-retry", text = "重来" }]
+
+# 剧情记录读文字的地方：docs/modules/game-adapter.md 的“对白框”。
+[[dialogue_boxes]]
+screen = "dialogue"
+speaker = "speaker"
+text = "dialogue"
+continue_signature = "dialogue-continue"
 
 [pacing]
 min_action_interval = 0.2

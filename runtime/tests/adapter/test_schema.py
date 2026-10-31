@@ -584,3 +584,133 @@ def test_load_rejects_toml_dates(tmp_path: Path) -> None:
 
     assert caught.value.problems == ("version：Input should be a valid string",)
     assert "sample" in str(caught.value)
+
+
+# 对白框
+
+DIALOGUE = """
+[[screen_types]]
+name = "旁白"
+base = "对话"
+
+[[screens]]
+id = "talk"
+title = "对白"
+type = "对话"
+
+[[screens]]
+id = "narration"
+title = "旁白"
+type = "旁白"
+
+[[signatures]]
+id = "talk-continue"
+screen = "talk"
+pixels = [{ at = [0.94, 0.91], color = "#FFFFFF", tolerance = 8 }]
+
+[[dialogue_boxes]]
+screen = "talk"
+speaker = "speaker"
+text = "line"
+continue_signature = "talk-continue"
+
+[[dialogue_boxes]]
+screen = "narration"
+text = "line"
+"""
+
+
+def dialogue_declaration() -> Data:
+    data = declaration(DIALOGUE)
+    data["rois"]["speaker"] = {"title": "名字栏", "rect": [0.05, 0.6, 0.25, 0.66]}
+    data["rois"]["line"] = {"title": "对白文字", "rect": [0.05, 0.7, 0.95, 0.95]}
+    return data
+
+
+def test_dialogue_boxes_are_declared_on_dialogue_screens() -> None:
+    adapter = Adapter.model_validate(dialogue_declaration())
+
+    talk, narration = adapter.require_dialogue_boxes()
+    assert (talk.screen, talk.speaker, talk.text, talk.continue_signature) == (
+        "talk",
+        "speaker",
+        "line",
+        "talk-continue",
+    )
+    assert talk.rois == ("speaker", "line")
+    assert (narration.speaker, narration.continue_signature, narration.rois) == (
+        None,
+        None,
+        ("line",),
+    )
+    assert adapter.generic_type("narration") is ScreenType.DIALOGUE  # 扩展按 base
+    assert adapter.generic_type("menu") is ScreenType.MENU
+    with pytest.raises(LookupError, match="没有声明画面 absent"):
+        adapter.generic_type("absent")
+
+
+def test_dialogue_boxes_may_reference_uncalibrated_items() -> None:
+    data = dialogue_declaration()
+    data["rois"]["speaker"] = {"title": "名字栏"}
+    data["signatures"][0] = {"id": "talk-continue", "screen": "talk"}
+
+    adapter = Adapter.model_validate(data)
+
+    assert "ROI speaker（名字栏）" in adapter.uncalibrated()
+    assert "签名 talk-continue" in adapter.uncalibrated()
+    with pytest.raises(NotCalibratedError) as caught:
+        adapter.require_dialogue_boxes()
+    assert caught.value.item == "对白框的ROI speaker（名字栏）、继续标记的签名 talk-continue"
+
+
+def test_without_dialogue_boxes_requiring_them_is_a_lookup_error() -> None:
+    adapter = Adapter.model_validate(declaration())
+
+    assert adapter.dialogue_boxes == ()
+    with pytest.raises(LookupError, match="适配包 sample 没有声明对白框"):
+        adapter.require_dialogue_boxes()
+
+
+def box(**fields: object) -> Mutation:
+    def mutate(data: Data) -> None:
+        data["dialogue_boxes"][0].update(fields)
+
+    return mutate
+
+
+DIALOGUE_REJECTED: list[tuple[str, Mutation, str]] = [
+    ("box on a menu", box(screen="menu"), "dialogue_boxes[0].screen：画面 menu 的类型是 菜单"),
+    ("undeclared screen", box(screen="absent"), "dialogue_boxes[0].screen：没有声明画面 absent"),
+    ("undeclared text roi", box(text="absent"), "dialogue_boxes[0].text：没有声明 ROI absent"),
+    (
+        "undeclared speaker roi",
+        box(speaker="absent"),
+        "dialogue_boxes[0].speaker：没有声明 ROI absent",
+    ),
+    ("same roi twice", box(speaker="line"), "speaker 与 text 须是不同的 ROI"),
+    (
+        "undeclared continue signature",
+        box(continue_signature="absent"),
+        "dialogue_boxes[0].continue_signature：没有声明签名 absent",
+    ),
+    (
+        "continue signature of another screen",
+        box(screen="narration", continue_signature="talk-continue"),
+        "签名 talk-continue 指向画面 talk，不是对白框所在的 narration",
+    ),
+    ("two boxes on one screen", box(screen="narration"), "dialogue_boxes：narration 重复"),
+    ("unknown field", box(name_plate="speaker"), "Extra inputs are not permitted"),
+]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [pytest.param(mutate, expected, id=name) for name, mutate, expected in DIALOGUE_REJECTED],
+)
+def test_invalid_dialogue_box_is_rejected(mutate: Mutation, expected: str) -> None:
+    data = dialogue_declaration()
+    mutate(data)
+
+    found = problems(data)
+
+    assert any(expected in problem for problem in found), found

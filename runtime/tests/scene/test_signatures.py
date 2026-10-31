@@ -43,9 +43,10 @@ def game_at(width: int = 1280, height: int = 720, *, target: str | None = None) 
 
 
 def with_signatures(adapter: Adapter, *signatures: dict[str, Any]) -> Adapter:
-    """按 `adapter` 的 ROI 与画面另写签名。"""
+    """按 `adapter` 的 ROI 与画面另写签名；对白框引用原来的签名，一并去掉。"""
     data = adapter.model_dump(mode="python")
     data["signatures"] = list(signatures)
+    data["dialogue_boxes"] = []
     return Adapter.model_validate(data)
 
 
@@ -370,7 +371,13 @@ def test_uncalibrated_signatures_take_no_part(data_dir: Path) -> None:
     witch_trial = load_adapter(GAMES_DIR / "witch-trial")
     signature_judge = SignatureJudge.load(witch_trial, data_dir)
 
-    assert signature_judge.uncalibrated == ("dialogue", "choice", "trial", "bad-ending")
+    assert signature_judge.uncalibrated == (
+        "dialogue",
+        "dialogue-continue",
+        "choice",
+        "trial",
+        "bad-ending",
+    )
     assert signature_judge.problems == ()
     frame = ring_frame(game_at(2560, 1440))
     judgement = signature_judge.judge(frame, bgra_view(frame), None)

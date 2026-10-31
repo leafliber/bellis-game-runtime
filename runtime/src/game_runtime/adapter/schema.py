@@ -423,6 +423,33 @@ class Signature(_Model):
         return bool(self.anchors or self.pixels or self.texts)
 
 
+class DialogueBox(_Model):
+    """一个画面上的对白框：剧情记录只在这些画面上读文字。
+
+    引用的 ROI 与签名只须已声明，可以尚未标定；取用见 `Adapter.require_dialogue_boxes`。
+    """
+
+    screen: Ident
+    """对白框所在的画面；类型须为“对话”或以“对话”为 base 的扩展。"""
+    text: Ident
+    """对白文字的 ROI。"""
+    speaker: Ident | None = None
+    """名字栏的 ROI；没有名字栏的画面不写。"""
+    continue_signature: Ident | None = None
+    """继续标记的签名：指向同一画面，本帧命中即继续标记可见；游戏没有继续标记时不写。"""
+
+    @model_validator(mode="after")
+    def _distinct(self) -> Self:
+        if self.speaker == self.text:
+            raise ValueError("speaker 与 text 须是不同的 ROI")
+        return self
+
+    @property
+    def rois(self) -> tuple[str, ...]:
+        """引用的 ROI：名字栏（如有）与对白文字。"""
+        return (self.text,) if self.speaker is None else (self.speaker, self.text)
+
+
 class NoteSection(_Model):
     """planner 的一个笔记栏目；只是结构，不含从游戏派生的内容。"""
 
@@ -452,6 +479,7 @@ class Adapter(_Model):
     pacing: Pacing | None = None
     """没有即尚未设定。"""
     signatures: tuple[Signature, ...] = ()
+    dialogue_boxes: tuple[DialogueBox, ...] = ()
     notes: tuple[NoteSection, ...] = ()
 
     @model_validator(mode="after")
@@ -485,12 +513,45 @@ class Adapter(_Model):
                 yield f"{where}：没有声明 ROI {name}"
             elif roi.rect is None:
                 yield f"{where}：ROI {name} 尚未标定，不能引用"
+        yield from self._dialogue_box_problems()
+
+    def _dialogue_box_problems(self) -> Iterator[str]:
+        """对白框：画面是对话类，至多一项；引用的 ROI 与签名已声明（可以尚未标定）。"""
+        yield from _duplicates("dialogue_boxes", (box.screen for box in self.dialogue_boxes))
+        types = {screen.id: screen.type for screen in self.screens}
+        bases = {ext.name: ext.base.value for ext in self.screen_types}
+        signatures = {signature.id: signature for signature in self.signatures}
+        for index, box in enumerate(self.dialogue_boxes):
+            where = f"dialogue_boxes[{index}]"
+            screen_type = types.get(box.screen)
+            if (
+                screen_type is not None
+                and bases.get(screen_type, screen_type) != ScreenType.DIALOGUE
+            ):
+                yield (
+                    f"{where}.screen：画面 {box.screen} 的类型是 {screen_type}，"
+                    f"对白框只能在{ScreenType.DIALOGUE}类的画面上"
+                )
+            for field, name in (("speaker", box.speaker), ("text", box.text)):
+                if name is not None and name not in self.rois:
+                    yield f"{where}.{field}：没有声明 ROI {name}"
+            if box.continue_signature is not None:
+                signature = signatures.get(box.continue_signature)
+                if signature is None:
+                    yield f"{where}.continue_signature：没有声明签名 {box.continue_signature}"
+                elif signature.screen != box.screen:
+                    yield (
+                        f"{where}.continue_signature：签名 {signature.id} 指向画面 "
+                        f"{signature.screen}，不是对白框所在的 {box.screen}"
+                    )
 
     def _screen_refs(self) -> Iterator[tuple[str, str]]:
         for index, item in enumerate(self.language.fixed_texts):
             yield f"language.fixed_texts[{index}].screen", item.screen
         for index, signature in enumerate(self.signatures):
             yield f"signatures[{index}].screen", signature.screen
+        for index, box in enumerate(self.dialogue_boxes):
+            yield f"dialogue_boxes[{index}].screen", box.screen
 
     def _roi_refs(self) -> Iterator[tuple[str, str]]:
         for index, name in enumerate(self.whitelist.click_regions):
@@ -530,6 +591,35 @@ class Adapter(_Model):
         if not self.language.fixed_texts:
             raise NotCalibratedError(self.id, "语言核对的固定文字")
         return self.language.fixed_texts
+
+    def require_dialogue_boxes(self) -> tuple[DialogueBox, ...]:
+        """对白框。没有声明即 LookupError；任一对白框引用的 ROI 或继续标记的签名尚未标定即
+        NotCalibratedError，一次列出全部这样的项。"""
+        if not self.dialogue_boxes:
+            raise LookupError(f"适配包 {self.id} 没有声明对白框")
+        signatures = {signature.id: signature for signature in self.signatures}
+        items: list[str] = []
+        for box in self.dialogue_boxes:
+            for name in box.rois:
+                roi = self.rois[name]
+                if roi.rect is None:
+                    items.append(f"ROI {name}（{roi.title}）")
+            marker = box.continue_signature
+            if marker is not None and not signatures[marker].calibrated:
+                items.append(f"继续标记的签名 {marker}")
+        if items:
+            raise NotCalibratedError(self.id, f"对白框的{'、'.join(dict.fromkeys(items))}")
+        return self.dialogue_boxes
+
+    def generic_type(self, screen: str) -> ScreenType:
+        """画面 `screen` 的通用画面类型：映射到扩展时取扩展的 `base`。没有声明即 LookupError。"""
+        for item in self.screens:
+            if item.id == screen:
+                for ext in self.screen_types:
+                    if ext.name == item.type:
+                        return ext.base
+                return ScreenType(item.type)
+        raise LookupError(f"适配包 {self.id} 没有声明画面 {screen}")
 
     def uncalibrated(self) -> tuple[str, ...]:
         """尚未标定的项，给人读。"""

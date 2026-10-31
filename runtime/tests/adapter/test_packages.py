@@ -127,6 +127,27 @@ def test_synthetic_language_check_reads_the_title_menu_buttons(synthetic: Adapte
     ]
 
 
+def test_synthetic_dialogue_box_reads_the_name_and_the_line(synthetic: Adapter) -> None:
+    [box] = synthetic.require_dialogue_boxes()
+    assert (box.screen, box.speaker, box.text, box.continue_signature) == (
+        "dialogue",
+        "speaker",
+        "dialogue",
+        "dialogue-continue",
+    )
+    # 继续标记的签名是对话签名的像素检查加上继续标记里的一点，与对话同级、指向对话。
+    signatures = {signature.id: signature for signature in synthetic.signatures}
+    dialogue, marker = signatures["dialogue"], signatures["dialogue-continue"]
+    assert (marker.screen, marker.priority) == (dialogue.screen, dialogue.priority)
+    assert marker.pixels[: len(dialogue.pixels)] == dialogue.pixels
+    [point] = marker.pixels[len(dialogue.pixels) :]
+    for width, height in [(1280, 720), (2560, 1440), (640, 360)]:
+        triangle = Layout(width, height).continue_marker()
+        column, row = int(point.at.x * width), int(point.at.y * height)
+        assert triangle.left < column < triangle.right - 1
+        assert triangle.top < row < triangle.center[1]  # 三角形朝下，上半部分最宽
+
+
 def test_synthetic_whitelist_covers_the_inputs_the_game_handles(synthetic: Adapter) -> None:
     whitelist = synthetic.whitelist
 
@@ -193,6 +214,7 @@ def test_witch_trial_calibration_is_pending_without_guessed_coordinates(
         "ROI choices（选项）",
         "ROI trial-statement（审判发言区）",
         "签名 dialogue",
+        "签名 dialogue-continue",
         "签名 choice",
         "签名 trial",
         "签名 bad-ending",
@@ -205,3 +227,18 @@ def test_witch_trial_calibration_is_pending_without_guessed_coordinates(
         witch_trial.language_check()
     with pytest.raises(NotCalibratedError):
         witch_trial.require_pacing()
+
+
+def test_witch_trial_dialogue_box_is_declared_but_not_calibrated(witch_trial: Adapter) -> None:
+    [box] = witch_trial.dialogue_boxes
+    assert (box.screen, box.speaker, box.text, box.continue_signature) == (
+        "dialogue",
+        "speaker",
+        "dialogue",
+        "dialogue-continue",
+    )
+    with pytest.raises(NotCalibratedError) as caught:
+        witch_trial.require_dialogue_boxes()
+    assert caught.value.item == (
+        "对白框的ROI speaker（名字栏）、ROI dialogue（对白框）、继续标记的签名 dialogue-continue"
+    )
