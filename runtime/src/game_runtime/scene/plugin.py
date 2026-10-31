@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from game_runtime._threads import in_thread
 from game_runtime.adapter import GAME_ADAPTER
 from game_runtime.frame_ring import RingFrame
-from game_runtime.frames import FrameSource
+from game_runtime.frames import FrameBacklogError, FrameSource
 from game_runtime.kernel import (
     FRAMES_READ,
     Manifest,
@@ -192,6 +192,10 @@ async def _read_frames(
     while True:
         try:
             frame = await frames.next_frame(after)
+        except FrameBacklogError as error:
+            logger.error("%s 积压超限：%s", ctx.entry_id, error)
+            after = error.resume_after
+            continue
         except Exception as error:
             if not failing:
                 logger.warning("%s 读帧失败，%g 秒后重试：%s", ctx.entry_id, RETRY_INTERVAL, error)

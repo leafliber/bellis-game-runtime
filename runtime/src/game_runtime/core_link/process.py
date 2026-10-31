@@ -5,7 +5,8 @@
 - 一律以 `subprocess.Popen` 和参数列表直接启动，不经 shell，不脱离父进程；
   环境变量只有系统必需的与显式给出的。
 - stdin 是生命线：管道，不传数据；子进程读到 EOF 即释放后退出。
-- Windows 上子进程挂起创建，放进 Job Object 后才恢复运行（`_win32`）。
+- Windows 上子进程挂起创建，放进 Job Object 后才恢复运行（`_win32`）；它在自己的进程组里，
+  控制台的 Ctrl+C 只到主进程，由主进程按停止顺序停它。
 - 停止顺序：停止请求（RPC）→ 关 stdin → 超时强制终止，不依赖信号；停在哪一步记日志。
 """
 
@@ -162,7 +163,9 @@ class ManagedProcess:
         """启动子进程；可执行文件不存在等情况下抛 OSError。"""
         creationflags = 0
         if sys.platform == "win32":
-            creationflags = _win32.CREATE_SUSPENDED
+            # 新进程组里的进程不响应控制台的 Ctrl+C：按下时只有主进程收到，实时核由主进程按
+            # 停止顺序停下，不会被控制台直接终止而来不及释放输入。
+            creationflags = _win32.CREATE_SUSPENDED | subprocess.CREATE_NEW_PROCESS_GROUP
         popen = subprocess.Popen(
             list(argv),
             stdin=subprocess.PIPE,

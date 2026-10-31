@@ -1,20 +1,24 @@
 """普通插件 `voice-activity`：定期从 `ctx.audio` 读新块，逐块交给核心，提供 `voice-activity@1`。
 
-设计见 `docs/modules/perception.md` 的“配音检测”。
+设计见 `docs/modules/perception.md` 的“配音检测”。实时运行时外壳把块号之外喂入核心的事（从哪一块
+接着喂、按墙钟发现的中断）作为喂入标记发布，录制记下它们；回放时 `ctx.audio` 是录制的声音
+（`RecordedAudio`），外壳不读墙钟，按录下的标记在同样的位置喂入中断。
 """
 
 import asyncio
 import functools
 import logging
 import time
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Final, Protocol, Self
+from typing import Annotated, Final, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from game_runtime._threads import in_thread
-from game_runtime.audio_ring import AudioRead, AudioReader, AudioRingError
+from game_runtime.audio_ring import AudioBlock, AudioRead, AudioReader, AudioRingError
 from game_runtime.kernel import AUDIO_READ, Manifest, Plugin, PluginContext, ServiceToken, Tier
 from game_runtime.local_data import local_data_dir
 from game_runtime.voice_activity.detector import SpeechModel, VoiceActivityDetector
@@ -39,6 +43,52 @@ READ_WINDOW_NS: Final = 60 * 1_000_000_000
 type VoiceListener = Callable[[VoiceChange], None]
 
 
+@dataclass(frozen=True, slots=True)
+class FeedSkip:
+    """喂入的下一块不是上一块加一：外壳从 `next_block` 接着喂（启动后的第一块不是 1，或读得太慢、
+    其间的块已被覆盖）。"""
+
+    after: int
+    """此前喂入的最后一块的块号；还没有喂过为 0。"""
+    next_block: int
+
+
+@dataclass(frozen=True, slots=True)
+class FeedInterrupt:
+    """外壳在块之间喂入的中断：按墙钟发现的 `no-audio`、`stalled`，或检测出错的 `error`。"""
+
+    after: int
+    """此前喂入的最后一块的块号；还没有喂过为 0。"""
+    reason: UnknownReason
+    at_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class FeedEnd:
+    """记录喂入标记的一方停止记录时外壳喂到的位置；回放喂到这一块为止。外壳不发布它。"""
+
+    after: int
+
+
+type FeedMark = FeedSkip | FeedInterrupt | FeedEnd
+"""喂入核心的序列里块号之外的事，按发生的顺序。块本身按块号从录制里复现。"""
+
+type FeedListener = Callable[[FeedMark], None]
+
+
+@runtime_checkable
+class RecordedAudio(Protocol):
+    """回放的声音：录下的块与实时运行时外壳的喂入标记。`ctx.audio` 满足它时外壳按录制喂入。"""
+
+    async def next_blocks(self, after: int) -> AudioRead | None:
+        """块号大于 `after` 的下一批块，按块号从小到大；读完后返回 None。"""
+        ...
+
+    def voice_marks(self) -> Sequence[FeedMark]:
+        """实时运行时外壳发布的喂入标记，按发生的顺序，末尾可以有一个 `FeedEnd`。"""
+        ...
+
+
 class VoiceActivityService(Protocol):
     """`voice-activity@1`。"""
 
@@ -55,6 +105,16 @@ class VoiceActivityService(Protocol):
         """
         ...
 
+    @property
+    def fed_block(self) -> int:
+        """已喂入核心、变化已发布的最后一块的块号；还没有为 0。"""
+        ...
+
+    def subscribe_feed(self, listener: FeedListener) -> Callable[[], None]:
+        """监听者按发生的顺序收到每一个喂入标记（`FeedSkip`、`FeedInterrupt`），规则同 `subscribe`。
+        录制以此记下块号之外喂入核心的事，回放时在同样的位置喂入。"""
+        ...
+
 
 VOICE_ACTIVITY: Final = ServiceToken[VoiceActivityService]("voice-activity", 1)
 
@@ -65,22 +125,40 @@ class VoiceHub:
     def __init__(self, status: VoiceStatus = INITIAL_STATUS) -> None:
         self._status = status
         self._listeners: list[VoiceListener] = []
+        self._feed_listeners: list[FeedListener] = []
+        self._fed = 0
 
     @property
     def status(self) -> VoiceStatus:
         return self._status
 
+    @property
+    def fed_block(self) -> int:
+        return self._fed
+
     def subscribe(self, listener: VoiceListener) -> Callable[[], None]:
-        entry: list[VoiceListener] = [listener]
-        self._listeners.append(listener)
+        return _subscribe(self._listeners, listener)
 
-        def unsubscribe() -> None:
-            if entry:
-                self._listeners.remove(entry.pop())
+    def subscribe_feed(self, listener: FeedListener) -> Callable[[], None]:
+        return _subscribe(self._feed_listeners, listener)
 
-        return unsubscribe
-
-    def publish(self, changes: list[VoiceChange], status: VoiceStatus) -> None:
+    def publish(
+        self,
+        changes: list[VoiceChange],
+        status: VoiceStatus,
+        *,
+        marks: Sequence[FeedMark] = (),
+        fed: int | None = None,
+    ) -> None:
+        """先发布喂入标记，再发布变化；`fed` 是此后已喂入的最后一块。"""
+        for mark in marks:
+            for listener in list(self._feed_listeners):
+                try:
+                    listener(mark)
+                except Exception:
+                    logger.exception("voice-activity@1 的监听者处理喂入标记 %s 时出错", mark)
+        if fed is not None:
+            self._fed = fed
         self._status = status
         for change in changes:
             for listener in list(self._listeners):
@@ -90,11 +168,33 @@ class VoiceHub:
                     logger.exception("voice-activity@1 的监听者处理变化 %s 时出错", change)
 
 
+def _subscribe[T](listeners: list[T], listener: T) -> Callable[[], None]:
+    entry: list[T] = [listener]
+    listeners.append(listener)
+
+    def unsubscribe() -> None:
+        if entry:
+            listeners.remove(entry.pop())
+
+    return unsubscribe
+
+
+@dataclass(frozen=True, slots=True)
+class _Fed:
+    """喂入一次的结果：变化、此后的状态、喂入标记与此后已喂入的最后一块。"""
+
+    changes: list[VoiceChange]
+    status: VoiceStatus
+    marks: list[FeedMark]
+    fed: int
+
+
 class VoiceRunner:
-    """外壳：每隔 `poll_interval` 秒读一次音频环，把新块逐块交给核心，发布状态与变化。
+    """外壳：每隔 `poll_interval` 秒读一次音频环，把新块逐块交给核心，发布状态、变化与喂入标记。
 
     读音频环在事件循环里（只拷新块，很快；音频环在同一线程上销毁，读与销毁不会并发）；核心在工作
     线程里运行，被取消时先等在途的工作做完。墙钟只用来发现块号不前进，`now_ns` 与采集时刻同一时钟。
+    `reader` 是录制的声音（`RecordedAudio`）时不读墙钟，按录下的块与喂入标记喂入，读完即结束。
     """
 
     def __init__(
@@ -117,21 +217,30 @@ class VoiceRunner:
         self._stall_ns = round(stall_timeout * 1e9)
         self._now = now_ns
         self._name = name
+        self._fed = 0
+        """已喂入核心的最后一块的块号，换了音频环也不归零。"""
 
     async def run(self) -> None:
-        """一直运行到被取消。出错时记录，状态转为未知（`error`）并停止检测。"""
+        """一直运行到被取消；按录制喂入时读完即结束。出错时记录，状态转为未知（`error`）并停止检测。"""
+        recorded = isinstance(self._reader, RecordedAudio)
         try:
-            await self._loop()
+            if isinstance(self._reader, RecordedAudio):
+                await self._recorded(self._reader)
+            else:
+                await self._loop()
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("%s 检测出错，停止检测", self._name)
-            changes = self._detector.interrupt(UnknownReason.ERROR, self._now())
-            self._hub.publish(changes, self._detector.status)
+            # 按录制喂入时没有“现在”：出错的时刻取已处理到的声音。
+            at = (self._detector.status.processed_ns or 0) if recorded else self._now()
+            changes = self._detector.interrupt(UnknownReason.ERROR, at)
+            mark = FeedInterrupt(self._fed, UnknownReason.ERROR, at)
+            self._hub.publish(changes, self._detector.status, marks=[mark])
 
     async def _loop(self) -> None:
         after = 0
-        """已交给核心的最大块号。"""
+        """已从这个音频环读到的最大块号。"""
         reference = self._now()
         """块号不前进从这一刻算起：最新一块的末尾，还没有块时为开始等的时刻。"""
         failing = False
@@ -162,35 +271,94 @@ class VoiceRunner:
                 after = read.blocks[-1].block_number
                 last = read.blocks[-1]
                 reference = last.capture_ns + read.duration_ns(last.sample_count)
-                await self._apply(functools.partial(self._feed, read))
+                await self._feed_blocks(read.blocks, read.sample_rate, read.channels)
             elif now - reference > self._stall_ns and (
                 self._hub.status.reason is not UnknownReason.STALLED
             ):
                 await self._interrupt(UnknownReason.STALLED, now)
             await asyncio.sleep(self._poll_interval)
 
+    async def _recorded(self, source: RecordedAudio) -> None:
+        """按录制喂入：块按块号顺序；每个喂入标记在它记下的位置上处理——跳过的块不喂，中断照原样
+        喂入，到 `FeedEnd` 或 `error` 中断为止。读完录下的块即结束。"""
+        marks = deque(source.voice_marks())
+        after = 0
+        stopped = False
+        while (read := await source.next_blocks(after)) is not None:
+            batch: list[AudioBlock] = []
+            for block in read.blocks:
+                after = block.block_number
+                if stopped:
+                    continue
+                take = True
+                while marks and marks[0].after <= (batch[-1].block_number if batch else self._fed):
+                    mark = marks[0]
+                    if isinstance(mark, FeedSkip):
+                        if block.block_number < mark.next_block:
+                            take = False
+                        else:
+                            marks.popleft()
+                        break
+                    await self._feed_blocks(batch, read.sample_rate, read.channels)
+                    batch = []
+                    marks.popleft()
+                    if isinstance(mark, FeedEnd):
+                        stopped, take = True, False
+                        break
+                    await self._interrupt(mark.reason, mark.at_ns)
+                    if mark.reason is UnknownReason.ERROR:
+                        stopped, take = True, False
+                        break
+                if take:
+                    batch.append(block)
+            await self._feed_blocks(batch, read.sample_rate, read.channels)
+        while not stopped and marks and marks[0].after <= self._fed:
+            mark = marks.popleft()
+            if isinstance(mark, FeedEnd):
+                break
+            if isinstance(mark, FeedInterrupt):
+                await self._interrupt(mark.reason, mark.at_ns)
+
     def _replaced(self, after: int) -> bool:
         """没有新块时看一眼最新一块：块号比已读的小即换了音频环，要从头读。"""
         latest = self._reader.read_recent(0)
         return latest is not None and bool(latest.blocks) and latest.blocks[-1].block_number < after
 
-    def _feed(self, read: AudioRead) -> tuple[list[VoiceChange], VoiceStatus]:
-        changes: list[VoiceChange] = []
-        for block in read.blocks:
-            changes.extend(
-                self._detector.feed(block, sample_rate=read.sample_rate, channels=read.channels)
-            )
-        return changes, self._detector.status
+    async def _feed_blocks(
+        self, blocks: Sequence[AudioBlock], sample_rate: int, channels: int
+    ) -> None:
+        if not blocks:
+            return
+        fed = self._fed
 
-    async def _interrupt(self, reason: UnknownReason, at_ns: int) -> None:
-        def work() -> tuple[list[VoiceChange], VoiceStatus]:
-            return self._detector.interrupt(reason, at_ns), self._detector.status
+        def work() -> _Fed:
+            changes: list[VoiceChange] = []
+            marks: list[FeedMark] = []
+            last = fed
+            for block in blocks:
+                if block.block_number != last + 1:
+                    marks.append(FeedSkip(last, block.block_number))
+                changes.extend(
+                    self._detector.feed(block, sample_rate=sample_rate, channels=channels)
+                )
+                last = block.block_number
+            return _Fed(changes, self._detector.status, marks, last)
 
         await self._apply(work)
 
-    async def _apply(self, work: Callable[[], tuple[list[VoiceChange], VoiceStatus]]) -> None:
-        changes, status = await in_thread(work)
-        self._hub.publish(changes, status)
+    async def _interrupt(self, reason: UnknownReason, at_ns: int) -> None:
+        fed = self._fed
+
+        def work() -> _Fed:
+            changes = self._detector.interrupt(reason, at_ns)
+            return _Fed(changes, self._detector.status, [FeedInterrupt(fed, reason, at_ns)], fed)
+
+        await self._apply(work)
+
+    async def _apply(self, work: Callable[[], _Fed]) -> None:
+        result = await in_thread(work)
+        self._fed = result.fed
+        self._hub.publish(result.changes, result.status, marks=result.marks, fed=result.fed)
 
 
 type _Probability = Annotated[float, Field(gt=0.0, le=1.0)]

@@ -1,5 +1,5 @@
 """`scene@1` 经帧环与真实实时核的联调：合成游戏的帧写进假显示面，实时核的假采集源取帧写进帧环，
-`RingFrameSource` 读出交给内核里的 `scene@1`，判别结果与真值一致。
+定序帧源 `SequencedFrameSource` 接纳后交给内核里的 `scene@1`，判别结果与真值一致。
 
 Windows 上跑命名文件映射，Linux 容器里跑 POSIX 共享内存。只用内存帧源的测试见
 `runtime/tests/scene/test_plugin.py`。
@@ -15,7 +15,7 @@ from core_protocol import models
 from game_runtime.adapter import GameAdapterPlugin
 from game_runtime.core_link import CaptureConfig, CoreLink, CoreLinkOptions, shutdown_runtime
 from game_runtime.frame_ring.fake import FakeDisplay
-from game_runtime.frames import RingFrameSource
+from game_runtime.frames import AdmissionPolicy, SequencedFrameSource
 from game_runtime.kernel import (
     FRAMES_READ,
     ControlGrant,
@@ -118,11 +118,14 @@ def test_scene_judges_synthetic_frames_that_came_through_the_core(
             await link.start()
             ring = link.frames
             assert ring is not None
+            # 每一帧都接纳：读帧不限速，内容不变的帧也不等。
+            frames = SequencedFrameSource(ring, policy=AdmissionPolicy(1000.0, 0.0))
             kernel = Kernel(
                 catalog=catalog(GameAdapterPlugin, ScenePlugin, Probe),
                 core=NotAProducer(),
-                frames=RingFrameSource(ring),
+                frames=frames,
             )
+            frames.start()
             try:
                 kernel.add(
                     [
@@ -178,7 +181,9 @@ def test_scene_judges_synthetic_frames_that_came_through_the_core(
                 assert still.state.stability is Stability.STABLE
                 assert still.state.frame_number > dialogue.state.frame_number
             finally:
+                await frames.close()
                 await shutdown_runtime(kernel, link)
             assert link.frames is None
+            assert frames.failure is None
 
     asyncio.run(main())

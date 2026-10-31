@@ -1,22 +1,20 @@
-"""帧源：读画面的插件取帧的统一接口，实时运行读帧环，测试用内存帧源，回放另有实现。
+"""帧源：读画面的插件取帧的统一接口。实时运行是定序帧源（`game_runtime.frames.sequenced`），
+测试用内存帧源，回放是录制的回放帧源（`game_runtime.recording.replay`）。
 
 设计见 `docs/modules/perception.md` 的“取帧”。帧沿用帧环的 `RingFrame`。
 """
 
 import asyncio
 import bisect
-from typing import Final, Protocol
+from typing import Protocol
 
-from game_runtime._threads import in_thread
-from game_runtime.frame_ring import FrameRing, FrameRingError, FrameRingTornError, RingFrame
+from game_runtime.frame_ring import RingFrame
 from game_runtime.frame_ring.ring import BYTES_PER_PIXEL
-
-DEFAULT_POLL_INTERVAL: Final = 0.005
-"""实时帧源查看最新帧号的间隔（秒）。"""
 
 
 class FrameSource(Protocol):
-    """帧源。帧源不记读者的进度，每个读者自己记下读到的帧号。"""
+    """帧源：给出一个确定的帧序列，每个读者按顺序逐帧读到，不跳过。帧源不记读者的进度，每个读者
+    自己记下读到的帧号。"""
 
     async def next_frame(self, after: int) -> RingFrame | None:
         """等到帧号大于 `after` 的一帧并返回；帧源结束后返回 None。"""
@@ -35,47 +33,6 @@ def check_frame(frame: RingFrame) -> None:
         raise ValueError(
             f"像素只有 {len(frame.pixels)} 字节，少于 {frame.row_stride} × {frame.height}"
         )
-
-
-class RingFrameSource:
-    """实时帧源：读主进程的帧环，总给出最新的一帧，读者处理不过来时跳过中间的帧。
-
-    帧环归 `CoreLink` 所有；内核运行期间帧环不关闭（主进程先停内核再停实时核）。帧环关闭后
-    `next_frame` 抛 `FrameRingError`。
-    """
-
-    def __init__(self, ring: FrameRing, *, poll_interval: float = DEFAULT_POLL_INTERVAL) -> None:
-        if not poll_interval > 0:
-            raise ValueError(f"poll_interval 须为正数：{poll_interval}")
-        self._ring = ring
-        self._poll_interval = poll_interval
-
-    async def next_frame(self, after: int) -> RingFrame | None:
-        """每隔 `poll_interval` 看一次最新帧号，有新帧时在工作线程里拷出最新一帧。
-
-        每次尝试都读到撕裂的帧时稍后再读。实时帧源不会结束，从不返回 None。
-        """
-        while True:
-            if self._ring.latest_frame_number() > after:
-                frame = await in_thread(self._read)
-                if isinstance(frame, FrameRingError):
-                    raise frame
-                if frame is not None and frame.frame_number > after:
-                    return frame
-            await asyncio.sleep(self._poll_interval)
-
-    def _read(self) -> RingFrame | FrameRingError | None:
-        """在工作线程里读最新一帧；撕裂时为 None。
-
-        错误不带工作线程里的调用栈交回：栈帧里有映射上的 ctypes 视图，异常若经线程池的 future
-        交回，引用环要等垃圾回收才释放，在那之前帧环关不掉。
-        """
-        try:
-            return self._ring.read_latest()
-        except FrameRingTornError:
-            return None
-        except FrameRingError as error:
-            return error.with_traceback(None)
 
 
 class MemoryFrameSource:

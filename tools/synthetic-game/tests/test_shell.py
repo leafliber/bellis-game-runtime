@@ -72,11 +72,19 @@ def test_command_line_sets_the_configuration() -> None:
             *("--choice-seconds", "3", "--redraw-hz", "60"),
         ]
     ) == ShellOptions(GameConfig(800, 600, 12.0, 3.0), 60.0)
+    assert parse_args(["--autoplay", "1.5"]) == ShellOptions(GameConfig(), 30.0, 1.5)
 
 
 @pytest.mark.parametrize(
     "argv",
-    [["--width", "10"], ["--redraw-hz", "0"], ["--redraw-hz", "1001"], ["--redraw-hz", "nan"]],
+    [
+        ["--width", "10"],
+        ["--redraw-hz", "0"],
+        ["--redraw-hz", "1001"],
+        ["--redraw-hz", "nan"],
+        ["--autoplay", "0"],
+        ["--autoplay", "nan"],
+    ],
 )
 def test_invalid_command_line_is_rejected(argv: list[str]) -> None:
     with pytest.raises(SystemExit):
