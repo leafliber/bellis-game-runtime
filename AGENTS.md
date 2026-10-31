@@ -21,6 +21,8 @@
 | 只跑实时核的启动、生命线、心跳、采集主循环、音频主循环与动作块测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link` |
 | 只跑音频环的布局核对、读写与 Python–Rust 互通测试 | `uv run pytest runtime/tests/audio_ring protocol/tests/test_ring_layouts.py` |
 | 只跑动作块、假输入后端与失效释放的联调测试，并打印假后端上的释放时延 | `uv run pytest runtime/tests/core_link/test_actions.py -s` |
+| 只跑取帧接口与 `scene@1`（变化与稳定、画面签名、模板文件、合成游戏全部画面的判别、插件在内核中）的测试 | `uv run pytest runtime/tests/frames runtime/tests/scene` |
+| 只跑 `scene@1` 经假显示面、实时核与帧环的联调测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link/test_scene.py` |
 | 格式化 | `uv run ruff format`；`cargo fmt --all` |
 | 改了 `core/crates/core-protocol` 后重新生成 `protocol/` 的生成物 | `uv run generate` |
 | 给某个 Python 包加依赖 | `uv add --package <发行名> <依赖>` |

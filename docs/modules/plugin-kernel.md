@@ -27,13 +27,13 @@
 | `version` | 1–32 字符 | 插件版本，只用于显示与日志 |
 | `tier` | `critical` 或 `ordinary` | 关键平面或普通插件，分级见[总体架构](../architecture.md#分层)；申请 `control.submit` 的必须是 `critical` |
 | `provides` | `名字@主版本` 的列表，名字不重复，缺省为空 | 激活时必须提供的服务；激活结束时缺任何一项即激活失败 |
-| `inject` | `名字@主版本` 的列表，名字不重复，缺省为空 | 必需依赖；任何一项不可用即停在 WAITING |
+| `inject` | `名字@主版本` 的列表，末尾加 `?` 为可选依赖，名字不重复，缺省为空 | 依赖：必需的任何一项不可用即停在 WAITING；可选的不阻塞激活，用到时以 `ctx.optional` 探测 |
 | `permissions` | 权限的列表，不重复，缺省为空 | 申请的权限，见[权限](#权限) |
 | `config` | Pydantic 模型类，缺省为只接受空对象的 `NoConfig` | 配置的 Schema：profile 给的配置先按模型的缺省值补齐缺项，再校验；不合法即停在 FAILED，不重试。模型宜设 `extra="forbid"`，让拼错的字段直接报错 |
 
 ## 服务
 
-服务目录按 `名字@主版本` 匹配：同一个名字同一时刻只有一个提供方；名字不在即缺少服务，主版本不同即主版本不兼容，两者都使依赖方停在 WAITING 并说明原因。插件在激活期间提供的服务激活成功后才发布，所以插件不能用自己提供的服务满足自己的依赖。代码里用带类型的 `ServiceToken[T](名字, 主版本)` 取得与提供服务。
+服务目录按 `名字@主版本` 匹配：同一个名字同一时刻只有一个提供方；名字不在即缺少服务，主版本不同即主版本不兼容，两者都使必需依赖它的条目停在 WAITING 并说明原因。可选依赖只在探测的那一刻取用：提供方停用时依赖方不随之停用，下次探测得到 None；依赖方调用已在停用的提供方时由提供方报错，依赖方按不可用处理。插件在激活期间提供的服务激活成功后才发布，所以插件不能用自己提供的服务满足自己的依赖。代码里用带类型的 `ServiceToken[T](名字, 主版本)` 取得与提供服务。
 
 当前定义的服务：
 
@@ -52,13 +52,15 @@
 
 | 接口 | 规则 |
 | --- | --- |
-| `ctx.service(token)` | 取得 `inject` 中声明的服务；未声明或不可用即抛 `LookupError` |
+| `ctx.service(token)` | 取得 `inject` 中声明的必需服务；未声明、声明为可选或不可用即抛 `LookupError` |
+| `ctx.optional(token)` | 探测 `inject` 中声明为可选的服务：此刻已发布且主版本相符即返回实现，否则为 None；未声明为可选即抛 `LookupError`。每次用到时探测，不留住返回的实现 |
 | `ctx.provide(token, impl)` | 提供 `provides` 中声明的服务；只能在激活期间调用，同一服务只能提供一次 |
 | `ctx.register(disposer)` | 登记一项副作用的撤销函数，同步函数或返回可等待对象的函数均可 |
 | `ctx.config` | 补齐缺省值并校验过的配置 |
 | `ctx.permissions` | 已授予的权限，即清单申请的权限 |
 | `ctx.control` | 控制产出者的提交资格，见[控制产出者](#控制产出者)；其它插件为 None |
 | `ctx.audio` | 读音频环的接口 `AudioReader`（`read_recent`，见[音频环的挂接与读取](core-protocol.md#音频环的读写规则)）。清单没有申请 `audio.read` 即抛 `PermissionError`；宿主没有给出时抛 `LookupError`。宿主构造内核时以 `Kernel(audio=link.audio_reader)` 给出 |
+| `ctx.frames` | 帧源 `FrameSource`（`next_frame`，见[取帧](perception.md#取帧)）。清单没有申请 `frames.read` 即抛 `PermissionError`；宿主没有给出时抛 `LookupError`。宿主构造内核时以 `Kernel(frames=…)` 给出：实时运行是帧环上的 `RingFrameSource(link.frames)`，测试是内存帧源，回放是回放的帧源 |
 | `Plugin.quiesce(ctx)` | 插件可覆盖：进入 QUIESCING 时调用，停止新工作、取消在途任务 |
 
 - 一切副作用（任务、定时器、连接、子进程）都经 `ctx.register` 登记。发布的服务由内核登记在最后，停用时最先撤回。
@@ -69,7 +71,7 @@
 
 | 权限 | 含义 |
 | --- | --- |
-| `frames.read` | 读帧环 |
+| `frames.read` | 读帧环（`ctx.frames`） |
 | `audio.read` | 读音频环（`ctx.audio`） |
 | `narrative.write` | 写剧情记录 |
 | `control.submit` | 向实时核提交动作块，只授予当前控制产出者 |
@@ -91,7 +93,7 @@
 | DISPOSED | 已卸载：条目被停用，保留条目，不加载实例 | 启用即 WAITING，重试计数清零 |
 | FAILED | 激活失败 | 退避到时回 WAITING 再试；重试用尽或配置不合法时停在这里，操作员停用再启用才重来 |
 
-- 全部状态变化都在一个串行的调和任务里进行，每一轮先续完已收到确认的 QUIESCING，再按 profile 逆序停用，最后按 profile 顺序激活。依赖某个提供方服务的条目先于提供方停用；它还在 QUIESCING 时提供方保持 ACTIVE 并说明原因，等它完成再停。
+- 全部状态变化都在一个串行的调和任务里进行，每一轮先续完已收到确认的 QUIESCING，再按 profile 逆序停用，最后按 profile 顺序激活。必需依赖某个提供方服务的条目先于提供方停用，可选依赖不影响停用的顺序；它还在 QUIESCING 时提供方保持 ACTIVE 并说明原因，等它完成再停。
 - 操作员与宿主的接口是 `add`（加入 profile 展开后的条目）、`enable`、`disable`、`set_control_producer`、`settled`（等调和结束）与 `shutdown`（停止内核，见下文），插件拿不到。
 - 状态或原因每次变化都经 `on_transition` 通知宿主，`status` 与 `snapshot` 给出当前的状态与原因，健康上报以此为来源。
 
@@ -183,8 +185,8 @@ profile 与 patch 是 JSON 文件，格式同 Bellis（`packages/protocol` 的 `
 
 | Bellis | 本仓库 | 差异 |
 | --- | --- | --- |
-| 清单 `PluginManifest`（TypeBox） | `Manifest`（Pydantic） | 没有 `process`，因为不做 sidecar；`inject` 不支持可选依赖（`名字@主版本?`）；`config` 是 Pydantic 模型类，不是 JSON Schema |
-| `definePlugin` 的 `activate`、`quiesce` | `Plugin` 子类的同名方法 | 上下文没有 `on`、`extensions`、`optional`、`fail`、`signal`、`forced`、`log`；多了 `control` |
+| 清单 `PluginManifest`（TypeBox） | `Manifest`（Pydantic） | 没有 `process`，因为不做 sidecar；`config` 是 Pydantic 模型类，不是 JSON Schema |
+| `definePlugin` 的 `activate`、`quiesce` | `Plugin` 子类的同名方法 | 上下文没有 `on`、`extensions`、`fail`、`signal`、`forced`、`log`；多了 `control`、`audio` 与 `frames` |
 | 状态 | 同名的七个状态 | 无 |
 | 静止中：吊销执行许可 → 插件收尾并等待物理确认 → 撤销；超时即强制撤销，记 `unknown` 并告警，关键平面急停 | 控制产出者：提交资格失效 → 请求作废代次（插件同时收尾）→ 等确认 → 撤销 | 物理确认由内核向实时核取得，不靠插件的 `quiesce`；超时不强制撤销，保持 QUIESCING 并继续等，输入由实时核按失效规则释放 |
 | 与安全核的接缝 `KernelSafetyHooks` | `CoreControl` | 作废代次与等确认两项，另有经提交资格交给控制产出者的 `submit`；没有维护态，因为不做热替换 |

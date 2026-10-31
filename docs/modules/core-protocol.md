@@ -432,7 +432,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - **配置**：`CoreLinkOptions.capture` 是 `CaptureConfig`（`core_link/capture.py`）：`target` 为 `WindowRule`（`process_name` 加 `window_class` 或 `title`，都不能为空串）或只用于测试的假显示面（`FakeDisplay.target`）；另有帧环的最大尺寸（缺省 1920×1080）与槽数（缺省 3）。窗口比帧环大时帧写不进帧环，实时核记录错误。没有配置时不建帧环，也不设定采集目标。
 - **顺序**：第一次 `start` 创建帧环；每个实例收到 `core_start` 之后先发 `frame_ring.attach`，再发 `capture.set_target`，然后才开始发心跳。任一请求被拒绝即按停止顺序终止该实例，`start` 报 `CoreStartError`，帧环保留到 `stop`。
 - **单写方**：`CoreLink` 同一时刻只有一个实例，上一个实例的进程退出之后才能再 `start`，所以挂接新实例时旧的写方已不在。实时核崩溃或被杀时帧环保留，重启后挂接同一个帧环，帧号续写。
-- **读帧**：宿主代码经 `CoreLink.frames` 读帧、算帧龄；帧环归 `CoreLink` 所有，宿主不关闭它。插件经服务读帧等用到时再做。
+- **读帧**：宿主代码经 `CoreLink.frames` 读帧、算帧龄；帧环归 `CoreLink` 所有，宿主不关闭它。插件经帧源读帧（[取帧](perception.md#取帧)）。
 - **销毁**：`stop` 在实时核退出后销毁帧环，强制终止后仍未确认退出时保留。
 
 #### 内存序与平台假设
