@@ -6,12 +6,16 @@ from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel
 
+from game_runtime.audio_ring import AudioReader
 from game_runtime.kernel.control import ControlGrant
 from game_runtime.kernel.manifest import Manifest, parse_ref
 from game_runtime.kernel.service import ServiceRegistry, ServiceToken
 
 type Disposer = Callable[[], Awaitable[None] | None]
 """撤销函数：撤回一项副作用。可以是同步函数，也可以返回可等待对象。"""
+
+AUDIO_READ = "audio.read"
+"""读音频环的权限：插件经 `PluginContext.audio` 读。"""
 
 
 class Registrations:
@@ -47,6 +51,7 @@ class PluginContext[C: BaseModel]:
         control: ControlGrant | None,
         registry: ServiceRegistry,
         registrations: Registrations,
+        audio: AudioReader | None = None,
     ) -> None:
         self.entry_id = entry_id
         """profile 条目 id。"""
@@ -62,6 +67,20 @@ class PluginContext[C: BaseModel]:
         self._provides = frozenset(parse_ref(ref) for ref in manifest.provides)
         self._registry = registry
         self._registrations = registrations
+        self._audio = audio
+
+    @property
+    def audio(self) -> AudioReader:
+        """读音频环的接口（`read_recent`），见 `docs/modules/core-protocol.md` 的“音频环”。
+
+        清单没有申请 `audio.read` 时抛 `PermissionError`；宿主没有给出音频时抛 `LookupError`。
+        """
+        self._alive()
+        if AUDIO_READ not in self.permissions:
+            raise PermissionError(f"{self.entry_id} 没有申请权限 {AUDIO_READ}")
+        if self._audio is None:
+            raise LookupError("宿主没有给出音频")
+        return self._audio
 
     def service[T](self, token: ServiceToken[T]) -> T:
         """取得清单 `inject` 中声明的服务。"""

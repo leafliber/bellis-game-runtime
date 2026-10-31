@@ -16,6 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, JsonValue, ValidationError
 
+from game_runtime.audio_ring import AudioReader
 from game_runtime.kernel.clock import Clock, MonotonicClock, finished_within, run_with_deadline
 from game_runtime.kernel.control import CONTROL_SUBMIT, ControlGrant, CoreControl
 from game_runtime.kernel.manifest import Manifest, parse_ref
@@ -102,12 +103,16 @@ class Kernel:
         clock: Clock | None = None,
         options: KernelOptions | None = None,
         on_transition: Callable[[Transition], None] | None = None,
+        audio: AudioReader | None = None,
     ) -> None:
+        """`audio` 是交给申请了 `audio.read` 的插件的读音频接口（`PluginContext.audio`），
+        通常是 `CoreLink.audio_reader`；不给时插件读音频抛 `LookupError`。"""
         self._catalog = catalog
         self._core = core
         self._clock = clock or MonotonicClock()
         self._options = options or KernelOptions()
         self._on_transition = on_transition
+        self._audio = audio
         self._registry = ServiceRegistry()
         self._entries: dict[str, _Entry] = {}
         self._producer: str | None = None
@@ -365,6 +370,7 @@ class Kernel:
             control=grant,
             registry=self._registry,
             registrations=registrations,
+            audio=self._audio,
         )
         self._set(entry, State.LOADING, ())
         try:
