@@ -24,7 +24,7 @@ Game Runtime 为 Bellis 提供游戏能力：采集画面与声音、读懂画�
 | 动作块 | 控制产出者交给实时核的一段带时间戳的动作，附基准帧与有效截止时刻 |
 | 输入许可 | Bellis 安全核授予的 `game.input` 执行许可（Bellis D-31、D-34） |
 | 游戏适配包 | 针对一款游戏的适配：必需的窗口识别、动作白名单、合规声明、期望分辨率与语言版本，以及可选的快路径（GD-04、GR-16） |
-| 本地数据目录 | 版本库外、只在本机的目录，存放从游戏派生的数据与运行数据 |
+| 本地数据目录 | 版本库外、只在本机的目录，存放从游戏派生的数据、模型制品与运行数据；Windows 上缺省为 `%LOCALAPPDATA%\BellisGameRuntime`，其它平台为 `$XDG_DATA_HOME/bellis-game-runtime`（未设时为 `~/.local/share/bellis-game-runtime`），环境变量 `BELLIS_GAME_RUNTIME_DATA` 可改到别处 |
 
 阶段编号 G0–G3 见[路线图](plan/roadmap.md)。Bellis 的游戏控制分层也用 G0–G4 编号，本仓库提到这些层时只写层名，不用编号。
 
