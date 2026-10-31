@@ -48,10 +48,16 @@
 | GS-04：渲染合成游戏的样本与真值，用来验证评测工具 | `uv run gs04 synth <目录>` |
 | GS-04：评测一个样本目录，报告写入 `reports/gs04/`（引擎 `ppocrv5-mobile`、`ppocrv5-server`） | `uv run gs04 eval <样本目录> --engine <引擎>` |
 | GS-04：以 Windows 自带 OCR 作对照基线（只在 Windows 上） | `uv run --extra windows-ocr gs04 eval <样本目录> --engine windows` |
+| 只跑配音检测的测试（状态与迟滞、预处理、核心、插件在内核中；本地数据目录里没有模型时真实推理的那部分跳过） | `uv run pytest runtime/tests/voice_activity` |
+| 只跑 `voice-activity@1` 经假音频源、实时核与音频环的联调测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link/test_voice_activity.py` |
+| 用本地数据目录里的真实模型跑语音检测的测试（模型不在时跳过并写明原因；SAPI 合成的语音只在 Windows 上） | `uv run pytest -m vad_model` |
+| GS-06：用 Windows 自带的语音合成与合成的背景生成自测样本（只在 Windows 上，见[GS-06 的评测](docs/modules/perception.md#gs-06-的评测)） | `uv run gs06 synth <目录>` |
+| GS-06：打印纯配音录音按能量得出的配音段 | `uv run gs06 truth <纯配音.wav>` |
+| GS-06：评测一组录音，报告写入 `reports/gs06/`（背景可给多段；负的增益写成 `--gains=-12,-6,0,6`） | `uv run gs06 eval --voice <纯配音.wav> --background <名字>=<背景.wav> --mix <正常混音.wav>` |
 
 探测程序另有 `--class <类名>`、`--keep-border`（保留黄色边框作对照）、`--min-update-interval-ms <N>`（会话的最小帧间隔）、`--borderless` 与 `--dpi-unaware`（图案窗口的样式）；`--help` 列出全部选项。
 
-pytest 缺省不选标 `manual` 的真机手动测试，命令行写 `-m manual` 才运行。标 `ocr_model` 的测试缺省也运行，本地数据目录里没有模型时跳过，所以没有模型的环境（如 Linux 容器）里 `uv run check` 照样通过。
+pytest 缺省不选标 `manual` 的真机手动测试，命令行写 `-m manual` 才运行。标 `ocr_model`、`vad_model` 的测试缺省也运行，本地数据目录里没有模型时跳过，所以没有模型的环境（如 Linux 容器）里 `uv run check` 照样通过。
 GS-03 的每一步在哪种终端里执行什么，由 `uv run gs03 <子命令>` 自己打印；需要管理员权限的动作（注册计划任务、把程序放进管理员目录）只打印命令，由维护者在管理员终端里执行，探针不提权。结果报告写入不入库的 `reports/gs03/`。
 
 `uv run check --linux` 首次运行要构建镜像。容器不写回仓库：虚拟环境、cargo target 与工具缓存放在每个检出目录各自的 `bellis-game-runtime-check-work-<路径摘要>` 卷里，uv 与 cargo 的下载缓存放在共用的 `bellis-game-runtime-check-uv-cache`、`bellis-game-runtime-check-cargo-registry` 卷里。这些卷都只是缓存，删掉只会让下次检查重新下载与编译；工作树删掉后它的卷会留下，用 `docker volume ls --filter name=bellis-game-runtime-check` 列出后 `docker volume rm` 清理。
