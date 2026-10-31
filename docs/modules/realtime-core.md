@@ -34,7 +34,7 @@ Rust 写的独立进程，是游戏侧的安全核：采集画面与声音，并
 3. 环境变量按 Bellis 的 `baseEnvironment` 只取系统必需的（Windows 的 `SYSTEMROOT`、`PATH` 等，POSIX 的 `HOME`、`PATH` 等），其余不继承；凭据按 Bellis 的 `ChildEnv` 放在 `BELLIS_CHANNEL_PATH`（地址）、`BELLIS_CHANNEL_KEY`（base64url 密钥）与 `BELLIS_ROLE`（角色，固定为 `game-runtime.core`）里。时限经命令行参数 `--heartbeat-timeout-ms`、`--health-interval-ms`、`--max-frame-age-ms` 给出。只用于测试：`CoreLinkOptions.test_device` 给出时另加 `--input-backend fake`，测试设备的地址与密钥放在 `GAME_RUNTIME_TEST_DEVICE_PATH`、`GAME_RUNTIME_TEST_DEVICE_KEY` 里（[测试设备连接](core-protocol.md#测试设备连接)）。
 4. Windows 上以 `CREATE_SUSPENDED` 创建，放进 Job Object 并交出 job 句柄之后才恢复运行，见下文。
 5. 实时核连上后发 `core.hello`；主进程只接受角色为 `game-runtime.core` 的第一个连接，核对协议版本，不相等即以 -32001 回错并断开。收到 `input.released(core_start)` 才算就绪。从拉起到就绪超过 `start_timeout` 或实例在就绪前退出，即按停止顺序终止它并报 `CoreStartError`。
-6. 配置了采集（`CoreLinkOptions.capture`）时先挂接帧环、再设定采集目标，被拒绝即按停止顺序终止它并报 `CoreStartError`（[帧环的挂接](core-protocol.md#读写规则)）。之后开始发心跳。
+6. 配置了采集（`CoreLinkOptions.capture`）时先挂接帧环、再设定采集目标；配置了音频（`CoreLinkOptions.audio`）时接着挂接音频环、设定音频目标；任一被拒绝即按停止顺序终止它并报 `CoreStartError`（[帧环的挂接](core-protocol.md#读写规则)、[音频环的挂接](core-protocol.md#音频环的读写规则)）。之后开始发心跳。
 
 实例退出后宿主可以再 `start`，即重启。自动重启按 GR-35，G2 接真实输入之前实现，现在 unsupported：
 
@@ -68,7 +68,7 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 | 2. 关 stdin | 关闭 stdin 管道 | 2 秒 | 读到 EOF，释放后以 0 退出 |
 | 3. 强制终止 | Windows 上 `TerminateJobObject`，其它平台 `SIGKILL` | 5 秒，只作上报的界限 | 被终止，不释放 |
 
-第 1、2 步的时限取 Bellis `ManagedProcess` 的缺省值；实时核的释放与回应在毫秒内完成，2 秒是给卡住的实时核留的余量。请求失败（连接已断、超时、对端报错）不影响后续步骤。实时核退出后 `stop` 销毁帧环；强制终止后仍未确认退出时保留。
+第 1、2 步的时限取 Bellis `ManagedProcess` 的缺省值；实时核的释放与回应在毫秒内完成，2 秒是给卡住的实时核留的余量。请求失败（连接已断、超时、对端报错）不影响后续步骤。实时核退出后 `stop` 销毁帧环与音频环；强制终止后仍未确认退出时保留。
 
 ### 生命线与 panic
 
@@ -117,11 +117,12 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 | 线程 | 做什么 |
 | --- | --- |
 | 主线程 | 以假后端运行时先连上测试设备；释放、连接、握手、发 `core_start`，启动其余线程，然后等会话结束 |
-| `RpcPeer` 读线程 | `producer.heartbeat`、`producer.revoke`、`core.stop`、`action.submit`、`frame_ring.attach`、`capture.set_target` 的处理函数：只动控制状态、发通知或把命令交给采集线程，很快返回，不向主进程发请求。`action.submit` 只校验并装进调度计划，不执行任何一步 |
+| `RpcPeer` 读线程 | `producer.heartbeat`、`producer.revoke`、`core.stop`、`action.submit`、`frame_ring.attach`、`capture.set_target`、`audio_ring.attach`、`audio.set_target` 的处理函数：只动控制状态、发通知或把命令交给采集线程与音频线程，很快返回，不向主进程发请求。`action.submit` 只校验并装进调度计划，不执行任何一步 |
 | 调度 | 按时刻执行动作块的步，负责全部定时的释放：心跳超时、许可到期、持有输入时帧龄超限、截止时刻，见[动作块的执行](#动作块的执行) |
 | 核连接的发送 | 写出调度线程与测试设备连接的线程放进队列的通知（回执、`input.released`） |
 | 健康 | 握手后立即发一次 `core.health`，之后按周期发 |
 | 采集 | 取帧写进帧环，见[采集主循环](#采集主循环) |
+| 音频 | 取音频包写进音频环，见[音频主循环](#音频主循环) |
 | 两条生命线 | 一个等核连接关闭，一个读 stdin 直到 EOF |
 | 测试设备连接（只在假后端时） | 读线程处理 `test_lease.grant`、`test_lease.revoke`；发送线程写出假输入事件；一条生命线等它断开，断开即许可失效 |
 
@@ -355,7 +356,111 @@ GS-01，2026-10-31，Windows 11 Pro 10.0.26200，单屏 3840×2160、缩放 175%
 
 ## 音频采集
 
-用 WASAPI 进程回环按游戏进程 ID（含子进程）只采游戏的声音（GR-08），PCM 带 QPC 时间戳写入音频环，与帧环同一时钟；音频环由主进程创建。不用端点回环与虚拟声卡。配音忙闲由主进程判断，见[感知](perception.md#配音检测)。
+用 WASAPI 进程回环按游戏进程 ID（含子进程）只采游戏的声音（GR-08），PCM 带 QPC 时间戳写入音频环，与帧环同一时钟；音频环由主进程创建，布局见[音频环](core-protocol.md#音频环)。不用端点回环与虚拟声卡。配音忙闲由主进程判断，见[感知](perception.md#配音检测)。
+
+音频源接口与 WASAPI 实现在 `core/crates/audio-capture`，WASAPI 部分用 `cfg` 隔离，只在 Windows 上编译；音频环的写入方、读取方与假音频源在 `core/crates/audio-ring`；音频线程在 `core/crates/realtime-core/src/audio.rs`。
+
+### 目标进程
+
+- `audio.set_target` 的 `window` 目标是一条[窗口识别](#窗口识别)规则，主进程给出与 `capture.set_target` 相同的一条（G1 起都来自游戏适配包）。音频线程按规则自己找到唯一的窗口，取窗口所属的进程，以 `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` 采这个进程及其子进程的声音。
+- 不从采集线程取窗口：两个线程各自识别，互不等待，画面采集卡住或失效不影响声音，反之亦然。规则只认唯一的窗口，所以两边认定不同窗口只可能发生在窗口关闭又重开的间隙，之后各自重新识别。
+- 只在建立音频源时识别一次。窗口关闭而进程仍在时继续采；进程退出后重新识别（[音频主循环](#音频主循环)）。
+- 发声的是窗口所属进程的父进程或兄弟进程时采不到（例如由启动器出声）；接入游戏时按 GS-06 核对。
+
+### 音频源接口
+
+音频源实现 `AudioSource::next_packet(timeout, &mut AudioPacket)`：等到下一个包，写进调用方给的 `AudioPacket` 并复用其缓冲；超时内没有新包时返回“无新包”，包不变。与画面不同，每个包都按顺序交出，不只交出最新的。WASAPI 音频源与供自动测试用的假音频源实现同一接口。
+
+| 每个包 | 内容 |
+| --- | --- |
+| 样本值 | F32、本机字节序、各声道交错；采样率与声道数是建立音频源时给的格式，即音频环头部的格式 |
+| 采样点数 | WASAPI 一般每 10 ms 一个包 |
+| 采集时刻 | 第一个采样点的 QPC 纳秒，见[音频的时钟](#音频的时钟) |
+| 不连续 | 与这个音频源交出的上一个包之间丢了声音或时间轴断开 |
+
+### 音频管线
+
+1. 以 `SYNCHRONIZE` 打开目标进程并持有句柄：进程退出时立即察觉，进程号在此期间也不会被复用。
+2. `ActivateAudioInterfaceAsync` 激活虚拟设备 `VAD\Process_Loopback` 上的 `IAudioClient`，激活参数为 `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`、目标进程号与 `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`；完成回调只发信号，音频线程至多等 5 秒再取结果。
+3. 共享模式、事件驱动，标志为 `LOOPBACK | EVENTCALLBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`，以音频环的采样率与声道数、F32 初始化，缓冲 200 ms：进程回环没有混音格式，由系统转换成要求的格式；音频线程卡住不超过 200 ms 不丢声音。
+4. `next_packet` 等缓冲事件或目标进程退出，至多等到时限；取出积压的每个包，复制样本值（带 `SILENT` 标志的包写零）后交还缓冲，记下采集时刻与 `DATA_DISCONTINUITY` 标志。
+5. COM 在音频线程上以 MTA 初始化；音频源在哪个线程创建就在哪个线程使用，丢弃时停止采集并反初始化。
+
+进程回环需要 Windows 10 build 20348 起的系统。在本机（Windows 11 Pro 10.0.26200，2026-11-01）观察到：48 kHz 立体声、44.1 kHz 立体声与 16 kHz 单声道都能初始化，包都是 10 ms；目标进程不出声时也每 10 ms 交出一个静音的包，相邻包的采集时刻正好相差一个包的时长；目标进程退出后立即报出。所以音频环的块号不再前进即说明音频源出了问题，而不是游戏安静。
+
+### 音频主循环
+
+实时核怎样把音频源接到音频环上，写法与[采集主循环](#采集主循环)相同。主进程一侧的挂接顺序见[音频环的读写规则](core-protocol.md#音频环的读写规则)。
+
+- **处理函数**：`audio_ring.attach` 与 `audio.set_target` 在 `RpcPeer` 的读线程上核对参数。前者以 `AudioRingWriter::attach` 打开并核对音频环；后者核对窗口识别规则与平台是否支持，假音频输出在这里先打开一次。核对通过就作为命令交给音频线程，随即回应；错误码见 [`audio.set_target`](core-protocol.md#消息集)。
+- **音频线程**独占写入方与音频源，音频环在实时核里只有这一个写方。目标以“建立音频源的方法”交给音频线程，音频源在音频线程上按音频环的格式创建与使用。
+- **一轮**：等命令，至多等到下一轮；没有音频源时按目标与音频环的格式建立；`next_packet` 至多等 50 ms；取到包就写进音频环（超过块容量时拆成几块），记下最近写入的一块。
+- **挂接与设定目标**的先后不限，两者都到了才建立音频源。再次设定目标时先停掉旧的音频源，再按新目标立即建立。再次挂接换成新的音频环，最近写入的一块随之清空；格式不同时音频源按新格式重建。
+- **不连续**：新建音频源、新挂接音频环或丢弃了写不进的包之后写入的第一块带不连续标志，音频源报告的不连续照样带上。
+- **写不进音频环的包**（格式不符等）丢弃并记录，音频环不受影响。
+- 状态变化写 stderr 的日志；同样的问题只记一次，恢复写入时再记一次。
+
+| 状态（`core.health.audio`） | 含义 |
+| --- | --- |
+| `idle` | 还没有挂接音频环或设定音频目标 |
+| `searching` | 有音频环与目标，没有音频源：找不到窗口、目标进程已退出，或音频源已失效，正在定期重新识别 |
+| `capturing` | 有音频源 |
+
+| 从 | 事件 | 到 | 之后 |
+| --- | --- | --- | --- |
+| `idle` | 音频环与目标都到了，建立音频源成功 | `capturing` | 取包 |
+| `idle` | 同上，建立失败（见下表） | `searching` | 每 500 ms 重新识别 |
+| `searching` | 重新识别并建立成功 | `capturing` | 取包 |
+| `capturing` | 音频源报错：目标进程退出、系统调用失败、假音频源的块不合布局等 | `searching` | 丢掉音频源，500 ms 后重新识别 |
+| `searching`、`capturing` | 再次设定目标 | 建立成功为 `capturing`，否则 `searching` | 旧的音频源先停掉 |
+| 任何 | 会话结束 | — | 停掉音频源，至多等 500 ms；等不到也照常退出 |
+
+这些间隔是 `audio.rs` 里的常量，只在测试与真机测试中跑过，未按真实游戏调整。
+
+**与采集、控制解耦。** 音频线程只碰自己的状态（`AudioStatus`，有自己的锁，只在更新的一瞬间持有）与音频环，从不碰控制状态的锁与 `FrameStatus`；[释放](#释放)与权威检查都不读音频，`core.health` 读 `AudioStatus` 时不持控制状态的锁。所以音频线程卡在 WASAPI 里或写失败，只让 `core.health.latest_audio` 不再前进，不影响释放与画面采集。
+
+### 音频的报错与恢复
+
+建立音频源时与采集期间的失败都写进日志，状态为 `searching`，500 ms 后按同一目标重新识别并新建音频源：
+
+| 情形 | 错误 |
+| --- | --- |
+| 找不到窗口、不止一个窗口符合 | 同[窗口识别](#窗口识别)的 `WindowNotFound`、`AmbiguousWindow` |
+| 目标进程已退出 | `ProcessExited`；同一规则的窗口重新出现（游戏重启）即采新的进程 |
+| 系统不支持进程回环（build 20348 之前） | `Unsupported`，每次重试都失败 |
+| 系统调用失败：激活超时或失败、初始化失败、取包时设备失效（`AUDCLNT_E_DEVICE_INVALIDATED`）或音频服务停止 | `Os` |
+| 假音频输出与音频环的格式不同、块头部不合布局（只有[假音频源](#假音频源)会报） | `FormatMismatch`、`InvalidBlock`，修正测试一侧 |
+
+- 非 Windows 上的 `window` 目标不会进到这里：`audio.set_target` 直接回 -32003（unsupported）。
+- 进程回环不绑定某个播放设备。默认播放设备改变后是继续交包还是报设备失效没有实测（PENDING）；报错时按上表新建。
+- 提权的游戏：非提权的实时核能否采到提权进程的声音没有实测，按第一版的规则不测（GS-06）。
+
+### 音频的时钟
+
+WASAPI 给出包里第一个采样点的 QPC 时刻（`GetBuffer` 的 `pu64QPCPosition`，100 ns 单位），采集时刻 = 它 × 100 纳秒，与 WGC 的换算相同，误差见[时钟](#时钟)。带 `TIMESTAMP_ERROR` 标志或读数为 0 的包按“现在 − 包的时长”估计。拆开的块的采集时刻按采样率推算（[音频环的读写规则](core-protocol.md#音频环的读写规则)）。
+
+### 假音频源
+
+只用于自动测试：在没有 WASAPI 的环境里（含 Linux 容器）跑音频环的全链路。生产中不使用。代码是 `core/crates/audio-ring` 的 `FakeAudioCapture`，实现同一[音频源接口](#音频源接口)。
+
+- **假音频输出**：一块与[音频环](core-protocol.md#音频环)同一布局的共享内存，代替游戏发出的声音。测试一侧（Python）创建、写入与销毁它，写法与实时核写音频环相同（`game_runtime.audio_ring.fake.FakeAudioOutput`，只用于测试）：`play` 写一块，采集时刻缺省取写入时的 `time.perf_counter_ns()`。复用音频环的布局，不另定格式。
+- **目标**：`audio.set_target` 的 `fake` 分支，`output` 是假音频输出的共享内存名与布局参数，打开与核对的规则同 `audio_ring.attach`。建立音频源时它的采样率与声道数须与音频环相同，否则报 `FormatMismatch`。
+- **取声音**：每 1 ms 查看一次假音频输出的 `write_seq`，按块号从小到大逐块交出，每块一个包，采集时刻、采样点数与样本值取自那一块，块的不连续标志照样带上；块撕裂就等下一轮再读。读得太慢、要交出的块已被覆盖时跳到最早仍在的块，并给它标上不连续。
+- **报错**：块头部在 seqlock 下稳定却不合布局时报 `InvalidBlock`。
+- 假音频源只能证明链路通，不验证 WASAPI、目标进程的识别与时钟；真机验收仍走 WASAPI（Bellis D-11）。
+
+### 音频的验证
+
+`uv run check` 中运行，Windows 本机与 Linux 容器都真跑 `realtime-core`：
+
+| 测试 | 内容 |
+| --- | --- |
+| `audio-capture`、`audio-ring` 的单元测试 | 格式与时长的换算；进程不存在时报 `ProcessExited`（Windows）；音频环与假音频源，见[音频环的测试](core-protocol.md#音频环的测试) |
+| `realtime-core` 的单元测试（`audio.rs`） | 以按脚本交包或报错的音频源与记录块的替身，核对上表的每条转换、重新识别的间隔、新目标先停旧源、新的音频源与音频环之后的不连续、换格式时重建音频源、写不进音频环的包、音频线程的停止；窗口识别规则的核对，非 Windows 上 `window` 不支持 |
+| `runtime/tests/core_link/test_core.py` | 测试扮演主进程：音频环挂接后仍是 `idle`、设定目标后 `capturing`，音频环里的块与 `latest_audio` 一致，第一块带不连续标志；音频环与假音频输出不符回 -32005，窗口规则不全回 -32602；假音频输出与音频环的格式不同时 `searching`、不写块；`window` 目标在 Windows 上找不到窗口时 `searching`，在 Linux 上回 -32003 |
+| `runtime/tests/core_link/test_audio.py` | 与 `CoreLink` 联调：假音频输出 → 假音频源 → 音频环，主进程读到的块与写入的样本值、采集时刻一致且按块号连续，`ctx.audio` 经插件内核读到同样的声音；杀掉实时核再拉起后挂接同一音频环，块号续写不回退且新实例的第一块带不连续标志；`stop` 在实时核退出后销毁音频环；目标被拒时启动失败；没有申请 `audio.read` 的插件读音频被拒；音频配置的校验 |
+
+真机手动测试 `runtime/tests/core_link/test_audio_process.py`，标 pytest 的 `manual`，不进 `uv run check`，命令见 [AGENTS.md](../../AGENTS.md)：拉起两个自建的测试进程 `tone_player`（`core/crates/audio-capture/examples/`），各开一个窗口，以很小的音量在缺省播放设备上播放不同频率的正弦波；`CoreLink` 以其中一个的窗口识别规则设定音频目标。核对：窗口出现之前 `searching`、之后 `capturing`；音频环里有目标进程的频率，没有另一个进程的频率；目标进程静音时块照常前进、样本值为零；目标进程退出后回到 `searching`。打印从测试进程交出第一个正弦波缓冲到它出现在音频环里的时延，以及块交到主进程时的块龄。结果 PENDING，随 GS-06 记录。
 
 ## 输入代理
 

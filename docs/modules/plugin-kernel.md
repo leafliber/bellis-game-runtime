@@ -58,6 +58,7 @@
 | `ctx.config` | 补齐缺省值并校验过的配置 |
 | `ctx.permissions` | 已授予的权限，即清单申请的权限 |
 | `ctx.control` | 控制产出者的提交资格，见[控制产出者](#控制产出者)；其它插件为 None |
+| `ctx.audio` | 读音频环的接口 `AudioReader`（`read_recent`，见[音频环的挂接与读取](core-protocol.md#音频环的读写规则)）。清单没有申请 `audio.read` 即抛 `PermissionError`；宿主没有给出时抛 `LookupError`。宿主构造内核时以 `Kernel(audio=link.audio_reader)` 给出 |
 | `Plugin.quiesce(ctx)` | 插件可覆盖：进入 QUIESCING 时调用，停止新工作、取消在途任务 |
 
 - 一切副作用（任务、定时器、连接、子进程）都经 `ctx.register` 登记。发布的服务由内核登记在最后，停用时最先撤回。
@@ -69,7 +70,7 @@
 | 权限 | 含义 |
 | --- | --- |
 | `frames.read` | 读帧环 |
-| `audio.read` | 读音频环 |
+| `audio.read` | 读音频环（`ctx.audio`） |
 | `narrative.write` | 写剧情记录 |
 | `control.submit` | 向实时核提交动作块，只授予当前控制产出者 |
 | `net.egress:<主机>` | 向该主机外发 |
