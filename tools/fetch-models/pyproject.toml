@@ -1,0 +1,23 @@
+# 下载并核对模型制品的离线工具（docs/modules/game-adapter.md 的“模型制品”）；提供 `uv run fetch-models`。
+# 运行时只读本地文件、不联网，下载只经这里。
+[project]
+name = "bellis-game-runtime-fetch-models"
+version = "0.0.0"
+description = "把钉住版本与摘要的模型制品下载到本地数据目录并核对"
+requires-python = "==3.12.*"
+dependencies = [
+    "bellis-game-runtime",
+]
+
+[project.scripts]
+fetch-models = "fetch_models:main"
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "fetch_models"
+
+[tool.uv.sources]
+bellis-game-runtime = { workspace = true }
