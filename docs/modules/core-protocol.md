@@ -59,7 +59,7 @@
 ### 安全设置
 
 - Windows 的管道由 Python 服务端自己建：asyncio 自带的服务端以消息模式、缺省安全描述符建管道，也不拒绝远程客户端。这里每个实例都用字节模式（与 libuv 一致）并带 `PIPE_REJECT_REMOTE_CLIENTS`；第一个实例带 `FILE_FLAG_FIRST_PIPE_INSTANCE`，同名管道已存在时以 `address-in-use` 失败，不用同名重试；安全描述符的 DACL 为 `D:P(A;;GA;;;<当前用户 SID>)`，只允许当前用户；地址上始终留一个尚未连接的实例。接受连接仍交给 asyncio 的 IOCP proactor，用到它的内部接口（与 `start_serving_pipe` 自身相同），所以 Python 版本锁定在 3.12。
-- 提权的实时核以同一用户运行时满足这个 DACL；跨完整性级别的可达性（非提权主进程建的管道，提权的实时核连接与读写）PENDING，由 [GS-03](../plan/spikes.md) 真机验证。
+- 提权的实时核以同一用户运行时满足这个 DACL；跨完整性级别的可达性（非提权主进程建的管道，提权的实时核连接与读写）经 [GS-03](../plan/spikes.md) 实测成立（2026-10-31，见[提权时的计划任务](realtime-core.md#提权时的计划任务gr-06)）。
 - Rust 客户端以 `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` 打开管道：连到被抢注的管道时，对端只能识别、不能冒充提权实时核的令牌。
 - POSIX 上服务端自己 bind，socket 文件已存在时报 `address-in-use`，不像 asyncio 那样删掉旧的；关闭时删除 socket 文件。
 - 这些设置只是减少暴露，认证仍只靠握手；同一用户下的恶意进程不在威胁模型内（Bellis D-12）。
@@ -432,7 +432,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - `name` 字段就是交给 `OpenFileMappingW` 或 `shm_open` 的字符串，不再加工。
 - Python 标准库的 `mmap` 与 `multiprocessing.shared_memory` 设不了安全属性，所以 Windows 上用 ctypes 创建，视图仍由 `mmap` 按名字打开，借它管理映射的生命期。POSIX 上不用 `multiprocessing.shared_memory`：它在 Python 3.12 里会把共享内存登记到另起的 resource tracker 进程。
 - 销毁由主进程负责，在实时核停止之后（`CoreLink.stop`，见[读写规则](#读写规则)）。主进程崩溃时，Windows 上对象随进程的句柄关闭而消失；POSIX 上名字留到重启，生产平台不受影响。
-- 跨完整性级别（非提权主进程创建、提权实时核打开与写入）的可达性 PENDING，由 [GS-03](../plan/spikes.md) 验证。这些设置只减少暴露，同一用户下的恶意进程不在威胁模型内（Bellis D-12）。
+- 跨完整性级别（非提权主进程创建、提权实时核打开与写入）的可达性经 [GS-03](../plan/spikes.md) 实测成立（2026-10-31）。这些设置只减少暴露，同一用户下的恶意进程不在威胁模型内（Bellis D-12）。
 
 #### 帧龄
 
