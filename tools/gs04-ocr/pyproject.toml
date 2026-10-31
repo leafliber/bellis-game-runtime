@@ -1,0 +1,39 @@
+# GS-04 的 OCR 评测工具（docs/modules/perception.md 的“GS-04 的评测工具”）；提供 `uv run gs04`。
+# 只用于评测，不进运行时；Windows 自带 OCR 的对照基线是可选依赖 `windows-ocr`，只在 Windows 上安装。
+[project]
+name = "bellis-game-runtime-gs04-ocr"
+version = "0.0.0"
+description = "GS-04：OCR 在样本上的字符准确率与时延，Windows 自带 OCR 作对照基线"
+requires-python = "==3.12.*"
+dependencies = [
+    "bellis-game-runtime",
+    "numpy>=2.5.4",
+    "opencv-python-headless>=5.0.0.93",
+    "pydantic>=2.14.2",
+    "synthetic-game",
+]
+
+[project.scripts]
+gs04 = "gs04_ocr.cli:main"
+
+[project.optional-dependencies]
+windows-ocr = [
+    "winrt-runtime>=4.0.3 ; sys_platform == 'win32'",
+    "winrt-windows-foundation>=4!10.0.28000.2705 ; sys_platform == 'win32'",
+    "winrt-windows-foundation-collections>=4!10.0.28000.2705 ; sys_platform == 'win32'",
+    "winrt-windows-globalization>=4!10.0.28000.2705 ; sys_platform == 'win32'",
+    "winrt-windows-graphics-imaging>=4!10.0.28000.2705 ; sys_platform == 'win32'",
+    "winrt-windows-media-ocr>=4!10.0.28000.2705 ; sys_platform == 'win32'",
+    "winrt-windows-storage-streams>=4!10.0.28000.2705 ; sys_platform == 'win32'",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "gs04_ocr"
+
+[tool.uv.sources]
+bellis-game-runtime = { workspace = true }
+synthetic-game = { workspace = true }

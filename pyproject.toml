@@ -53,6 +53,9 @@ typeCheckingMode = "strict"
 testpaths = ["protocol", "runtime", "tools"]
 # 真机手动测试缺省不选；`-m manual` 写在命令行上时覆盖这里的 -m。
 addopts = ["--import-mode=importlib", "-ra", "-m", "not manual"]
-markers = ["manual: 真机手动测试，需要 Windows 交互桌面，不在 uv run check 中"]
+markers = [
+    "manual: 真机手动测试，需要 Windows 交互桌面，不在 uv run check 中",
+    "ocr_model: 用本地数据目录里的真实 OCR 模型推理；模型不在时跳过",
+]
 strict = true
 filterwarnings = ["error"]
