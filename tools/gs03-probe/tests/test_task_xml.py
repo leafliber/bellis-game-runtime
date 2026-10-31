@@ -3,6 +3,8 @@
 注册需要管理员，这里不尝试；只验证 XML 结构正确、能被解析、核对逻辑正确。
 """
 
+import sys
+
 import pytest
 
 from gs03_probe.task_xml import (
@@ -64,6 +66,13 @@ def test_encode_is_utf16le_with_bom_and_round_trips() -> None:
 def test_decode_recognizes_utf8_and_utf16() -> None:
     assert decode_query_output("héllo".encode("utf-16-le")) == "héllo"
     assert decode_query_output(b"\xef\xbb\xbf" + "héllo".encode()) == "héllo"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="OEM 代码页只在 Windows 上有")
+def test_decode_falls_back_to_oem_code_page() -> None:
+    # 重定向时 schtasks 按 OEM 代码页输出；“é”在 936 与 437 中都有，编码后都不是合法的 UTF-8。
+    encoded = "héllo".encode("oem")
+    assert decode_query_output(encoded) == "héllo"
 
 
 def test_current_user_id_requires_domain_and_name() -> None:
