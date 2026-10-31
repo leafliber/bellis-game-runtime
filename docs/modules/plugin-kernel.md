@@ -59,8 +59,8 @@
 | `ctx.config` | 补齐缺省值并校验过的配置 |
 | `ctx.permissions` | 已授予的权限，即清单申请的权限 |
 | `ctx.control` | 控制产出者的提交资格，见[控制产出者](#控制产出者)；其它插件为 None |
-| `ctx.audio` | 读音频环的接口 `AudioReader`（`read_recent`，见[音频环的挂接与读取](core-protocol.md#音频环的读写规则)）。清单没有申请 `audio.read` 即抛 `PermissionError`；宿主没有给出时抛 `LookupError`。宿主构造内核时以 `Kernel(audio=link.audio_reader)` 给出 |
-| `ctx.frames` | 帧源 `FrameSource`（`next_frame`，见[取帧](perception.md#取帧)）。清单没有申请 `frames.read` 即抛 `PermissionError`；宿主没有给出时抛 `LookupError`。宿主构造内核时以 `Kernel(frames=…)` 给出：实时运行是帧环上的 `RingFrameSource(link.frames)`，测试是内存帧源，回放是回放的帧源 |
+| `ctx.audio` | 读音频的接口 `AudioReader`（`read_recent`，见[音频环的挂接与读取](core-protocol.md#音频环的读写规则)）。清单没有申请 `audio.read` 即抛 `PermissionError`；宿主没有给出时抛 `LookupError`。宿主构造内核时以 `Kernel(audio=…)` 给出：实时运行是 `link.audio_reader`，回放是录制的回放音频源（[M0 回放](offline-tools.md#m0-回放)） |
+| `ctx.frames` | 帧源 `FrameSource`（`next_frame`，见[取帧](perception.md#取帧)）。清单没有申请 `frames.read` 即抛 `PermissionError`；宿主没有给出时抛 `LookupError`。宿主构造内核时以 `Kernel(frames=…)` 给出：实时运行是帧环上的定序帧源 `SequencedFrameSource(link.frames)`，测试是内存帧源，回放是回放帧源 |
 | `Plugin.quiesce(ctx)` | 插件可覆盖：进入 QUIESCING 时调用，停止新工作、取消在途任务 |
 
 - 一切副作用（任务、定时器、连接、子进程）都经 `ctx.register` 登记。发布的服务由内核登记在最后，停用时最先撤回。

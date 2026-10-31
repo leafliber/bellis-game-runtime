@@ -32,7 +32,7 @@ Rust 写的独立进程，是游戏侧的安全核：采集画面与声音，并
 1. 以 `session_credentials` 生成本实例的会话地址与密钥，在 `bellis-channel/1` 上开服务端监听。每个实例的凭据都是新的，被杀或已退出的旧实例连不上。
 2. 以 `subprocess.Popen` 和参数列表拉起 `realtime-core`：不经 shell，不用 `DETACHED_PROCESS`、`CREATE_BREAKAWAY_FROM_JOB` 或 `start_new_session`；stdin 是管道，stdout 与 stderr 继承主进程。
 3. 环境变量按 Bellis 的 `baseEnvironment` 只取系统必需的（Windows 的 `SYSTEMROOT`、`PATH` 等，POSIX 的 `HOME`、`PATH` 等），其余不继承；凭据按 Bellis 的 `ChildEnv` 放在 `BELLIS_CHANNEL_PATH`（地址）、`BELLIS_CHANNEL_KEY`（base64url 密钥）与 `BELLIS_ROLE`（角色，固定为 `game-runtime.core`）里。时限经命令行参数 `--heartbeat-timeout-ms`、`--health-interval-ms`、`--max-frame-age-ms` 给出。只用于测试：`CoreLinkOptions.test_device` 给出时另加 `--input-backend fake`，测试设备的地址与密钥放在 `GAME_RUNTIME_TEST_DEVICE_PATH`、`GAME_RUNTIME_TEST_DEVICE_KEY` 里（[测试设备连接](core-protocol.md#测试设备连接)）。
-4. Windows 上以 `CREATE_SUSPENDED` 创建，放进 Job Object 并交出 job 句柄之后才恢复运行，见下文。
+4. Windows 上以 `CREATE_SUSPENDED` 创建，放进 Job Object 并交出 job 句柄之后才恢复运行，见下文。同时以 `CREATE_NEW_PROCESS_GROUP` 放进自己的进程组：控制台里按 Ctrl+C 只到主进程，由主进程按[停止](#停止)的顺序停实时核，实时核不会被控制台直接终止、来不及释放输入。它仍在同一个控制台里，stdout、stderr 照常继承；关闭控制台窗口时照样收到关闭事件。其它平台不另设进程组（只在测试中运行，没有交互终端）。
 5. 实时核连上后发 `core.hello`；主进程只接受角色为 `game-runtime.core` 的第一个连接，核对协议版本，不相等即以 -32001 回错并断开。收到 `input.released(core_start)` 才算就绪。从拉起到就绪超过 `start_timeout` 或实例在就绪前退出，即按停止顺序终止它并报 `CoreStartError`。
 6. 配置了采集（`CoreLinkOptions.capture`）时先挂接帧环、再设定采集目标；配置了音频（`CoreLinkOptions.audio`）时接着挂接音频环、设定音频目标；任一被拒绝即按停止顺序终止它并报 `CoreStartError`（[帧环的挂接](core-protocol.md#读写规则)、[音频环的挂接](core-protocol.md#音频环的读写规则)）。之后开始发心跳。
 
