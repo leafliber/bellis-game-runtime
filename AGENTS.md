@@ -41,10 +41,17 @@
 | GS-03 探针：读回核对已注册的计划任务 | `uv run gs03 check-task` |
 | GS-03 探针：非提权一侧尝试改写管理员安装目录里的文件 | `uv run gs03 install-check <目录> <文件名>` |
 | GS-03 探针：清理（删凭据，打印注销任务与清理安装目录的命令） | `uv run gs03 cleanup` |
+| 把钉住版本与摘要的模型制品下载到本地数据目录并核对（要联网，见[模型制品](docs/modules/game-adapter.md#模型制品)） | `uv run fetch-models` |
+| 只核对本地数据目录里的模型制品，不联网 | `uv run fetch-models --check` |
+| 只跑 OCR 的测试（本地数据目录里没有模型时，真实推理的那部分跳过） | `uv run pytest runtime/tests/ocr` |
+| 用本地数据目录里的真实模型跑 OCR 的识别测试（模型不在时跳过并写明原因） | `uv run pytest -m ocr_model` |
+| GS-04：渲染合成游戏的样本与真值，用来验证评测工具 | `uv run gs04 synth <目录>` |
+| GS-04：评测一个样本目录，报告写入 `reports/gs04/`（引擎 `ppocrv5-mobile`、`ppocrv5-server`） | `uv run gs04 eval <样本目录> --engine <引擎>` |
+| GS-04：以 Windows 自带 OCR 作对照基线（只在 Windows 上） | `uv run --extra windows-ocr gs04 eval <样本目录> --engine windows` |
 
 探测程序另有 `--class <类名>`、`--keep-border`（保留黄色边框作对照）、`--min-update-interval-ms <N>`（会话的最小帧间隔）、`--borderless` 与 `--dpi-unaware`（图案窗口的样式）；`--help` 列出全部选项。
 
-pytest 缺省不选标 `manual` 的真机手动测试，命令行写 `-m manual` 才运行。
+pytest 缺省不选标 `manual` 的真机手动测试，命令行写 `-m manual` 才运行。标 `ocr_model` 的测试缺省也运行，本地数据目录里没有模型时跳过，所以没有模型的环境（如 Linux 容器）里 `uv run check` 照样通过。
 GS-03 的每一步在哪种终端里执行什么，由 `uv run gs03 <子命令>` 自己打印；需要管理员权限的动作（注册计划任务、把程序放进管理员目录）只打印命令，由维护者在管理员终端里执行，探针不提权。结果报告写入不入库的 `reports/gs03/`。
 
 `uv run check --linux` 首次运行要构建镜像。容器不写回仓库：虚拟环境、cargo target 与工具缓存放在每个检出目录各自的 `bellis-game-runtime-check-work-<路径摘要>` 卷里，uv 与 cargo 的下载缓存放在共用的 `bellis-game-runtime-check-uv-cache`、`bellis-game-runtime-check-cargo-registry` 卷里。这些卷都只是缓存，删掉只会让下次检查重新下载与编译；工作树删掉后它的卷会留下，用 `docker volume ls --filter name=bellis-game-runtime-check` 列出后 `docker volume rm` 清理。
