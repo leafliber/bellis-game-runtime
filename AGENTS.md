@@ -18,7 +18,8 @@
 | 只跑 Rust 测试 | `cargo test --workspace` |
 | 校验 `games/` 下的全部适配包，列出尚未标定的项；给出目录时只校验这几个 | `uv run check-adapters`；`uv run check-adapters games/<id>` |
 | 只跑适配包格式、两个适配包与 `game-adapter@1` 的测试 | `uv run pytest runtime/tests/adapter` |
-| 只跑实时核的启动、生命线、心跳、采集主循环与动作块测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link` |
+| 只跑实时核的启动、生命线、心跳、采集主循环、音频主循环与动作块测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link` |
+| 只跑音频环的布局核对、读写与 Python–Rust 互通测试 | `uv run pytest runtime/tests/audio_ring protocol/tests/test_ring_layouts.py` |
 | 只跑动作块、假输入后端与失效释放的联调测试，并打印假后端上的释放时延 | `uv run pytest runtime/tests/core_link/test_actions.py -s` |
 | 格式化 | `uv run ruff format`；`cargo fmt --all` |
 | 改了 `core/crates/core-protocol` 后重新生成 `protocol/` 的生成物 | `uv run generate` |
@@ -28,6 +29,7 @@
 | 改了合成游戏的台词后重新生成字体子集（要联网，见[字体](docs/modules/offline-tools.md#字体)） | `uv run python -m synthetic_game.font_subset` |
 | 采集的真机测试（需要 Windows 交互桌面，不在 `uv run check` 中） | `cargo test -p capture -- --ignored --nocapture` |
 | 合成游戏窗口经 `CoreLink`、实时核与 WGC 进入帧环的真机测试（需要 Windows 交互桌面，不在 `uv run check` 中；先关掉已打开的合成游戏窗口） | `uv run pytest -m manual runtime/tests/core_link/test_capture_window.py -s` |
+| 自建测试进程的声音经 WASAPI 进程回环、`CoreLink` 与实时核进入音频环的真机测试，打印时延（需要 Windows 交互桌面，会以很小的音量放出两段正弦波，不在 `uv run check` 中） | `uv run pytest -m manual runtime/tests/core_link/test_audio_process.py -s` |
 | GS-01 探测：列出可见的顶层窗口及其进程、类名与标题 | `cargo run --release -p capture --bin capture-probe -- --list` |
 | GS-01 探测：采一个窗口 N 秒，报告帧率、帧龄、丢帧、变换版本与黄色边框 | `cargo run --release -p capture --bin capture-probe -- --process <进程名> --title <标题> --seconds <N>` |
 | GS-01 探测：采自建的已知图案窗口，另报从重画到采集的时延 | `cargo run --release -p capture --bin capture-probe -- --pattern-window --animate` |
