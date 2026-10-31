@@ -27,8 +27,7 @@ from core_protocol.frame_ring import (
     FrameRingHeader,
     FrameSlotHeader,
 )
-
-from ._shm import SharedMemory, create_shared_memory, shared_memory_name
+from game_runtime._shm import SharedMemory, create_shared_memory, shared_memory_name
 
 DEFAULT_SLOT_COUNT: Final = 3
 """缺省的槽数。"""

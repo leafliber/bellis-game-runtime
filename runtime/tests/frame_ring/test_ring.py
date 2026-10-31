@@ -15,6 +15,7 @@ from core_protocol.frame_ring import (
     SLOT_PIXELS_OFFSET,
     SLOTS_OFFSET,
 )
+from game_runtime._shm import create_shared_memory, shared_memory_name
 from game_runtime.frame_ring import (
     DEFAULT_SLOT_COUNT,
     FrameRing,
@@ -25,7 +26,6 @@ from game_runtime.frame_ring import (
     frame_age_ns,
     slot_stride_for,
 )
-from game_runtime.frame_ring._shm import create_shared_memory, shared_memory_name
 from game_runtime.frame_ring.fake import FakeDisplay
 
 
@@ -278,7 +278,7 @@ if sys.platform == "win32":
 else:
     import os
 
-    from game_runtime.frame_ring._shm import posix_shm_open
+    from game_runtime._shm import posix_shm_open
 
     def shared_memory_exists(name: str) -> bool:
         try:

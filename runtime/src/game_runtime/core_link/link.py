@@ -11,9 +11,11 @@
 实例被强制终止或崩溃（退出码非 0）时没有进程发出按键抬起，等待保留到下一个实例的 `core_start`。
 
 配置了采集（`CoreLinkOptions.capture`）时，第一次 `start` 创建帧环；每个实例就绪后先挂接帧环，
-再设定采集目标，然后才开始发心跳。帧环跨实例保留，`stop` 在实时核退出之后销毁它。同一时刻只有
-一个实例：上一个实例退出之后才能再 `start`，所以帧环只挂接给一个实时核，新实例从帧环头部的
-`write_seq` 续写帧号。
+再设定采集目标。配置了音频（`CoreLinkOptions.audio`）时同样创建音频环，接着挂接音频环、
+设定音频目标。之后才开始发心跳。两个环都跨实例保留，`stop` 在实时核退出之后销毁它们。
+同一时刻只有一个实例：上一个实例退出之后才能再 `start`，所以环只挂接给一个实时核，
+新实例从头部的 `write_seq` 续写帧号与块号。
+插件经 `audio_reader`（交给插件内核，即 `ctx.audio`）读音频环。
 
 `submit` 是 `CoreControl` 的第三项：控制产出者经提交资格（`ControlGrant.submit`）提交动作块，见
 `docs/modules/plugin-kernel.md` 的“提交动作块”。
@@ -36,6 +38,8 @@ from core_protocol import models
 from core_protocol.methods import (
     ACTION_RECEIPT,
     ACTION_SUBMIT,
+    AUDIO_RING_ATTACH,
+    AUDIO_SET_TARGET,
     CAPTURE_SET_TARGET,
     CORE_HEALTH,
     CORE_HELLO,
@@ -57,6 +61,7 @@ from core_protocol.models import (
     ProducerRevokeParams,
     ReleaseReason,
 )
+from game_runtime.audio_ring import AudioRead, AudioReader, AudioRing
 from game_runtime.channel import (
     ChannelCredentials,
     ChannelError,
@@ -68,6 +73,7 @@ from game_runtime.channel import (
     listen,
     session_credentials,
 )
+from game_runtime.core_link.audio import AudioConfig
 from game_runtime.core_link.capture import CaptureConfig
 from game_runtime.core_link.process import ManagedProcess, StopResult, StopStage, StopTimeouts
 from game_runtime.core_link.process import base_environment as _base_environment
@@ -108,14 +114,15 @@ class CoreLinkOptions:
     start_timeout: float = 10.0
     """从拉起到收到 `core.hello` 与 `input.released(core_start)` 的时限。"""
     rpc_timeout: float = 2.0
-    """发给实时核的请求（`producer.revoke`、`action.submit`、`frame_ring.attach`、`capture.set_target`）
-    的截止时间。"""
+    """发给实时核的请求（`producer.revoke`、`action.submit`、两个环的挂接与两个目标的设定）的截止时间。"""
     max_frame_age: float = 0.5
     """动作允许的帧龄，经命令行交给实时核：最新写入帧的帧龄超过它，实时核即不发输入并释放。"""
     stop: StopTimeouts = field(default_factory=StopTimeouts)
     """停止各步的时限。"""
     capture: CaptureConfig | None = None
     """帧环与采集目标；`None` 时不建帧环，也不设定采集目标。"""
+    audio: AudioConfig | None = None
+    """音频环与音频目标；`None` 时不建音频环，也不设定音频目标。"""
     test_device: ChannelCredentials | None = None
     """只用于测试：测试设备（`game_runtime.core_link.fake_device.FakeDevice`）的地址与密钥。给出时以
     假输入后端（`--input-backend fake`）拉起实时核，许可来自测试设备。生产中为 None：G0 没有真实的
@@ -278,6 +285,8 @@ class CoreLink:
         self._exited: _Instance | None = None
         """最近一个已退出的实例；`stop` 等它的善后做完。"""
         self._frames: FrameRing | None = None
+        self._audio: AudioRing | None = None
+        self._audio_reader = _LinkAudio(self)
 
     def bind_control(self, source: Callable[[], ControlGrant | None]) -> None:
         """给出当前的提交资格，通常是 `lambda: kernel.active_control`。资格有效时才发心跳。"""
@@ -313,6 +322,21 @@ class CoreLink:
         return self._frames
 
     @property
+    def audio(self) -> AudioRing | None:
+        """音频环，供宿主代码读声音（`read_recent`）。
+
+        配置了音频时由第一次 `start` 创建，跨实时核重启保留，`stop` 在实时核退出后销毁；其余时候
+        为 None。音频环归 `CoreLink` 所有，宿主只读，不关闭它。
+        """
+        return self._audio
+
+    @property
+    def audio_reader(self) -> AudioReader:
+        """交给插件内核的读音频接口（`Kernel(audio=...)`，即插件的 `ctx.audio`）。它总是读当前的
+        音频环，没有音频环时返回 None。"""
+        return self._audio_reader
+
+    @property
     def healthy(self) -> bool:
         """`health_timeout` 内收到过运行中实例的 `core.health`。"""
         at = self._last_health_at_ns
@@ -341,6 +365,22 @@ class CoreLink:
                 capture.max_width,
                 capture.max_height,
                 capture.slot_count,
+            )
+        audio = self._options.audio
+        if audio is not None and self._audio is None:
+            self._audio = AudioRing.create(
+                audio.sample_rate,
+                audio.channels,
+                block_capacity=audio.block_capacity,
+                block_count=audio.block_count,
+            )
+            logger.info(
+                "已创建音频环 %s：%d Hz、%d 声道，%d 个块槽，每块至多 %d 个采样点",
+                self._audio.name,
+                audio.sample_rate,
+                audio.channels,
+                audio.block_count,
+                audio.block_capacity,
             )
         self._instances += 1
         number = self._instances
@@ -401,13 +441,22 @@ class CoreLink:
             except (ChannelError, RpcError) as error:
                 await self._stop_instance(instance)
                 raise CoreStartError(f"实时核 {number} 没有接受帧环或采集目标：{error}") from error
+        if audio is not None and self._audio is not None:
+            try:
+                await self._attach_audio(instance, audio, self._audio)
+            except (ChannelError, RpcError) as error:
+                await self._stop_instance(instance)
+                raise CoreStartError(
+                    f"实时核 {number} 没有接受音频环或音频目标：{error}"
+                ) from error
         instance.tasks.append(loop.create_task(self._send_heartbeats(instance)))
         instance.tasks.append(loop.create_task(self._watch_health(instance)))
 
     async def stop(self) -> StopResult:
-        """按 R-06 的顺序停止实时核：`core.stop` → 关 stdin → 强制终止；实时核退出后销毁帧环。
+        """按 R-06 的顺序停止实时核：`core.stop` → 关 stdin → 强制终止；
+        实时核退出后销毁帧环与音频环。
 
-        没有在运行时返回上次的退出码。强制终止后仍未确认退出时保留帧环。返回时已退出实例的连接、
+        没有在运行时返回上次的退出码。强制终止后仍未确认退出时保留两个环。返回时已退出实例的连接、
         监听与凭据都已关闭。
         """
         instance = self._instance
@@ -417,9 +466,13 @@ class CoreLink:
             result = StopResult(StopStage.ALREADY_EXITED, self._last_returncode)
         else:
             result = await self._stop_instance(instance)
-        if self._instance is None and self._frames is not None:
-            self._frames.close()
-            self._frames = None
+        if self._instance is None:
+            if self._frames is not None:
+                self._frames.close()
+                self._frames = None
+            if self._audio is not None:
+                self._audio.close()
+                self._audio = None
         return result
 
     async def _stop_instance(self, instance: _Instance) -> StopResult:
@@ -450,6 +503,22 @@ class CoreLink:
         await peer.request(CAPTURE_SET_TARGET.name, _dump(params), timeout=timeout)
         logger.info(
             "实时核 %d 已挂接帧环 %s，采集目标：%s",
+            instance.number,
+            ring.name,
+            params.target.root.type,
+        )
+
+    async def _attach_audio(self, instance: _Instance, audio: AudioConfig, ring: AudioRing) -> None:
+        """挂接音频环，再设定音频目标。实时核从音频环头部的 `write_seq` 续写块号。"""
+        peer = instance.peer
+        if peer is None or not peer.connection.is_open:
+            raise ChannelError("closed", "核连接未建立")
+        timeout = self._options.rpc_timeout
+        await peer.request(AUDIO_RING_ATTACH.name, _dump(ring.attach_params()), timeout=timeout)
+        params = audio.set_target_params()
+        await peer.request(AUDIO_SET_TARGET.name, _dump(params), timeout=timeout)
+        logger.info(
+            "实时核 %d 已挂接音频环 %s，音频目标：%s",
             instance.number,
             ring.name,
             params.target.root.type,
@@ -738,6 +807,19 @@ class CoreLink:
         self._handle_exit(instance, returncode)
         if instance.closing is not None:
             await asyncio.shield(instance.closing)
+
+
+class _LinkAudio:
+    """`CoreLink.audio_reader`：总是读 `CoreLink` 当前的音频环，没有时返回 None。"""
+
+    def __init__(self, link: CoreLink) -> None:
+        self._link = link
+
+    def read_recent(self, duration_ns: int, *, after: int = 0) -> AudioRead | None:
+        ring = self._link.audio
+        if ring is None:
+            return None
+        return ring.read_recent(duration_ns, after=after)
 
 
 async def shutdown_runtime(kernel: Kernel, link: CoreLink) -> StopResult:

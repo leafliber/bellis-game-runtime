@@ -11,7 +11,14 @@ from game_runtime.kernel.control import (
 )
 from game_runtime.kernel.kernel import Kernel, KernelOptions
 from game_runtime.kernel.manifest import Manifest, NoConfig, Tier
-from game_runtime.kernel.plugin import Catalog, Disposer, Plugin, PluginContext, catalog
+from game_runtime.kernel.plugin import (
+    AUDIO_READ,
+    Catalog,
+    Disposer,
+    Plugin,
+    PluginContext,
+    catalog,
+)
 from game_runtime.kernel.profile import (
     Profile,
     ProfilePatch,
@@ -24,6 +31,7 @@ from game_runtime.kernel.service import ServiceToken
 from game_runtime.kernel.status import EntryStatus, Reason, ReasonCode, State, Transition
 
 __all__ = [
+    "AUDIO_READ",
     "CONTROL_SUBMIT",
     "Catalog",
     "Clock",

@@ -44,6 +44,12 @@ class WindowRule(BaseModel):
             process_name=self.process_name, window_class=self.window_class, title=self.title
         )
 
+    def audio_target(self) -> models.AudioWindowTarget:
+        """`audio.set_target` 的 `window` 分支：采这个窗口所属进程及其子进程的声音。"""
+        return models.AudioWindowTarget(
+            process_name=self.process_name, window_class=self.window_class, title=self.title
+        )
+
 
 class CaptureConfig(BaseModel):
     """帧环的尺寸与采集目标。窗口比帧环大时帧写不进帧环，实时核记录错误，帧龄随之增长。"""
