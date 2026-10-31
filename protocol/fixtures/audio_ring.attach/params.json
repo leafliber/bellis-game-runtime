@@ -1,0 +1,11 @@
+{
+  "name": "bellis-game-runtime-audio-example",
+  "size_bytes": 3097664,
+  "layout_version": 1,
+  "block_count": 400,
+  "block_stride": 7744,
+  "block_capacity": 960,
+  "sample_rate": 48000,
+  "channels": 2,
+  "sample_format": 1
+}

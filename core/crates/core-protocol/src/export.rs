@@ -1,4 +1,5 @@
-//! 导出生成物：JSON Schema、帧环偏移表与示例消息，由 `core-protocol-export` 写到仓库的 `protocol/`。
+//! 导出生成物：JSON Schema、帧环与音频环的偏移表与示例消息，由 `core-protocol-export` 写到仓库的
+//! `protocol/`。
 //!
 //! 输出是确定的：不含时间戳，键按声明顺序，换行为 LF，每个文件以换行结尾。
 
@@ -10,28 +11,32 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use crate::PROTOCOL_VERSION;
-use crate::frame_ring;
 use crate::messages::{
     Accepted, Action, ActionBlock, ActionOutcome, ActionReceiptParams, ActionSubmitResult,
+    AudioRingAttachParams, AudioSetTargetParams, AudioTarget, AudioWindowTarget,
     CaptureSetTargetParams, CaptureState, CaptureTarget, Click, ControlStep, CoreHealthParams,
-    CoreHelloParams, CoreHelloResult, DropReason, Dropped, Empty, Executed, FakeAxisRelease,
-    FakeAxisSet, FakeClick, FakeInputEvent, FakeInputEventParams, FakeKeyDown, FakeKeyPress,
-    FakeKeyUp, FakeLeaseGrantParams, FakeLeaseRevokeParams, FakeMouseDown, FakeMouseMove,
-    FakeMouseUp, FakeReleaseAll, FakeScroll, FakeTarget, FrameRingAttachParams, HeldAxis,
-    HeldInput, HeldKey, HeldMouseButton, InputReleasedParams, KeyPress, LatestFrame, LeaseStatus,
-    MouseButton, MouseMove, Producer, ProducerHeartbeatParams, ProducerRevokeParams, RejectReason,
-    Rejected, ReleaseReason, Scroll, WindowTarget,
+    CoreHelloParams, CoreHelloResult, DropReason, Dropped, Empty, Executed, FakeAudioTarget,
+    FakeAxisRelease, FakeAxisSet, FakeClick, FakeInputEvent, FakeInputEventParams, FakeKeyDown,
+    FakeKeyPress, FakeKeyUp, FakeLeaseGrantParams, FakeLeaseRevokeParams, FakeMouseDown,
+    FakeMouseMove, FakeMouseUp, FakeReleaseAll, FakeScroll, FakeTarget, FrameRingAttachParams,
+    HeldAxis, HeldInput, HeldKey, HeldMouseButton, InputReleasedParams, KeyPress, LatestAudio,
+    LatestFrame, LeaseStatus, MouseButton, MouseMove, Producer, ProducerHeartbeatParams,
+    ProducerRevokeParams, RejectReason, Rejected, ReleaseReason, Scroll, WindowTarget,
 };
 use crate::methods::{
-    ActionReceipt, ActionSubmit, CaptureSetTarget, CoreHealth, CoreHello, CoreStop, FakeInput,
-    FrameRingAttach, InputReleased, Method, MethodInfo, ProducerHeartbeat, ProducerRevoke, Request,
-    TestLeaseGrant, TestLeaseRevoke, catalog, error_code, test_device_catalog,
+    ActionReceipt, ActionSubmit, AudioRingAttach, AudioSetTarget, CaptureSetTarget, CoreHealth,
+    CoreHello, CoreStop, FakeInput, FrameRingAttach, InputReleased, Method, MethodInfo,
+    ProducerHeartbeat, ProducerRevoke, Request, TestLeaseGrant, TestLeaseRevoke, catalog,
+    error_code, test_device_catalog,
 };
+use crate::{audio_ring, frame_ring};
 
 /// Schema 相对 `protocol/` 的路径。
 pub const SCHEMA_PATH: &str = "schema/core-protocol.schema.json";
 /// 帧环偏移表相对 `protocol/` 的路径。
 pub const FRAME_RING_LAYOUT_PATH: &str = "frame-ring-layout.json";
+/// 音频环偏移表相对 `protocol/` 的路径。
+pub const AUDIO_RING_LAYOUT_PATH: &str = "audio-ring-layout.json";
 /// 示例消息目录相对 `protocol/` 的路径。
 pub const FIXTURES_DIR: &str = "fixtures";
 
@@ -55,6 +60,10 @@ pub fn files() -> Vec<File> {
         File {
             path: FRAME_RING_LAYOUT_PATH.to_owned(),
             contents: to_json(&frame_ring::layout()),
+        },
+        File {
+            path: AUDIO_RING_LAYOUT_PATH.to_owned(),
+            contents: to_json(&audio_ring::layout()),
         },
     ];
     files.extend(fixtures().into_iter().map(|fixture| File {
@@ -224,6 +233,22 @@ pub fn fixtures() -> Vec<Fixture> {
             max_height: height,
         }
     };
+    let audio = |name: &str, sample_rate: u32, channels: u32, capacity: u32, blocks: u32| {
+        let stride = (audio_ring::BLOCK_SAMPLES_OFFSET
+            + u64::from(capacity) * u64::from(channels) * u64::from(audio_ring::BYTES_PER_VALUE))
+        .next_multiple_of(audio_ring::BLOCK_ALIGN);
+        AudioRingAttachParams {
+            name: name.into(),
+            size_bytes: audio_ring::BLOCKS_OFFSET + u64::from(blocks) * stride,
+            layout_version: audio_ring::LAYOUT_VERSION,
+            block_count: blocks,
+            block_stride: stride,
+            block_capacity: capacity,
+            sample_rate,
+            channels,
+            sample_format: audio_ring::SAMPLE_FORMAT_F32,
+        }
+    };
     let mut fixtures = vec![
         Fixture::params::<CoreHello>(
             None,
@@ -262,6 +287,30 @@ pub fn fixtures() -> Vec<Fixture> {
             },
         ),
         Fixture::result::<CaptureSetTarget>(None, &Empty {}),
+        Fixture::params::<AudioRingAttach>(
+            None,
+            &audio("bellis-game-runtime-audio-example", 48_000, 2, 960, 400),
+        ),
+        Fixture::result::<AudioRingAttach>(None, &Empty {}),
+        Fixture::params::<AudioSetTarget>(
+            Some("window"),
+            &AudioSetTargetParams {
+                target: AudioTarget::Window(AudioWindowTarget {
+                    process_name: "synthetic-game.exe".into(),
+                    window_class: Some("SyntheticGameWindow".into()),
+                    title: None,
+                }),
+            },
+        ),
+        Fixture::params::<AudioSetTarget>(
+            Some("fake"),
+            &AudioSetTargetParams {
+                target: AudioTarget::Fake(FakeAudioTarget {
+                    output: audio("bellis-game-runtime-fake-audio-example", 16_000, 1, 160, 8),
+                }),
+            },
+        ),
+        Fixture::result::<AudioSetTarget>(None, &Empty {}),
         Fixture::params::<ProducerHeartbeat>(
             None,
             &ProducerHeartbeatParams {
@@ -400,6 +449,11 @@ pub fn fixtures() -> Vec<Fixture> {
                     capture_ns: 5_683_000_000,
                 }),
                 lease: LeaseStatus::Valid,
+                audio: CaptureState::Capturing,
+                latest_audio: Some(LatestAudio {
+                    block_number: 570,
+                    capture_ns: 5_688_000_000,
+                }),
             },
         ),
         Fixture::params::<TestLeaseGrant>(

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use core_protocol::messages::{
     Accepted, Action, ActionBlock, ActionOutcome, ActionReceiptParams, ActionSubmitResult,
-    CoreHealthParams, DropReason, Dropped, Executed, FakeLeaseGrantParams, HeldInput,
+    CaptureState, CoreHealthParams, DropReason, Dropped, Executed, FakeLeaseGrantParams, HeldInput,
     InputReleasedParams, Producer, ProducerHeartbeatParams, RejectReason, Rejected, ReleaseReason,
 };
 
@@ -792,6 +792,9 @@ impl Control {
     }
 
     /// `core.health` 的内容。先读时刻再读状态：`now_ns` 不早于某个时刻的一条，其中的状态也不早于那个时刻。
+    ///
+    /// 控制状态不知道音频：`audio` 为 `idle`、`latest_audio` 为 `null`，由会话按音频线程的状态填写
+    /// （在这之后读，所以同样不早于 `now_ns`）。
     pub(crate) fn health(&self) -> CoreHealthParams {
         let now_ns = mono_clock::now_ns();
         let (capture, latest_frame) = self.frames.snapshot();
@@ -803,6 +806,8 @@ impl Control {
             producer: state.current_producer(),
             latest_frame,
             lease: state.lease.status(now_ns),
+            audio: CaptureState::Idle,
+            latest_audio: None,
         }
     }
 

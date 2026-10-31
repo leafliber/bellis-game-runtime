@@ -1,10 +1,12 @@
-//! 核协议：主进程与实时核之间核连接上的消息与帧环布局，是它们的唯一源（GR-03）。
+//! 核协议：主进程与实时核之间核连接上的消息与帧环、音频环的布局，是它们的唯一源（GR-03）。
 //!
-//! 消息集、字段含义与帧环布局见 `docs/modules/core-protocol.md`。JSON Schema、Pydantic 模型、
-//! 帧环偏移表与示例消息都由本 crate 导出到仓库的 `protocol/`，重新生成用 `uv run generate`。
+//! 消息集、字段含义与两个环的布局见 `docs/modules/core-protocol.md`。JSON Schema、Pydantic 模型、
+//! 两个环的偏移表与示例消息都由本 crate 导出到仓库的 `protocol/`，重新生成用 `uv run generate`。
 
+pub mod audio_ring;
 pub mod export;
 pub mod frame_ring;
+pub mod layout;
 pub mod messages;
 pub mod methods;
 

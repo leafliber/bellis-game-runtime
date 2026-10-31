@@ -3,9 +3,9 @@
 `uv run generate` 重新生成全部生成物并写回 `protocol/`；`uv run check` 的 `generated files` 一项以
 `--check` 运行：重新生成到临时目录，与入库的逐字节比较，不一致即失败。
 
-管线：Rust 的 `core-protocol-export` 写出 JSON Schema、帧环偏移表与示例消息；datamodel-codegen 从
-Schema 生成 Pydantic 模型；本模块从 Schema 的 `x-methods` 写出方法目录。两份 Python 文件都经 ruff
-整理。输出不含时间戳与路径，换行一律 LF，Windows 与 Linux 上逐字节相同。
+管线：Rust 的 `core-protocol-export` 写出 JSON Schema、帧环与音频环的偏移表与示例消息；
+datamodel-codegen 从 Schema 生成 Pydantic 模型；本模块从 Schema 的 `x-methods` 写出方法目录。
+两份 Python 文件都经 ruff 整理。输出不含时间戳与路径，换行一律 LF，Windows 与 Linux 上逐字节相同。
 """
 
 import argparse
@@ -29,7 +29,7 @@ SCHEMA_PATH = "schema/core-protocol.schema.json"
 MODELS_PATH = "src/core_protocol/models.py"
 METHODS_PATH = "src/core_protocol/methods.py"
 GENERATED_DIRS = ("schema", "fixtures")
-GENERATED_FILES = ("frame-ring-layout.json", MODELS_PATH, METHODS_PATH)
+GENERATED_FILES = ("frame-ring-layout.json", "audio-ring-layout.json", MODELS_PATH, METHODS_PATH)
 
 PYTHON_HEADER = "# 由 `uv run generate` 从 core/crates/core-protocol 生成，不要手改。"
 
@@ -98,7 +98,7 @@ def tidy_python(source: bytes, repo_path: str) -> bytes:
 
 
 def export_rust(out: Path, *, locked: bool) -> None:
-    """运行 `core-protocol-export`，写出 Schema、帧环偏移表与示例消息。"""
+    """运行 `core-protocol-export`，写出 Schema、帧环与音频环的偏移表与示例消息。"""
     argv = ["cargo", "run", "--quiet", "--package", "core-protocol"]
     if locked:
         argv.append("--locked")
