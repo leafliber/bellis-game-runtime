@@ -67,6 +67,7 @@ from game_runtime.secret_store import (
     SecretStoreError,
     SessionInfo,
     delete_session_info,
+    read_session_info,
     write_session_info,
 )
 
@@ -281,7 +282,8 @@ class OperatorConsole:
         self._credentials: ChannelCredentials | None = None
         self._credentials_scope = contextlib.ExitStack()
         self._log: SessionLog | None = None
-        self._info_written = False
+        self._session_id: str | None = None
+        """写进 SecretStore 的会话信息的 `sessionId`；还没写入或已删除时为 None。"""
         self._closed = False
 
     # 状态
@@ -403,7 +405,7 @@ class OperatorConsole:
                 credentials, session_id, launcher_pid=self._pid, started_at=started
             )
             write_session_info(self._store, info)
-            self._info_written = True
+            self._session_id = session_id
         except BaseException:
             await self._teardown()
             raise
@@ -435,12 +437,15 @@ class OperatorConsole:
                 await peer.close()
         if self._server is not None:
             await self._server.close()
-        if self._info_written:
+        if self._session_id is not None:
             try:
-                delete_session_info(self._store)
+                # 只删自己写的：已被后开的控制台覆盖的不动。
+                current = read_session_info(self._store)
+                if current is not None and current.session_id == self._session_id:
+                    delete_session_info(self._store)
             except SecretStoreError as error:
                 logger.error("没能删除 SecretStore 里的会话信息：%s", error)
-            self._info_written = False
+            self._session_id = None
         self._credentials_scope.close()
         if self._log is not None:
             self._log.close()
