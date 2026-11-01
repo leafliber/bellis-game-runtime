@@ -603,6 +603,30 @@ def test_the_connection_info_is_in_the_secret_store_while_open(data_dir: Path) -
     run(main)
 
 
+def test_closing_leaves_the_connection_info_of_a_later_console(data_dir: Path) -> None:
+    async def main() -> None:
+        async with bench(data_dir) as first:
+            later = OperatorConsole(
+                synthetic(*TWO_PRECONDITIONS),
+                store=first.store,
+                data_dir=data_dir,
+                clock=first.clock,
+                wall=Wall(),
+                pid=4343,
+            )
+            await later.open()
+            try:
+                await first.console.close()
+                info = read_session_info(first.store)
+                assert info is not None
+                assert info.credentials() == later.credentials
+            finally:
+                await later.close()
+            assert read_session_info(first.store) is None
+
+    run(main)
+
+
 def test_the_session_log_records_the_session(data_dir: Path) -> None:
     async def main() -> Path:
         async with bench(data_dir) as b:
