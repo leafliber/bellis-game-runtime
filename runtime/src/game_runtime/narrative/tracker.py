@@ -224,7 +224,8 @@ class SentenceTracker:
             and not same_name(current.speaker_key, speaker_key)
         ):
             return False
-        return continues(current.key, key)
+        partial = current.record.completeness is Completeness.PARTIAL
+        return continues(current.key, key, partial=partial)
 
     def _start(self, frame: BoxFrame, key: str, speaker_key: str | None) -> NarrativeRecord:
         speaker = frame.speaker if speaker_key is not None else None

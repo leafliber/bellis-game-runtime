@@ -135,6 +135,39 @@ def test_continues(current: str, observed: str, same: bool) -> None:
     assert continues(current, observed) is same
 
 
+@pytest.mark.parametrize(
+    ("current", "observed", "partial", "same"),
+    [
+        ("一然后", "然后风停了", True, True),  # 开头的破折号一次读成“一”、一次读成“-”
+        ("一然后", "然后风停了", False, False),  # 已完整的短句不容错
+        ("唔", "晤", True, True),  # 形近字前后读得不同
+        ("唔", "晤", False, False),
+        ("雨停", "雨挺了", True, True),
+        ("门后", "你说什么", True, False),  # 两个字的部分句仍要有一个字对得上
+        ("嗯", "啊", True, True),  # 代价：一个字的部分句与随后的任何读数都算同一句
+        ("雨停了钟楼", "雨挺了钟搂", True, False),  # 4 个字起照常按 ⌊n/4⌋
+    ],
+)
+def test_short_partial_sentences_tolerate_one_character(
+    current: str, observed: str, partial: bool, same: bool
+) -> None:
+    assert continues(current, observed, partial=partial) is same
+
+
+def test_a_dash_read_two_ways_at_the_start_of_typing_stays_one_sentence() -> None:
+    feed = Feed()
+    feed.box("一然后，")  # 开头的“——”读成“一”，还在逐字显示
+    feed.box("-然后，风停了")
+    feed.box("—然后，风停了。", marker=True)
+    feed.box("唔", "林小满")
+    feed.box("晤……", "林小满", marker=True)  # 两个字的感叹句，形近字前后读得不同
+
+    assert feed.summary() == [
+        ("阿遥", "—然后，风停了。", 2, Completeness.COMPLETE),
+        ("林小满", "晤……", 2, Completeness.COMPLETE),
+    ]
+
+
 def test_continues_on_long_text_stays_within_the_band() -> None:
     """长句只算带内：一处读错的长句仍续得上，前面多出超过容差的字即续不上。"""
     sentence = "雨停了钟楼的指针停在七点" * 40
