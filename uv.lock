@@ -98,6 +98,7 @@ version = "0.0.0"
 source = { editable = "tools/gs04-ocr" }
 dependencies = [
     { name = "bellis-game-runtime" },
+    { name = "fonttools" },
     { name = "numpy" },
     { name = "opencv-python-headless" },
     { name = "pydantic" },
@@ -118,6 +119,7 @@ windows-ocr = [
 [package.metadata]
 requires-dist = [
     { name = "bellis-game-runtime", editable = "runtime" },
+    { name = "fonttools", specifier = ">=4.68.0" },
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "opencv-python-headless", specifier = ">=5.0.0.93" },
     { name = "pydantic", specifier = ">=2.14.2" },
@@ -139,12 +141,14 @@ source = { editable = "tools/gs06-eval" }
 dependencies = [
     { name = "bellis-game-runtime" },
     { name = "numpy" },
+    { name = "pydantic" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "bellis-game-runtime", editable = "runtime" },
     { name = "numpy", specifier = ">=2.5.4" },
+    { name = "pydantic", specifier = ">=2.14.2" },
 ]
 
 [[package]]

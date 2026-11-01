@@ -1,15 +1,19 @@
 """`uv run gs06`：GS-06 配音检测的离线评测（`docs/modules/perception.md` 的“GS-06 的评测”）。
 
 - `gs06 truth <纯配音.wav>`：打印按能量得出的配音段。
-- `gs06 eval --voice <纯配音.wav> [--background 名字=<背景.wav>]... [--mix <正常混音.wav>]`：
-  评测，报告写进 `reports/gs06/`。
-- `gs06 synth <目录>`：用 SAPI 与合成的背景生成自测样本。
+- `gs06 eval --suite <目录>`：整组评测 `gs06 synth` 写出的目录（按其中的 `suite.toml`）。
+- `gs06 eval --voice <纯配音.wav> [--background 名字=<背景.wav>]...
+  [--vocal-background 名字=<背景.wav>]... [--mix <正常混音.wav>]`：评测给出的文件。
+- `gs06 synth <目录>`：用 SAPI 与合成的背景生成整组样本。
+
+报告写进 `reports/gs06/`。
 """
 
 import argparse
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from game_runtime.artifacts import ArtifactError, verify_artifact
 from game_runtime.local_data import local_data_dir
@@ -17,11 +21,11 @@ from game_runtime.voice_activity import SILERO_VAD, SileroVad, VoiceParams
 from gs06_eval import sapi
 from gs06_eval.evaluate import DEFAULT_GAINS, run_evaluation
 from gs06_eval.metrics import Collars
-from gs06_eval.mix import mix
 from gs06_eval.report import environment, format_summary, reports_dir, sha256_file, write_report
-from gs06_eval.synth import effects, music, voice_track
+from gs06_eval.suite import SuiteError, SuiteLine, read_suite
+from gs06_eval.synth import RATES, write_samples
 from gs06_eval.truth import TruthParams, voice_truth
-from gs06_eval.wav import Audio, read_wav, write_wav
+from gs06_eval.wav import Audio, WavError, read_wav
 
 
 def _truth_options(parser: argparse.ArgumentParser) -> None:
@@ -52,11 +56,21 @@ def _truth_params(args: argparse.Namespace) -> TruthParams:
     )
 
 
-def _gains(text: str) -> tuple[float, ...]:
+def _numbers(text: str) -> tuple[float, ...]:
     try:
         return tuple(float(part) for part in text.split(",") if part.strip())
     except ValueError as error:
-        raise argparse.ArgumentTypeError(f"增益须为逗号分隔的数：{text}") from error
+        raise argparse.ArgumentTypeError(f"须为逗号分隔的数：{text}") from error
+
+
+def _rates(text: str) -> tuple[int, ...]:
+    try:
+        rates = tuple(int(part) for part in text.split(",") if part.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"语速须为逗号分隔的整数：{text}") from error
+    if not rates or any(rate not in sapi.RATES for rate in rates):
+        raise argparse.ArgumentTypeError(f"语速须为 −10 到 10 之间的整数，至少一个：{text}")
+    return rates
 
 
 def _background(text: str) -> tuple[str, Path]:
@@ -75,22 +89,37 @@ def parser() -> argparse.ArgumentParser:
     _truth_options(truth)
 
     run = commands.add_parser("eval", help="评测，报告写进 reports/gs06/")
-    run.add_argument("--voice", type=Path, required=True, help="纯配音的 WAV（背景静音）")
+    source = run.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--suite",
+        type=Path,
+        metavar="目录",
+        help="整组评测：gs06 synth 写出的、含 suite.toml 的目录",
+    )
+    source.add_argument("--voice", type=Path, help="纯配音的 WAV（背景静音）")
     run.add_argument(
         "--background",
         type=_background,
         action="append",
         default=[],
         metavar="名字=WAV",
-        help="只有背景（配音静音）的 WAV，可给多段，如 bgm=… sfx=…",
+        help="与 --voice 一起：只有背景（配音静音）的 WAV，可给多段，如 music=… effects=…",
+    )
+    run.add_argument(
+        "--vocal-background",
+        type=_background,
+        action="append",
+        default=[],
+        metavar="名字=WAV",
+        help="与 --voice 一起：带人声的背景，只记录、不设门槛",
     )
     run.add_argument(
         "--gains",
-        type=_gains,
+        type=_numbers,
         default=DEFAULT_GAINS,
-        help="背景的增益（dB，逗号分隔，写成 --gains=-12,-6,0,6），缺省 -12,-6,0,6",
+        help="背景相对配音电平的增益（dB，逗号分隔，写成 --gains=-12,-6,0,6），缺省 -12,-6,0,6",
     )
-    run.add_argument("--mix", type=Path, help="正常混音的 WAV：只给判定，不算准确率")
+    run.add_argument("--mix", type=Path, help="与 --voice 一起：正常混音的 WAV，只给判定")
     run.add_argument(
         "--model",
         type=Path,
@@ -110,11 +139,21 @@ def parser() -> argparse.ArgumentParser:
     group.add_argument("--offset-collar", type=float, default=collars.offset, help="秒")
     _truth_options(run)
 
-    synth = commands.add_parser("synth", help="用 SAPI 与合成的背景生成自测样本（只在 Windows）")
-    synth.add_argument(
-        "directory", type=Path, help="写 voice.wav、bgm.wav、sfx.wav、mix.wav 的目录"
-    )
+    synth = commands.add_parser("synth", help="用 SAPI 与合成的背景生成整组样本（只在 Windows）")
+    synth.add_argument("directory", type=Path, help="写各段 WAV 与 suite.toml 的目录")
     synth.add_argument("--sample-rate", type=int, default=48_000)
+    synth.add_argument(
+        "--max-voices",
+        type=int,
+        help="至多用几把语音（中文的优先），缺省为中文 4 把加其它语言 2 把",
+    )
+    synth.add_argument(
+        "--rates",
+        type=_rates,
+        default=RATES,
+        help=f"SAPI 的语速（−10 到 10，逗号分隔，写成 --rates=-3,0,4），缺省 "
+        f"{','.join(map(str, RATES))}",
+    )
     return root
 
 
@@ -137,21 +176,53 @@ def command_truth(args: argparse.Namespace) -> int:
     return 0
 
 
+class _InputError(Exception):
+    pass
+
+
+def _sources(
+    args: argparse.Namespace,
+) -> tuple[Path, list[tuple[str, Path, bool]], Path | None, tuple[SuiteLine, ...]]:
+    """纯配音、背景（名字、路径、是否带人声）、正常混音与每句的出处。"""
+    if args.suite is None:
+        backgrounds = [(name, path, False) for name, path in args.background]
+        backgrounds += [(name, path, True) for name, path in args.vocal_background]
+        return args.voice, backgrounds, args.mix, ()
+    if args.background or args.vocal_background or args.mix is not None:
+        raise _InputError("--suite 不与 --background、--vocal-background、--mix 一起用")
+    directory: Path = args.suite
+    try:
+        suite = read_suite(directory)
+    except SuiteError as error:
+        raise _InputError(str(error)) from None
+    backgrounds = [(b.name, directory / b.file, b.vocal) for b in suite.backgrounds]
+    normal = None if suite.mix is None else directory / suite.mix
+    return directory / suite.voice, backgrounds, normal, suite.lines
+
+
 def command_eval(args: argparse.Namespace) -> int:
-    voice, voice_info = _input(args.voice, "voice")
-    inputs = [voice_info]
-    backgrounds: dict[str, Audio] = {}
-    for name, path in args.background:
-        if name in backgrounds:
-            print(f"背景 {name} 重复", file=sys.stderr)
-            return 2
-        audio, info = _input(path, f"background {name}")
-        backgrounds[name] = audio
-        inputs.append(info)
-    normal_mix = None
-    if args.mix is not None:
-        normal_mix, info = _input(args.mix, "normal mix")
-        inputs.append(info)
+    try:
+        voice_path, sources, mix_path, lines = _sources(args)
+        voice, voice_info = _input(voice_path, "voice")
+        inputs = [voice_info]
+        backgrounds: dict[str, Audio] = {}
+        vocal: set[str] = set()
+        for name, path, is_vocal in sources:
+            if name in backgrounds:
+                raise _InputError(f"背景 {name} 重复")
+            role = "vocal background" if is_vocal else "background"
+            audio, info = _input(path, f"{role} {name}")
+            backgrounds[name] = audio
+            inputs.append(info)
+            if is_vocal:
+                vocal.add(name)
+        normal_mix = None
+        if mix_path is not None:
+            normal_mix, info = _input(mix_path, "normal mix")
+            inputs.append(info)
+    except (_InputError, OSError, WavError) as error:
+        print(error, file=sys.stderr)
+        return 2
     artifact: dict[str, str] | None = None
     if args.model is None:
         try:
@@ -169,19 +240,27 @@ def command_eval(args: argparse.Namespace) -> int:
         min_speech=args.min_speech,
         min_silence=args.min_silence,
     )
-    results = run_evaluation(
-        voice=voice,
-        backgrounds=backgrounds,
-        model=model,
-        params=params,
-        gains=args.gains,
-        normal_mix=normal_mix,
-        truth_params=_truth_params(args),
-        collars=Collars(onset=args.onset_collar, offset=args.offset_collar),
-    )
-    report = {
+    try:
+        results = run_evaluation(
+            voice=voice,
+            backgrounds=backgrounds,
+            model=model,
+            params=params,
+            gains=args.gains,
+            vocal=vocal,
+            normal_mix=normal_mix,
+            lines=lines,
+            truth_params=_truth_params(args),
+            collars=Collars(onset=args.onset_collar, offset=args.offset_collar),
+        )
+    except ValueError as error:
+        print(f"无法评测：{error}", file=sys.stderr)
+        return 2
+    report: dict[str, Any] = {
         "spike": "GS-06",
         "environment": environment(),
+        "command": ["gs06", *args.argv],
+        "suite": None if args.suite is None else str(args.suite.resolve()),
         "model": {
             "artifact": artifact,
             "file": model_path.name,
@@ -202,27 +281,29 @@ def command_synth(args: argparse.Namespace) -> int:
     if not sapi.available():
         print("本机没有可用的 SAPI 语音（只在 Windows 上可用）", file=sys.stderr)
         return 1
-    directory: Path = args.directory
-    directory.mkdir(parents=True, exist_ok=True)
-    track = voice_track(args.sample_rate)
-    voice = Audio(track.audio.samples.repeat(2, axis=1), track.audio.sample_rate)
-    bgm = music(voice.duration, args.sample_rate)
-    sfx = effects(voice.duration, args.sample_rate)
-    normal = mix(mix(voice, bgm, 0.0), sfx, 0.0)
-    for name, audio in (("voice", voice), ("bgm", bgm), ("sfx", sfx), ("mix", normal)):
-        write_wav(directory / f"{name}.wav", audio)
-    print(f"语音：{track.voice}，{voice.duration:.1f} 秒，写进 {directory}")
-    print(
-        "评测：uv run gs06 eval "
-        f'--voice "{directory / "voice.wav"}" '
-        f'--background bgm="{directory / "bgm.wav"}" '
-        f'--background sfx="{directory / "sfx.wav"}" '
-        f'--mix "{directory / "mix.wav"}"'
-    )
+    if args.max_voices is not None and args.max_voices < 1:
+        print("--max-voices 至少为 1", file=sys.stderr)
+        return 2
+    try:
+        written = write_samples(
+            args.directory,
+            sample_rate=args.sample_rate,
+            max_voices=args.max_voices,
+            rates=args.rates,
+        )
+    except sapi.SapiError as error:
+        print(error, file=sys.stderr)
+        return 1
+    names = "，".join(f"{v.name}（{v.culture}）" for v in written.voices)
+    print(f"语音：{names}；语速：{', '.join(map(str, args.rates))}")
+    print(f"带人声的背景：{written.chatter_voice.name}")
+    print(f"纯配音 {written.duration:.1f} 秒，{len(written.suite.lines)} 句，写进 {args.directory}")
+    print(f'评测：uv run gs06 eval --suite "{args.directory}"')
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    args.argv = list(sys.argv[1:] if argv is None else argv)
     handlers = {"truth": command_truth, "eval": command_eval, "synth": command_synth}
     return handlers[args.command](args)

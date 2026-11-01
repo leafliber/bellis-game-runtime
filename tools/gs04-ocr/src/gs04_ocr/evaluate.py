@@ -1,4 +1,4 @@
-"""对一批样本跑一个引擎，按类别与总计统计字符准确率与时延，写报告。
+"""对一批样本跑一个引擎，按类别、按每个标签的每个取值与总计统计字符准确率与时延，写报告。
 
 报告写到不入库的 `reports/gs04/`，内容见 `docs/modules/perception.md` 的“GS-04 的评测工具”。
 """
@@ -8,7 +8,7 @@ import os
 import platform
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,8 @@ from gs04_ocr.samples import LoadedSample
 REPO_ROOT = Path(__file__).resolve().parents[4]
 REPORTS_DIR = REPO_ROOT / "reports" / "gs04"
 TOTAL = "总计"
+TAG_TITLES = {"font": "字体", "size": "字号（像素）", "background": "底色", "style": "字形"}
+"""报告里各标签的标题；没有列出的标签用它本身的名字。"""
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class SampleResult:
     milliseconds: float
     warmup: bool
     """第一次调用，含预热；时延不计入分布。"""
+    tags: dict[str, str] = field(default_factory=dict[str, str])
 
     @property
     def predicted(self) -> str:
@@ -81,6 +84,7 @@ def run_engine(
                 lines=tuple(lines),
                 milliseconds=elapsed,
                 warmup=position == 0,
+                tags=dict(sample.tags),
             )
         )
     return results
@@ -93,6 +97,18 @@ def summarize(results: Sequence[SampleResult]) -> dict[str, Summary]:
         groups.setdefault(result.category, []).append(result)
     groups[TOTAL] = list(results)
     return {name: _summary(group) for name, group in groups.items()}
+
+
+def summarize_tags(results: Sequence[SampleResult]) -> dict[str, dict[str, Summary]]:
+    """按每个标签的每个取值汇总（标签与取值都按出现的顺序）；没有这个标签的样本不计入。"""
+    groups: dict[str, dict[str, list[SampleResult]]] = {}
+    for result in results:
+        for key, value in result.tags.items():
+            groups.setdefault(key, {}).setdefault(value, []).append(result)
+    return {
+        key: {value: _summary(group) for value, group in values.items()}
+        for key, values in groups.items()
+    }
 
 
 def _summary(results: Sequence[SampleResult]) -> Summary:
@@ -125,19 +141,9 @@ def _ms(value: float | None) -> str:
     return "—" if value is None else f"{value:.1f}"
 
 
-def markdown(report: Mapping[str, Any], summaries: Mapping[str, Summary]) -> str:
+def _table(title: str, summaries: Mapping[str, Summary]) -> list[str]:
     lines = [
-        f"# GS-04 OCR 评测：{report['engine']['engine']}",
-        "",
-        f"- 时间：{report['date']}",
-        f"- 命令：`{report['command']}`",
-        f"- 样本：{report['samples_dir']}（{report['sample_count']} 个）",
-        f"- 系统：{report['environment']['system']}，{report['environment']['processor']}，"
-        f"{report['environment']['cpu_count']} 个逻辑处理器",
-        f"- 引擎：`{json.dumps(report['engine'], ensure_ascii=False)}`",
-        f"- 预热（第一次调用）：{_ms(report['warmup_ms'])} ms，不计入时延分布",
-        "",
-        "| 类别 | 样本 | 字符准确率 | NFKC 后 | 完全相同 | p50 ms | p90 | p95 | p99 | 最大 "
+        f"| {title} | 样本 | 字符准确率 | NFKC 后 | 完全相同 | p50 ms | p90 | p95 | p99 | 最大 "
         "| 均值 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
@@ -150,13 +156,40 @@ def markdown(report: Mapping[str, Any], summaries: Mapping[str, Summary]) -> str
             f"{_ms(lat.p95 if lat else None)} | {_ms(lat.p99 if lat else None)} | "
             f"{_ms(lat.max if lat else None)} | {_ms(lat.mean if lat else None)} |"
         )
+    return lines
+
+
+def markdown(
+    report: Mapping[str, Any],
+    summaries: Mapping[str, Summary],
+    by_tag: Mapping[str, Mapping[str, Summary]] | None = None,
+) -> str:
+    lines = [
+        f"# GS-04 OCR 评测：{report['engine']['engine']}",
+        "",
+        f"- 时间：{report['date']}",
+        f"- 命令：`{report['command']}`",
+        f"- 样本：{report['samples_dir']}（{report['sample_count']} 个）",
+        f"- 系统：{report['environment']['system']}，{report['environment']['processor']}，"
+        f"{report['environment']['cpu_count']} 个逻辑处理器",
+        f"- 引擎：`{json.dumps(report['engine'], ensure_ascii=False)}`",
+        f"- 预热（第一次调用）：{_ms(report['warmup_ms'])} ms，不计入时延分布",
+        "",
+        *_table("类别", summaries),
+    ]
+    if by_tag:
+        lines += ["", "## 按标签", "", "只计入带这个标签的样本。"]
+        for key, values in by_tag.items():
+            lines += ["", f"### {TAG_TITLES.get(key, key)}（`{key}`）", ""]
+            lines += _table(key, values)
     lines += ["", "## 不完全相同的样本", ""]
     mismatched = [r for r in report["results"] if r["strict_distance"] > 0]
     if not mismatched:
         lines.append("无。")
     for result in mismatched:
+        tags = "".join(f" {k}={v}" for k, v in result["tags"].items())
         lines.append(
-            f"- #{result['index'] + 1} {result['image']} {result['category']}："
+            f"- #{result['index'] + 1} {result['image']} {result['category']}{tags}："
             f"真值 {json.dumps(result['truth'], ensure_ascii=False)}，"
             f"识别 {json.dumps(result['predicted'], ensure_ascii=False)}"
         )
@@ -172,6 +205,7 @@ def build_report(
     date: datetime | None = None,
 ) -> tuple[dict[str, Any], dict[str, Summary]]:
     summaries = summarize(results)
+    by_tag = summarize_tags(results)
     when = (date or datetime.now(UTC)).isoformat(timespec="seconds")
     warmup = next((r.milliseconds for r in results if r.warmup), None)
     report: dict[str, Any] = {
@@ -184,6 +218,10 @@ def build_report(
         "engine": dict(engine.describe()),
         "warmup_ms": warmup,
         "summary": {name: asdict(summary) for name, summary in summaries.items()},
+        "by_tag": {
+            key: {value: asdict(summary) for value, summary in values.items()}
+            for key, values in by_tag.items()
+        },
         "results": [
             {
                 **asdict(result),
@@ -199,7 +237,10 @@ def build_report(
 
 
 def write_report(
-    report: Mapping[str, Any], summaries: Mapping[str, Summary], directory: Path
+    report: Mapping[str, Any],
+    summaries: Mapping[str, Summary],
+    directory: Path,
+    by_tag: Mapping[str, Mapping[str, Summary]] | None = None,
 ) -> tuple[Path, Path]:
     """写 JSON 与 Markdown，文件名为 UTC 时间、引擎与样本目录名。"""
     directory.mkdir(parents=True, exist_ok=True)
@@ -210,5 +251,5 @@ def write_report(
     json_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n"
     )
-    md_path.write_text(markdown(report, summaries), encoding="utf-8", newline="\n")
+    md_path.write_text(markdown(report, summaries, by_tag), encoding="utf-8", newline="\n")
     return json_path, md_path

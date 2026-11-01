@@ -1,12 +1,19 @@
-"""把纯配音与背景按增益离线混合，以及按音频环的样子把声音逐块喂给配音检测的核心。"""
+"""把纯配音与背景按增益离线混合，以及按音频环的样子把声音逐块喂给配音检测的核心。
 
+评测的增益相对配音的电平（`relative_gain_db`）：配音的电平为真值段内的均方根电平，背景的电平为它
+循环或截断到配音的长度后整段的均方根电平。
+"""
+
+import math
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from game_runtime.audio_ring import AudioBlock
 from game_runtime.voice_activity import SpeechModel, VoiceActivityDetector, VoiceChange, VoiceParams
+from gs06_eval.truth import Segment
 from gs06_eval.wav import Audio, Float32Array
 
 BLOCK_SECONDS = 0.01
@@ -42,10 +49,50 @@ def mix(voice: Audio, background: Audio, gain_db: float) -> Audio:
     return Audio(total.astype(np.float32), voice.sample_rate)
 
 
+def fitted(background: Audio, length: int, gain_db: float = 0.0) -> Audio:
+    """背景循环或截断到 `length` 个采样点，乘以 `gain_db`。"""
+    gain = np.float32(10.0 ** (gain_db / 20.0))
+    return Audio((fit(background, length) * gain).astype(np.float32), background.sample_rate)
+
+
 def rms_db(audio: Audio) -> float:
     """整段的均方根电平（dBFS）。"""
     power = float(np.mean(audio.mono() ** 2)) if audio.length else 0.0
     return 10.0 * float(np.log10(max(power, 1e-20)))
+
+
+SILENT_DB = -150.0
+"""电平低于它即当作静音，没有可比的电平。"""
+
+
+def voice_level_db(voice: Audio, segments: Sequence[Segment]) -> float:
+    """配音的电平：真值段内的均方根电平（dBFS）。"""
+    mono = voice.mono()
+    pieces = [
+        mono[max(0, math.floor(s.start * voice.sample_rate)) : math.ceil(s.end * voice.sample_rate)]
+        for s in segments
+    ]
+    total = sum(len(piece) for piece in pieces)
+    if total == 0:
+        raise ValueError("纯配音里没有配音段，没有配音的电平")
+    power = sum(float(np.sum(piece**2)) for piece in pieces) / total
+    level = 10.0 * math.log10(max(power, 1e-20))
+    if level < SILENT_DB:
+        raise ValueError("纯配音的配音段是静音")
+    return level
+
+
+def background_level_db(background: Audio, length: int) -> float:
+    """背景的电平：循环或截断到 `length` 个采样点后整段的均方根电平（dBFS）。"""
+    level = rms_db(fitted(background, length))
+    if level < SILENT_DB:
+        raise ValueError("背景是静音，没有可比的电平")
+    return level
+
+
+def relative_gain_db(voice_level: float, background_level: float, gain_db: float) -> float:
+    """背景要乘的增益（dB，相对它本身的电平），使它的电平为配音的电平加 `gain_db`。"""
+    return voice_level + gain_db - background_level
 
 
 @dataclass
@@ -56,7 +103,7 @@ class Detection:
     duration: float
     probabilities: list[float] = field(default_factory=list[float])
     seconds: float = 0.0
-    """处理的总耗时（墙钟）。"""
+    """逐块喂入核心的总耗时（墙钟）：重采样、分帧、推理与迟滞，不含切块。"""
 
     @property
     def frames(self) -> int:
@@ -90,8 +137,9 @@ def detect(audio: Audio, model: SpeechModel, params: VoiceParams) -> Detection:
         detection.probabilities.append(probability)
 
     detector = VoiceActivityDetector(model, params, on_frame=observe)
+    items = blocks(audio)
     started = time.perf_counter()
-    for block in blocks(audio):
+    for block in items:
         detection.changes.extend(
             detector.feed(block, sample_rate=audio.sample_rate, channels=audio.channels)
         )

@@ -7,6 +7,7 @@ description = "GS-04：OCR 在样本上的字符准确率与时延，Windows 自
 requires-python = "==3.12.*"
 dependencies = [
     "bellis-game-runtime",
+    "fonttools>=4.68.0",
     "numpy>=2.5.4",
     "opencv-python-headless>=5.0.0.93",
     "pydantic>=2.14.2",

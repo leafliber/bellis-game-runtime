@@ -1,4 +1,4 @@
-"""`uv run gs04`：`synth` 渲染合成游戏的样本，`eval` 评测一个样本目录并写报告。"""
+"""`uv run gs04`：`synth` 渲染合成游戏与泛化的样本，`eval` 评测一个样本目录并写报告。"""
 
 import argparse
 import shlex
@@ -10,7 +10,17 @@ from game_runtime.adapter import GAMES_DIR, AdapterError, NotCalibratedError
 from game_runtime.ocr import DEFAULT_MODEL_SET, EngineOptions
 from gs04_ocr.engines import ENGINE_NAMES, create_engine
 from gs04_ocr.errors import EngineUnavailableError
-from gs04_ocr.evaluate import REPORTS_DIR, TOTAL, build_report, run_engine, write_report
+from gs04_ocr.evaluate import (
+    REPORTS_DIR,
+    TAG_TITLES,
+    TOTAL,
+    Summary,
+    build_report,
+    run_engine,
+    summarize_tags,
+    write_report,
+)
+from gs04_ocr.general import available_fonts
 from gs04_ocr.samples import SampleError, load_samples
 from gs04_ocr.synth import write_synthetic_samples
 
@@ -19,10 +29,17 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gs04", description="GS-04 OCR evaluation.")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    synth = commands.add_parser("synth", help="render synthetic-game samples with ground truth")
+    synth = commands.add_parser(
+        "synth", help="render synthetic-game and generalization samples with ground truth"
+    )
     synth.add_argument("directory", type=Path)
     synth.add_argument("--width", type=int, default=1280)
     synth.add_argument("--height", type=int, default=720)
+    synth.add_argument(
+        "--no-system-fonts",
+        action="store_true",
+        help="render the generalization samples with the synthetic game's font subset only",
+    )
 
     evaluate = commands.add_parser("eval", help="evaluate one engine on a sample directory")
     evaluate.add_argument("directory", type=Path)
@@ -47,10 +64,22 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _line(name: str, summary: Summary) -> str:
+    strict, nfkc, lat = summary.strict.value, summary.nfkc.value, summary.latency
+    return (
+        f"{name}：{summary.samples} 个，字符准确率 "
+        f"{'—' if strict is None else f'{strict:.4f}'}（NFKC 后 "
+        f"{'—' if nfkc is None else f'{nfkc:.4f}'}），"
+        + ("没有时延样本" if lat is None else f"p50 {lat.p50:.1f} ms，p95 {lat.p95:.1f} ms")
+    )
+
+
 def run(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "synth":
-        path = write_synthetic_samples(args.directory, args.width, args.height)
+        fonts = available_fonts(system=not args.no_system_fonts)
+        path = write_synthetic_samples(args.directory, args.width, args.height, fonts=fonts)
+        print("泛化样本的字体：" + "，".join(f"{f.name}（{f.tag}）" for f in fonts))
         print(f"已写出 {path}")
         return 0
 
@@ -73,15 +102,14 @@ def run(argv: Sequence[str] | None = None) -> int:
     results = run_engine(engine, samples)
     command = shlex.join(["gs04", *(sys.argv[1:] if argv is None else argv)])
     report, summaries = build_report(engine, args.directory.resolve(), results, command)
-    json_path, md_path = write_report(report, summaries, args.report_dir)
+    by_tag = summarize_tags(results)
+    json_path, md_path = write_report(report, summaries, args.report_dir, by_tag)
     for name, summary in summaries.items():
-        strict, nfkc, lat = summary.strict.value, summary.nfkc.value, summary.latency
-        print(
-            f"{name}：{summary.samples} 个，字符准确率 "
-            f"{'—' if strict is None else f'{strict:.4f}'}（NFKC 后 "
-            f"{'—' if nfkc is None else f'{nfkc:.4f}'}），"
-            + ("没有时延样本" if lat is None else f"p50 {lat.p50:.1f} ms，p95 {lat.p95:.1f} ms")
-        )
+        print(_line(name, summary))
+    for key, values in by_tag.items():
+        print(f"按{TAG_TITLES.get(key, key)}（{key}）：")
+        for value, summary in values.items():
+            print("  " + _line(value, summary))
     print(f"报告：{md_path}\n      {json_path}")
     total = summaries[TOTAL].strict.value
     return 0 if total is not None else 1
