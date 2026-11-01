@@ -1,10 +1,19 @@
-"""按能量得出真值、离线混合：合成的正弦段，真值已知。"""
+"""按能量得出真值、电平与相对增益、离线混合：合成的正弦段，真值已知。"""
 
 import numpy as np
 import pytest
 from numpy.typing import NDArray
 
-from gs06_eval.mix import blocks, fit, mix, rms_db
+from gs06_eval.mix import (
+    background_level_db,
+    blocks,
+    fit,
+    fitted,
+    mix,
+    relative_gain_db,
+    rms_db,
+    voice_level_db,
+)
 from gs06_eval.truth import Segment, TruthParams, merge, voice_truth
 from gs06_eval.wav import Audio
 
@@ -69,3 +78,23 @@ def test_blocks_are_cut_like_the_audio_ring() -> None:
     assert [b.capture_ns for b in items[:3]] == [0, 10_000_000, 20_000_000]
     assert items[-1].sample_count == 7
     assert not any(b.discontinuity for b in items)
+
+
+def test_levels_and_relative_gains() -> None:
+    # 配音段内幅度 0.3 的正弦（约 −13.5 dBFS），段外静音：配音的电平只算段内。
+    voice = bursts((1.0, 0), (1.0, 0.3), (1.0, 0))
+    level = voice_level_db(voice, voice_truth(voice).segments)
+    assert level == pytest.approx(20 * np.log10(0.3 / np.sqrt(2)), abs=0.1)
+    assert rms_db(voice) == pytest.approx(level - 10 * np.log10(3), abs=0.2)
+    # 背景先循环到配音的长度再算整段的电平。
+    background = Audio(np.full((RATE // 2, 2), 0.1, dtype=np.float32), RATE)
+    assert background_level_db(background, voice.length) == pytest.approx(-20.0, abs=0.01)
+    gain = relative_gain_db(level, -20.0, -6.0)
+    scaled = fitted(background, voice.length, gain)
+    assert scaled.length == voice.length
+    assert rms_db(scaled) == pytest.approx(level - 6.0, abs=0.01)
+    assert rms_db(mix(voice, background, gain)) > rms_db(voice)
+    with pytest.raises(ValueError, match="没有配音段"):
+        voice_level_db(voice, [])
+    with pytest.raises(ValueError, match="静音"):
+        background_level_db(Audio(np.zeros((10, 1), dtype=np.float32), RATE), 10)

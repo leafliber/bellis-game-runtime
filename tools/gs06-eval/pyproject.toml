@@ -8,6 +8,7 @@ requires-python = "==3.12.*"
 dependencies = [
     "bellis-game-runtime",
     "numpy>=2.5.4",
+    "pydantic>=2.14.2",
 ]
 
 [project.scripts]

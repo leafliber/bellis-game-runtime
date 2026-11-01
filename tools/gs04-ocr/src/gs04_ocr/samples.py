@@ -20,6 +20,7 @@ from game_runtime.adapter import GAMES_DIR, Adapter, PixelRect, load_adapter
 SAMPLES_FILE = "samples.toml"
 
 Ident = Annotated[StrictStr, StringConstraints(pattern=r"^[a-z][a-z0-9-]*$", max_length=48)]
+TagValue = Annotated[StrictStr, StringConstraints(pattern=r"^[a-z0-9][a-z0-9.-]*$", max_length=48)]
 
 
 class SampleError(Exception):
@@ -41,6 +42,8 @@ class Sample(BaseModel):
     """客户区物理像素的矩形 `[左, 上, 右, 下]`。"""
     text: StrictStr
     """真值；多行以换行分隔。"""
+    tags: dict[Ident, TagValue] = Field(default_factory=dict[Ident, TagValue])
+    """可选的标签（如字体 `font`、字号 `size`），评测另按每个标签的每个取值分组。"""
 
     @model_validator(mode="after")
     def _one_region(self) -> Self:
@@ -160,6 +163,9 @@ def write_sample_set(directory: Path, game: str | None, samples: Sequence[Sample
         if sample.rect is not None:
             lines.append(f"rect = [{', '.join(str(v) for v in sample.rect)}]")
         lines.append(f"text = {toml_string(sample.text)}")
+        if sample.tags:
+            pairs = ", ".join(f"{key} = {toml_string(value)}" for key, value in sample.tags.items())
+            lines.append(f"tags = {{ {pairs} }}")
         lines.append("")
     path = directory / SAMPLES_FILE
     path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
