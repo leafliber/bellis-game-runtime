@@ -82,7 +82,7 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 
 - 断开与 EOF 都由阻塞读立即发现，不需要计时；主进程卡死而连接未断时由心跳超时释放并待命，不退出。
 - 以假后端运行时，退出前至多等 500 ms 把释放全部输入的抬起与 `release_all` 写给测试设备；主进程崩溃时测试一方由此看到释放（[测试设备连接](core-protocol.md#测试设备连接)）。
-- 退出码 0 只在释放之后出现；连不上主进程或测试设备、握手失败为 1，参数不合法（含测试许可源的门禁）为 2。
+- 退出码 0 只在释放之后出现；连不上主进程、操作员控制台或测试设备、握手失败为 1，参数不合法（含输入后端与许可源的门禁）为 2。
 - **panic 即退出。** 标准库在非主线程 panic 时只结束那个线程，读线程或调度线程的 panic 会被吞掉。实时核启动时装 panic 钩子：照常打印 panic 信息后以 101 退出整个进程。钩子里不释放输入，panic 时的状态不可信；重启后先释放（`core_start`）。
 - **提权时**（计划任务启动）没有 stdin 管道，stdin 生命线须能关闭：unsupported，随 GR-06 实现。
 
@@ -93,7 +93,7 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 - 实时核记当前产出者（身份、代次、上一个算数的 `seq`、心跳截止时刻、上一个接受的动作块序号与这一代次已执行过的动作身份）、已作废的最高代次、输入许可、调度计划与持有输入的账目，放在一把锁里（`control.rs`）。时刻一律是 `mono_clock::now_ns()` 的读数。
 - 心跳由主进程的 `CoreLink` 发：当前提交资格（`kernel.active_control`）有效时每个周期发一次，身份取 `ControlGrant.producer`（条目 id），代次取 `ControlGrant.generation`，`seq` 在主进程运行期间全局递增，因而在每个代次内严格递增。资格收回（进入 QUIESCING）即停发。一个代次的第一块动作之前另发一次，见[提交动作块](plugin-kernel.md#提交动作块)。
 - 调度线程等到心跳截止时刻即释放（`heartbeat_timeout`）并待命：产出者仍是当前的，同一代次 `seq` 递增的心跳到达后重新计时。
-- **启动的顺序。** 每次启动先释放全部输入，再连接主进程；握手完成、`input.released(core_start)` 发出之后才启动处理产出者消息的读线程与发送线程，所以 `core_start` 一定先于任何因产出者消息而发的通知。以假后端运行时，测试设备连接在释放之前就连上，测试设备因而也收到 `release_all(core_start)`。
+- **启动的顺序。** 每次启动先释放全部输入，再连接主进程；握手完成、`input.released(core_start)` 发出之后才启动处理产出者消息的读线程与发送线程，所以 `core_start` 一定先于任何因产出者消息而发的通知。操作员许可连接与测试设备连接在释放之前就连上，控制台因而也收到 `input.released(core_start)`，测试设备也收到 `release_all(core_start)`。
 - 实时核每次启动都没有当前产出者与已作废的代次；代次由主进程的插件内核分配，在主进程运行期间单调递增，所以也满足“在一个实时核的生命期内严格递增”。
 
 主进程以 `core.health` 判断实时核存活：`CoreLink` 记下最近一条与收到的时刻，超过 `health_timeout` 没有新的即记录告警；实时核退出或连接断开另有进程退出与连接关闭的事件。
@@ -116,7 +116,7 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 
 | 线程 | 做什么 |
 | --- | --- |
-| 主线程 | 以假后端运行时先连上测试设备；释放、连接、握手、发 `core_start`，启动其余线程，然后等会话结束 |
+| 主线程 | 有操作员许可连接时先连上控制台，以假后端运行时接着连上测试设备；释放、连接、握手、发 `core_start`，启动其余线程，然后等会话结束 |
 | `RpcPeer` 读线程 | `producer.heartbeat`、`producer.revoke`、`core.stop`、`action.submit`、`frame_ring.attach`、`capture.set_target`、`audio_ring.attach`、`audio.set_target` 的处理函数：只动控制状态、发通知或把命令交给采集线程与音频线程，很快返回，不向主进程发请求。`action.submit` 只校验并装进调度计划，不执行任何一步 |
 | 调度 | 按时刻执行动作块的步，负责全部定时的释放：心跳超时、许可到期、持有输入时帧龄超限、截止时刻，见[动作块的执行](#动作块的执行) |
 | 核连接的发送 | 写出调度线程与测试设备连接的线程放进队列的通知（回执、`input.released`） |
@@ -124,7 +124,8 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 | 采集 | 取帧写进帧环，见[采集主循环](#采集主循环) |
 | 音频 | 取音频包写进音频环，见[音频主循环](#音频主循环) |
 | 两条生命线 | 一个等核连接关闭，一个读 stdin 直到 EOF |
-| 测试设备连接（只在假后端时） | 读线程处理 `test_lease.grant`、`test_lease.revoke`；发送线程写出假输入事件；一条生命线等它断开，断开即许可失效 |
+| 操作员许可连接（只在给出时） | 读线程处理 `operator_lease.grant`、`operator_lease.revoke`；发送线程写出 `input.released`（每次释放全部输入时，与核连接上的同一份放进它的发送队列）；一条生命线等它断开，断开即许可失效 |
+| 测试设备连接（只在假后端时） | 发送线程写出假输入事件；没有操作员许可连接时它是测试许可源：读线程处理 `test_lease.grant`、`test_lease.revoke`，一条生命线等它断开，断开即许可失效 |
 
 通知有两条出口：读线程上的处理函数直接写（`producer.revoke` 与 `core.stop` 由此在回应之前发出 `input.released`）；调度线程与测试设备连接的线程放进发送队列，由发送线程写，它们因此从不等网络写入，主进程卡住时只有发送线程阻塞。两条出口之间的先后不定。`core.stop` 以 `Handlers::request_then` 登记（见[错误处理](core-protocol.md#错误处理)）：回应写出之后才通知主线程结束会话，否则退出会丢掉回应。日志写 stderr，写失败丢弃，不 panic。
 
@@ -137,9 +138,10 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 | `core.health` 周期 | 1 秒 | `CoreLinkOptions.health_interval`，经命令行交给实时核 | 只用于诊断与判断卡死；实时核退出由进程退出与连接关闭立即发现 |
 | `core.health` 超时 | 3 秒 | `CoreLinkOptions.health_timeout` | 连续丢失 3 条 |
 | 动作允许的帧龄 | 500 ms | `CoreLinkOptions.max_frame_age`，经命令行交给实时核 | 30 Hz 时约 15 帧没有更新，与心跳超时同一量级；不进动作块，产出者不能放宽它 |
+| 操作员许可的有效期与续约间隔 | 500 ms、250 ms | 控制台的 `ConsoleOptions` | 同上，取 Bellis D-34 的初值 |
 | 测试许可的有效期与续约间隔 | 500 ms、250 ms | `FakeDevice.renew`（只用于测试） | 取 Bellis D-34 的游戏输入许可初值与续约间隔 |
 | `action.submit` 的请求 | 2 秒 | `CoreLinkOptions.rpc_timeout` | 处理函数只校验，毫秒内回应 |
-| 退出前写完通知与假输入事件 | 200 ms、500 ms | 实时核内的常量 | 输入此前已经释放，等不到也照常退出 |
+| 退出前写完通知与假输入事件 | 200 ms、500 ms | 实时核内的常量 | 输入此前已经释放，等不到也照常退出；写给控制台的 `input.released` 同通知 |
 | 启动 | 10 秒 | `CoreLinkOptions.start_timeout` | 含连接的握手（2 秒）与 `core.hello`（2 秒）；新编译的程序首次运行可能被杀毒软件扫描几秒 |
 | `producer.revoke` 的请求 | 2 秒 | `CoreLinkOptions.rpc_timeout` | 超时只记录，等待由其它事件完成；内核另有 `release_timeout` |
 | `core.hello` 的回应 | 2 秒 | 实时核内的常量 | 与通道握手的缺省时限相同 |
@@ -165,6 +167,7 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 | `realtime-core` 的单元测试 | 控制状态的每条规则（`seq`、旧代次与已作废代次、身份不同、更高代次、作废、超时待命、停止）；实时的调度线程；参数、凭据与输入后端门禁的解析。动作块与许可的单元测试见[动作块的验证](#动作块的验证) |
 | `realtime-core/tests/panic_exit.rs` | 工作线程 panic 使进程以 101 退出 |
 | `runtime/tests/core_link/test_core.py` | 测试扮演主进程拉起真实的实时核：`core_start` 先于产出者消息；版本不符时退出；`core.stop` 先释放再回应、以 0 退出；断开连接、stdin EOF 后释放并以 0 退出；心跳超时、`seq` 不递增、旧代次与已作废代次、更高代次、`producer.revoke` 在释放后回应；时钟 |
+| `runtime/tests/core_link/test_operator.py` | 操作员控制台作许可源，主进程一侧经 `OperatorClient` 连上：只在会话运行时执行动作；暂停即 `lease_revoked`、控制台退出即 `lease_source_lost`、到时即吊销并结束，都不留按住的键；有操作员许可连接时 `test_lease.*` 回“方法不存在”；重启的实时核得到更大的新令牌；门禁（操作员许可连接没有输入后端、假后端没有测试设备以 2 退出，连不上控制台以 1 退出）以真实的程序核对；脚本化的产出者只在运行时推进合成游戏的对白 |
 | `runtime/tests/core_link/test_link.py` | `CoreLink` 启动与停止；与插件内核联调的 QUIESCING 与停止顺序；杀掉实时核后重启，新实例的 `core_start` 使等待完成；干净退出后等待完成；真的杀掉主进程（Windows 上先单独关闭主进程的 job 句柄）后实时核按生命线释放并以 0 退出 |
 | `runtime/tests/core_link/test_process.py` | 替身子进程：RPC 不应答时退到关 stdin，不理 stdin 时强制终止；Windows 上孙进程在 job 里并在停止后不残留 |
 

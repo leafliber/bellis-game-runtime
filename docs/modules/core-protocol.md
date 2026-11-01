@@ -573,11 +573,11 @@ Windows 本机跑命名文件映射，Linux 容器跑 POSIX 共享内存。
 
 | 生成物（`protocol/` 下） | 来源 |
 | --- | --- |
-| `schema/core-protocol.schema.json` | schemars 从 Rust 类型生成；`x-methods`、`x-test-device-methods`、`x-protocol-version`、`x-error-codes` 来自 `core_protocol::methods` 与协议版本常量 |
+| `schema/core-protocol.schema.json` | schemars 从 Rust 类型生成；`x-methods`、`x-operator-methods`、`x-test-device-methods`、`x-protocol-version`、`x-error-codes` 来自 `core_protocol::methods` 与协议版本常量 |
 | `frame-ring-layout.json`、`audio-ring-layout.json` | Rust 以 `std::mem::offset_of!` 导出的帧环与音频环的常量与各结构的大小、对齐、字段偏移、大小与类型 |
 | `fixtures/<方法名>/params[.<用例>].json`、`result[.<用例>].json` | Rust 从类型的值序列化出的示例消息，两组的每个方法的 params 与 result 至少一条，每个联合类型的每个分支至少出现一次 |
 | `src/core_protocol/models.py` | datamodel-code-generator 从 Schema 生成的 Pydantic 模型 |
-| `src/core_protocol/methods.py` | 从 Schema 的 `x-methods` 与 `x-test-device-methods` 生成的两组方法目录（`METHODS`、`TEST_DEVICE_METHODS`）、协议版本与自定义错误码 |
+| `src/core_protocol/methods.py` | 从 Schema 的 `x-methods`、`x-operator-methods` 与 `x-test-device-methods` 生成的三组方法目录（`METHODS`、`OPERATOR_METHODS`、`TEST_DEVICE_METHODS`）、协议版本与自定义错误码。操作员许可连接的常量名一律以 `OPERATOR_` 起头（它的 `input.released` 是 `OPERATOR_INPUT_RELEASED`），不与核连接的同名 |
 
 - 重新生成用 `uv run generate`：先运行 Rust 的 `core-protocol-export` 写出 Schema、偏移表与示例消息，再运行 datamodel-code-generator，两份 Python 文件经仓库的 ruff 配置修正与格式化，然后写回 `protocol/`，删除不再生成的示例消息。改了 `core/crates/core-protocol` 后运行它，生成物与源放在同一个提交里。
 - `uv run check` 的生成物核对把全部生成物重新生成到临时目录，与入库的逐字节比较，缺少、多余或内容不同都失败，并提示运行 `uv run generate`。
