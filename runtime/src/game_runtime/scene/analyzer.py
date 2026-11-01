@@ -59,8 +59,9 @@ class SceneAnalyzer:
         """判别一帧；`reader` 为 None 即 OCR 不可用。"""
         check_frame(frame)
         bgra = bgra_view(frame)
-        change = self._change.update(bgra, frame.capture_ns)
         judgement = self.judge.judge(frame, bgra, reader)
+        interface = judgement.verdict in (Verdict.SCREEN, Verdict.AMBIGUOUS)
+        change = self._change.update(bgra, frame.capture_ns, interface=interface)
         return SceneState(
             frame_number=frame.frame_number,
             capture_ns=frame.capture_ns,

@@ -375,9 +375,9 @@ class Play:
         """`scene@1` 判过的各帧，按帧号。"""
         self._judged = asyncio.Event()
         self.truth_cutscenes: list[tuple[int, int | None]] = []
-        """真值里的各个播片：第一帧的采集时刻，回到别的画面之后第二帧的采集时刻（`scene@1` 应给出
-        的开始与结束时刻：播片的第一帧与回到别的画面的那一帧都是动帧）。"""
-        self._after_cutscene = 0
+        """真值里的各个播片：第一帧与回到别的画面的那一帧的采集时刻（`scene@1` 应给出的开始与结束
+        时刻：播片的第一帧是动帧，回到的画面在那一帧上签名就命中）。"""
+        self._in_cutscene = False
 
     def on_scene(self, update: SceneUpdate) -> None:
         """`scene@1` 的监听者：记下每一帧的判别结果。"""
@@ -439,17 +439,15 @@ class Play:
                 self.recognizer.teach(frame, rect, "".join(labels))
 
     def _follow_truth(self, truth: Truth, capture_ns: int) -> None:
-        """记下真值里播片的第一帧与回到别的画面之后的第二帧。"""
+        """记下真值里播片的第一帧与回到别的画面的那一帧。"""
         if truth.scene is SceneType.CUTSCENE:
-            if self._after_cutscene == 0:
+            if not self._in_cutscene:
                 self.truth_cutscenes.append((capture_ns, None))
-            self._after_cutscene = 1
-        elif self._after_cutscene:
-            self._after_cutscene += 1
-            if self._after_cutscene == 3:
-                start, _ = self.truth_cutscenes[-1]
-                self.truth_cutscenes[-1] = (start, capture_ns)
-                self._after_cutscene = 0
+            self._in_cutscene = True
+        elif self._in_cutscene:
+            start, _ = self.truth_cutscenes[-1]
+            self.truth_cutscenes[-1] = (start, capture_ns)
+            self._in_cutscene = False
 
     def _expect(self, truth: Truth, capture_ns: int, state: SceneState) -> None:
         number = self.number
@@ -532,13 +530,12 @@ class Play:
                 current.complete_frame = number
 
     def _expect_cutscene(self, state: SceneState, number: int, capture_ns: int) -> None:
-        """播片开始与结束的那一帧先结束当前句；新开的播片段同新开一句，可开始新的剧情范围。"""
+        """播片开始与结束不结束当前句；新开的播片段同新开一句，可开始新的剧情范围。"""
         playing = self.playing
         if playing is not None:
             if state.playing and state.playing_since_ns == playing.first_ns:
                 playing.last_frame, playing.last_ns = number, capture_ns
                 return
-            self._close(number)
             playing.closed_frame = number
             playing.end_ns = None if state.playing else state.playing_ended_ns
             self.playing = None
@@ -546,7 +543,6 @@ class Play:
             return
         since = state.playing_since_ns
         assert since is not None
-        self._close(number)
         if self.scope == 0 or self.scope_pending:
             self.scope += 1
             self.scope_pending = False
@@ -783,7 +779,7 @@ def _processed(scene: SceneService, number: int) -> bool | None:
 
 def check(outcome: RunResult) -> None:
     """记录与播片段与按真值算出的逐个相同，存储里的与内存里的相同；播片段的开始与结束时刻是真值里
-    播片的第一帧与回到别的画面之后的第二帧。"""
+    播片的第一帧与回到别的画面的那一帧。"""
     assert [row(r) for r in outcome.records] == [row(e) for e in outcome.expected]
     assert [cutscene_row(c) for c in outcome.cutscenes] == [
         cutscene_row(e) for e in outcome.expected_cutscenes
@@ -833,7 +829,7 @@ def test_the_whole_story_matches_the_truth(data_dir: Path) -> None:
     first, revealed, skipped, knocked, *subtitles, again = records[:7]
     instant, last = records[9], records[-1]
     # 播片：两个播片段，各有两句字幕，开始与结束时刻同真值（`check`）；播片前的那一句由判出播片的
-    # 那一帧结束，字幕的最后一句由回到选项之后读到的空对白框结束。
+    # 那一帧上读到的字幕结束，字幕的最后一句由回到选项的那一帧结束（签名命中，播片段同时结束）。
     assert [r.text for r in subtitles] == list(echo.subtitles)
     assert [(c.index, c.scope, c.sentences) for c in outcome.cutscenes] == [
         (1, 1, (5, 6)),
@@ -844,8 +840,7 @@ def test_the_whole_story_matches_the_truth(data_dir: Path) -> None:
     for cutscene in outcome.cutscenes:
         assert 3.9e9 < cutscene.duration_ns < 4.2e9
         last_subtitle = records[cutscene.sentences[-1] - 1]
-        assert last_subtitle.closed_frame is not None
-        assert last_subtitle.closed_frame < cutscene.last_frame
+        assert last_subtitle.closed_frame == cutscene.closed_frame == cutscene.last_frame + 1
     # 逐字显示：每多显示一个字修订号加一，多显示的是标点时只换文字；看完的一句文字就是全文。
     assert first.text == intro.lines[0].text
     assert first.revision == outcome.expected[0].revision >= len(compare_key(first.text)) - 2
@@ -1232,8 +1227,8 @@ async def to_cutscene(play: Play) -> None:
 
 
 def test_cutscene_subscribers_get_the_start_and_the_end_in_order(data_dir: Path) -> None:
-    """播片段的开始与结束按发生的顺序与句子的变化交错：先结束播片前的那一句，再开始播片段，然后是
-    字幕；结束时先结束最后一句字幕，再结束播片段。"""
+    """播片段的开始与结束按发生的顺序与句子的变化交错：先开始播片段，再按这一帧上的字幕结束播片前
+    的那一句、新开字幕；结束时先结束播片段，再按回到的选项画面结束最后一句字幕。"""
     events: list[tuple[str, int, bool]] = []
 
     async def script(play: Play) -> None:
@@ -1250,11 +1245,9 @@ def test_cutscene_subscribers_get_the_start_and_the_end_in_order(data_dir: Path)
     [cutscene] = outcome.cutscenes
     assert cutscene.sentences == (5, 6)
     start = events.index(("cutscene", 1, False))
-    assert events[start - 1] == ("record", 4, True)
-    assert events[start + 1] == ("record", 5, False)
+    assert events[start + 1 : start + 3] == [("record", 4, True), ("record", 5, False)]
     end = events.index(("cutscene", 1, True))
-    assert events[end - 1] == ("record", 6, True)
-    assert end == len(events) - 1
+    assert events[end + 1 :] == [("record", 6, True)]
     assert [e for e in events if e[0] == "cutscene"] == [
         ("cutscene", 1, False),
         ("cutscene", 1, True),

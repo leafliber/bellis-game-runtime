@@ -244,8 +244,8 @@ class SentenceTracker:
     def _follow(
         self, frame_number: int, playback: Playback
     ) -> tuple[tuple[Event, ...], Scope | None]:
-        """按本帧的播片状态结束或新开播片段：开始与结束的那一帧都先结束当前句。返回按发生的顺序的
-        变化与新开播片段时开始的剧情范围。"""
+        """按本帧的播片状态结束或新开播片段；当前句不因此结束（屏幕上仍是同一句时接着记）。返回按
+        发生的顺序的变化与新开播片段时开始的剧情范围。"""
         events: list[Event] = []
         current = self.playing
         if current is not None:
@@ -255,7 +255,6 @@ class SentenceTracker:
                 )
                 return (), None
             # 不再在播片中；开始时刻不同（中断里结束了一段又开始一段）时结束时刻不知道。
-            events += self._close(frame_number)
             ended = playback.ended_ns if playback.since_ns is None else None
             closed = replace(current, end_ns=ended, closed_frame=frame_number)
             self._cutscenes[-1] = closed
@@ -263,7 +262,6 @@ class SentenceTracker:
             events.append(closed)
         if playback.since_ns is None:
             return tuple(events), None
-        events += self._close(frame_number)
         scope = self._next_scope(frame_number)
         opened = Cutscene(
             session=self.session,

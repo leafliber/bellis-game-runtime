@@ -96,7 +96,8 @@ class ChangeDetector:
         self._last_change_ns = 0
         self._playing = _PlayingDetector(self.params)
 
-    def update(self, bgra: Bgra, capture_ns: int) -> Change:
+    def update(self, bgra: Bgra, capture_ns: int, *, interface: bool = False) -> Change:
+        """处理一帧；`interface` 为本帧的签名判出了画面（认出了游戏的界面，不算播片的动帧）。"""
         grid = self._grid(bgra)
         size = (bgra.shape[1], bgra.shape[0])
         previous = self._previous
@@ -116,7 +117,10 @@ class ChangeDetector:
             stability = Stability.TRANSITION
         else:
             stability = Stability.CHANGING
-        since, ended = self._playing.update(capture_ns, changed >= self.params.motion_fraction)
+        if interface:
+            since, ended = self._playing.interrupt(capture_ns)
+        else:
+            since, ended = self._playing.update(capture_ns, changed >= self.params.motion_fraction)
         return Change(stability, stable_ns, changed, since is not None, since, ended)
 
     def _grid(self, bgra: Bgra) -> NDArray[np.int16]:
@@ -131,7 +135,7 @@ class ChangeDetector:
 class _PlayingDetector:
     """播片：相邻相隔不超过 `playing_gap_ns` 的动帧连成一段，当前这一段从第一个到最近一个动帧覆盖
     不短于 `playing_after_ns` 时进入；此后连续 `playing_end_ns` 没有动帧即结束，之后的动帧另起
-    一段。只按采集时刻。"""
+    一段。签名判出了画面的帧打断这一段，在播片中时即结束。只按采集时刻。"""
 
     def __init__(self, params: ChangeParams) -> None:
         self.params = params
@@ -167,3 +171,12 @@ class _PlayingDetector:
             return None, None
         self._playing, self._after_last = True, None
         return self._first, None
+
+    def interrupt(self, capture_ns: int) -> tuple[int | None, int | None]:
+        """处理一个签名判出了画面的帧：不是动帧，打断当前这一段；在播片中时本帧起不再在播片中。
+        返回值同 `update`。"""
+        ended = None
+        if self._playing:
+            ended = capture_ns if self._after_last is None else self._after_last
+        self._playing = self._running = False
+        return None, ended

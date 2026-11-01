@@ -128,8 +128,8 @@ class Walk:
 
     def watch_cutscene(self) -> None:
         """刚进入播片：逐帧看完，回到选项后再看 2 秒。每帧都是动帧，连成一段；从播片的第一帧起覆盖
-        2 秒时判出播片，开始时刻是这第一帧。回到选项的那一帧是最后一个动帧，1.5 秒后不再在播片中，
-        结束时刻是它的下一帧。"""
+        2 秒时判出播片，开始时刻是这第一帧。回到选项的那一帧签名命中，起即不再在播片中，结束时刻
+        是这一帧。"""
         start = len(self.history) - 1
         (cutscene, entered), (_, before) = self.history[start], self.history[start - 1]
         assert cutscene.scene is SceneType.CUTSCENE
@@ -153,11 +153,10 @@ class Walk:
         assert states[first - 1].capture_ns - entered.capture_ns < second
         assert first < switch
         assert {states[n].playing_since_ns for n in playing} == {entered.capture_ns}
-        switched = states[switch].capture_ns
-        assert states[last + 1].capture_ns - switched >= 1_500_000_000
-        assert states[last].capture_ns - switched < 1_500_000_000
-        assert states[last + 1].playing_ended_ns == states[switch + 1].capture_ns
-        assert [n for n, s in enumerate(states) if s.playing_ended_ns is not None] == [last + 1]
+        assert states[switch].screen is not None
+        assert last + 1 == switch
+        assert states[switch].playing_ended_ns == states[switch].capture_ns
+        assert [n for n, s in enumerate(states) if s.playing_ended_ns is not None] == [switch]
 
     def read_dialogue(self, *, watch_typing: bool = False) -> None:
         """读完当前的对话节点：每句等逐字显示完再推进。"""
