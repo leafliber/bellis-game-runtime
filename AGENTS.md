@@ -25,6 +25,7 @@
 | 只跑 `scene@1` 经假显示面、实时核与帧环的联调测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link/test_scene.py` |
 | 只读运行：按适配包拉起实时核与感知插件，在终端里显示画面判别、配音忙闲、剧情记录与语言核对，结束时打印摘要；不发输入，不连 Bellis，按回车或 Ctrl+C 停止（先编译 release 版 `realtime-core`；`--status-interval` 改状态行的间隔，见[只读运行](docs/modules/offline-tools.md#只读运行)） | `uv run observe <适配包 id>` |
 | 只读运行并同时录制（与 `uv run record` 录下的相同） | `uv run observe <适配包 id> --record --name <名字>` |
+| 操作员控制台：在另一个终端里开一次受监督的测试会话（测试许可），逐条确认适配包的前置条件与“不直播”，按行读命令（`y`、`n`、`start`、`pause`、`goal <文字>`、`<序号>`、`end`），连接信息写进凭据管理器、退出时删除，会话记录写进本地数据目录；`--max-minutes` 改时长上限（缺省 60），见[操作员控制台](docs/modules/game-bridge.md#操作员控制台) | `uv run operate <适配包 id>` |
 | 按适配包录制帧、游戏声音与感知插件的实时输出，按回车或 Ctrl+C 停止（先编译 release 版 `realtime-core`；`--record-only` 只录制，见[录制工具](docs/modules/offline-tools.md#录制工具)） | `uv run record <适配包 id> --name <名字>` |
 | M0 回放一段录制，与录制时的实时输出逐条比对（`<录制>` 写目录、`<适配包 id>/<录制目录名>` 或只写 `<适配包 id>` 取最新的） | `uv run replay <录制>` |
 | 列出录制、用量与上限 | `uv run recording list [<适配包 id>]` |
@@ -36,6 +37,9 @@
 | 合成游戏 2560×1440 的窗口经 WGC 录制、量体积与 CPU 再回放比对的真机测试（需要 Windows 交互桌面与 `uv run fetch-models` 的模型，不在 `uv run check` 中；先关掉已打开的合成游戏窗口；`RECORD_SECONDS` 改时长，`RECORD_ONLY=1` 只录制） | `uv run pytest -m manual runtime/tests/core_link/test_record_window.py -s` |
 | 只跑只读运行的测试：事件、显示、摘要与 `observer` 插件，以及经假显示面、假音频输出与实时核的联调（会先编译 `realtime-core`） | `uv run pytest runtime/tests/observe runtime/tests/core_link/test_observe.py` |
 | 合成游戏的窗口外壳加 `--autoplay` 经 WGC 只读运行、用真实的 OCR 与配音检测模型的真机测试，打印终端输出（需要 Windows 交互桌面与 `uv run fetch-models` 的模型，不在 `uv run check` 中；先关掉已打开的合成游戏窗口；`OBSERVE_SECONDS` 改时长，`OBSERVE_RECORD=1` 同时录制） | `uv run pytest -m manual runtime/tests/core_link/test_observe_window.py -s` |
+| 只跑操作员控制台的测试：确认与状态机、令牌与续约、时长上限、按角色的连接、决策点、会话记录、SecretStore 与 `SessionInfo`、终端界面与 `OperatorClient`（不拉起实时核；凭据管理器的往返只在 Windows 上，用一次性的服务名） | `uv run pytest runtime/tests/operator` |
+| 只跑操作员控制台作许可源经假输入后端、合成游戏与实时核的联调，以及操作员许可连接的门禁（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link/test_operator.py` |
+| 经 stdin 管道运行真实的 `uv run operate synthetic-game`、用真实凭据管理器的真机测试（只在 Windows 上，不在 `uv run check` 中；写入并删除当前用户的 `operator-session` 条目，条目已存在时跳过） | `uv run pytest -m manual runtime/tests/operator/test_operate_window.py -s` |
 | 格式化 | `uv run ruff format`；`cargo fmt --all` |
 | 改了 `core/crates/core-protocol` 后重新生成 `protocol/` 的生成物 | `uv run generate` |
 | 给某个 Python 包加依赖 | `uv add --package <发行名> <依赖>` |
