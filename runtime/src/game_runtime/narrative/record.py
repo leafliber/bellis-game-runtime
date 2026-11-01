@@ -9,7 +9,8 @@ from enum import StrEnum
 from typing import Final
 
 REVISION_TOLERANCE: Final = 4
-"""同一句的文字容差：当前句的比较文本有 n 个字时，容许的编辑距离为 ⌊n / 4⌋。"""
+"""同一句的容差：当前句的比较文本有 n 个字时，文字容许的编辑距离为 ⌊n / 4⌋；名字较长一方有 m
+个字时为 max(1, ⌊m / 4⌋)。"""
 
 
 class Completeness(StrEnum):
@@ -92,25 +93,43 @@ class Discontinuity:
 
 
 def compare_key(text: str) -> str:
-    """比较文本：NFKC 归一（全角与半角标点视为相同），去掉全部空白。"""
-    return "".join(unicodedata.normalize("NFKC", text).split())
+    """比较文本：NFKC 归一后只保留字母与数字（Unicode 一般类别 L 与 N），去掉空白、标点与符号。"""
+    return "".join(
+        char
+        for char in unicodedata.normalize("NFKC", text)
+        if unicodedata.category(char)[0] in "LN"
+    )
 
 
 def continues(current: str, observed: str) -> bool:
-    """`observed` 是否还是比较文本为 `current` 的那一句：`observed` 的前 n 个字与 `current`
-    （n 个字）的编辑距离不超过 ⌊n / 4⌋。两者都不为空。"""
-    head = observed[: len(current)]
-    if head == current:
+    """`observed` 是否还是比较文本为 `current` 的那一句：`observed` 有一个前缀与 `current`
+    （n 个字）的编辑距离不超过 ⌊n / 4⌋，前缀的长度不限。`observed` 比 `current` 短超过 ⌊n / 4⌋
+    个字时没有这样的前缀（重新开始的逐字显示）。"""
+    if observed.startswith(current):
         return True
-    return _within_distance(current, head, len(current) // REVISION_TOLERANCE)
-
-
-def _within_distance(a: str, b: str, limit: int) -> bool:
-    """`a` 与 `b` 的编辑距离是否不超过 `limit`：只算对角线两侧 `limit` 宽的带。"""
-    if abs(len(a) - len(b)) > limit:
+    limit = len(current) // REVISION_TOLERANCE
+    if len(observed) < len(current) - limit:
         return False
-    if limit == 0:
-        return a == b
+    row = _banded_row(current, observed[: len(current) + limit], limit)
+    return row is not None and min(row[max(0, len(current) - limit) :]) <= limit
+
+
+def same_name(current: str, observed: str) -> bool:
+    """两边都读到了名字时，比较文本为 `current` 与 `observed` 的是不是同一个名字：编辑距离不超过
+    max(1, ⌊m / 4⌋)，m 为较长一方的字数。"""
+    if current == observed:
+        return True
+    limit = max(1, max(len(current), len(observed)) // REVISION_TOLERANCE)
+    if abs(len(current) - len(observed)) > limit:
+        return False
+    row = _banded_row(current, observed, limit)
+    return row is not None and row[len(observed)] <= limit
+
+
+def _banded_row(a: str, b: str, limit: int) -> list[int] | None:
+    """`a` 与 `b` 的各个前缀的编辑距离表的最后一行：第 j 项是 `a` 与 `b[:j]` 的距离，超过 `limit`
+    的记为 `limit + 1`。只算对角线两侧 `limit` 宽的带；某一行全都超过 `limit` 时提前返回 None。
+    `len(b)` 不小于 `len(a) - limit`。"""
     width = len(b)
     over = limit + 1
     previous = [j if j <= limit else over for j in range(width + 1)]
@@ -123,6 +142,6 @@ def _within_distance(a: str, b: str, limit: int) -> bool:
             cost = 0 if a[i - 1] == b[j - 1] else 1
             current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost, over)
         if min(current[max(0, low - 1) : high + 1]) > limit:
-            return False
+            return None
         previous = current
-    return previous[width] <= limit
+    return previous
