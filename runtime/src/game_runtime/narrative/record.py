@@ -1,4 +1,4 @@
-"""剧情记录的数据：一句的记录、剧情范围、中断，以及比较文字用的归一与同一句的判断。
+"""剧情记录的数据：一句的记录、剧情范围、播片段、中断，以及比较文字用的归一与同一句的判断。
 
 字段与规则见 `docs/modules/narrative-planner.md` 的“剧情记录”。
 """
@@ -45,6 +45,8 @@ class NarrativeRecord:
     """剧情范围号。"""
     screen: str | None
     """对白框所在的画面；对白框没写画面（通用缺省）时为 None。"""
+    cutscene: int | None
+    """播片中读到的句子（字幕）所在的播片段编号；其余为 None。"""
     speaker: str | None
     """说话人：这一句第一次读到的非空名字；没有名字栏或一直读不到时为 None。"""
     text: str
@@ -79,7 +81,41 @@ class Scope:
     after_screen: str | None
     """触发它的画面（坏结局、存读档之类）；运行的第一个范围为 None。"""
     first_frame: int
-    """范围里第一句的首帧。"""
+    """范围里第一句或第一个播片段的首帧。"""
+
+
+@dataclass(frozen=True, slots=True)
+class Cutscene:
+    """一个播片段（某一时刻的状态）：`scene@1` 判出的一段播片，与其中读到的字幕。"""
+
+    session: int
+    index: int
+    """播片段编号：本次运行内从 1 起；不占句子的出现编号。"""
+    scope: int
+    """剧情范围号。"""
+    first_frame: int
+    """判出播片的帧号。"""
+    first_ns: int
+    """`scene@1` 给出的开始时刻。"""
+    last_frame: int
+    """最后一个在播片中的帧的帧号。"""
+    last_ns: int
+    end_ns: int | None
+    """`scene@1` 给出的结束时刻；还没结束或结束时刻随中断丢了时为 None。"""
+    closed_frame: int | None
+    """不再在播片中的那一帧；还没结束时为 None。"""
+    sentences: tuple[int, ...]
+    """其中各句的出现编号。"""
+
+    @property
+    def closed(self) -> bool:
+        return self.closed_frame is not None
+
+    @property
+    def duration_ns(self) -> int:
+        """时长：开始到结束时刻；结束时刻为空时到最后一个在播片中的帧。"""
+        end = self.last_ns if self.end_ns is None else self.end_ns
+        return max(0, end - self.first_ns)
 
 
 @dataclass(frozen=True, slots=True)

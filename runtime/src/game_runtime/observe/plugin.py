@@ -104,7 +104,10 @@ class ObserverPlugin(Plugin[NoConfig]):
                 None
                 if narrative is None
                 else NarrativeFinal(
-                    narrative.records(), narrative.scopes, narrative.discontinuities
+                    narrative.records(),
+                    narrative.scopes,
+                    narrative.cutscenes,
+                    narrative.discontinuities,
                 )
             )
 
@@ -149,6 +152,9 @@ class _Follower:
             self._unsubscribe_narrative = []
             if narrative is not None:
                 self._unsubscribe_narrative.append(narrative.subscribe(self._on_record))
+                self._unsubscribe_narrative.append(
+                    narrative.subscribe_cutscenes(self._hub.on_cutscene)
+                )
                 if self._results is not None:
                     # 不录制时没有 results：由这里交给宿主，停内核之前等剧情记录处理完。
                     self._unsubscribe_narrative.append(self._results.track(narrative))

@@ -59,7 +59,8 @@ max_rate = 10
 hold_keys = []
 hold_buttons = []
 
-# 画面类型映射即 docs/modules/offline-tools.md “画面与转换”表的第二列；弹窗是叠加层，不是画面。
+# 画面类型映射即 docs/modules/offline-tools.md “画面与转换”表的第二列；弹窗是叠加层，不是画面；
+# 播片也不声明为画面，由 scene@1 按持续整屏的动态识别。
 
 [[screens]]
 id = "title-menu"

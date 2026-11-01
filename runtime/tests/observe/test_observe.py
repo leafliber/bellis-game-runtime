@@ -41,6 +41,8 @@ from game_runtime.kernel import (
 from game_runtime.narrative import (
     NARRATIVE,
     Completeness,
+    Cutscene,
+    CutsceneListener,
     Discontinuity,
     LowConfidenceLine,
     NarrativeListener,
@@ -48,6 +50,7 @@ from game_runtime.narrative import (
     Scope,
 )
 from game_runtime.observe import (
+    CutsceneEvent,
     Event,
     Formatter,
     LanguageEvent,
@@ -166,12 +169,14 @@ def record(
     low: tuple[LowConfidenceLine, ...] = (),
     at: int = 0,
     screen: str | None = "dialogue",
+    cutscene: int | None = None,
 ) -> NarrativeRecord:
     return NarrativeRecord(
         session=1,
         occurrence=occurrence,
         scope=1,
         screen=screen,
+        cutscene=cutscene,
         speaker=speaker,
         text=text,
         revision=revision,
@@ -434,6 +439,62 @@ def test_sentences_are_shown_when_they_appear_complete_are_revised_and_close(
     ]
 
 
+def cutscene(
+    index: int,
+    *,
+    first: int,
+    last: int,
+    end: int | None = None,
+    closed: int | None = None,
+    sentences: tuple[int, ...] = (),
+) -> Cutscene:
+    """第 `index` 个播片段：帧号与采集时刻相同（毫秒为单位的帧号 × 0.1 秒）。"""
+    return Cutscene(
+        session=1,
+        index=index,
+        scope=1,
+        first_frame=first,
+        first_ns=first * SECOND // 10,
+        last_frame=last,
+        last_ns=last * SECOND // 10,
+        end_ns=end,
+        closed_frame=closed,
+        sentences=sentences,
+    )
+
+
+def test_cutscenes_are_shown_when_they_start_and_end_and_subtitles_name_them(
+    synthetic: Adapter,
+) -> None:
+    hub, collected, formatter = make_hub(synthetic)
+    hub.on_record(record(1, "门后也许有路。", Completeness.COMPLETE, closed=20, at=SECOND))
+    hub.on_cutscene(cutscene(1, first=20, last=20))
+    hub.on_record(record(2, "雨夜里。", speaker=None, cutscene=1, at=25 * SECOND // 10))
+    hub.on_record(
+        record(
+            2, "雨夜里。", Completeness.COMPLETE, speaker=None, cutscene=1, closed=61, at=6 * SECOND
+        )
+    )
+    ended = cutscene(1, first=20, last=74, end=6 * SECOND, closed=75, sentences=(2,))
+    hub.on_cutscene(ended)
+
+    assert [formatter.event(e) for e in collected.events] == [
+        "[00:01.0] 剧情 #1 出现 阿遥「门后也许有路。」（完整，修订 1）",
+        "[00:01.0] 剧情 #1 结束（完整）",
+        "[00:02.0] 播片 1 开始，帧 20",
+        "[00:02.5] 剧情 #2 出现 播片 1 「雨夜里。」（部分，修订 1）",
+        "[00:06.0] 剧情 #2 结束 播片 1（完整）",
+        "[00:06.0] 播片 1 结束：4.0 秒，1 句，帧 75",
+    ]
+    assert [e.ended for e in collected.events if isinstance(e, CutsceneEvent)] == [False, True]
+    assert hub.cutscenes() == (ended,)
+    # 结束时刻随中断丢了：时长算到最后一个在播片中的帧，那一行的时刻也是它。
+    lost = cutscene(2, first=100, last=130, closed=131)
+    hub.on_cutscene(lost)
+    assert formatter.event(collected.events[-1]) == "[00:13.0] 播片 2 结束：3.0 秒，0 句，帧 131"
+    assert hub.cutscenes() == (ended, lost)
+
+
 # 语言核对的显示与日志
 
 
@@ -517,6 +578,11 @@ def test_summary_counts_sentences_and_shares_of_time(synthetic: Adapter) -> None
                 record(4, "四"),
             ),
             scopes=(Scope(1, 1, None, 1), Scope(1, 2, "bad-ending", 9)),
+            # 一段放完了 4 秒；另一段停止时还在放，算到最后一个在播片中的帧，1.5 秒。
+            cutscenes=(
+                cutscene(1, first=20, last=75, end=6 * SECOND, closed=76),
+                cutscene(2, first=80, last=95),
+            ),
             discontinuities=(Discontinuity(1, 10, 20, 11),),
         )
     )
@@ -535,7 +601,7 @@ def test_summary_counts_sentences_and_shares_of_time(synthetic: Adapter) -> None
     hub.end_ns = 10 * SECOND
     assert summary(formatter, narrative_problem=None) == [
         "摘要（00:10.0）：",
-        "  剧情记录：4 句，完整 2、部分 1、缺口 1；剧情范围 2，中断 1",
+        "  剧情记录：4 句，完整 2、部分 1、缺口 1；剧情范围 2，中断 1；播片段 2，共 5.5 秒",
         "  画面判别（4 帧，4.0 秒）：对话（dialogue） 75%（3 帧）、不命中 25%（1 帧）",
         "  配音（10.0 秒）：忙 20%、闲 30%、未知（stalled） 40%、未知（starting） 10%",
         "  语言核对（文字系统）：没有完整的句子",
@@ -652,7 +718,9 @@ class StubNarrative:
 
     def __init__(self) -> None:
         self.items: list[NarrativeRecord] = []
+        self.played: list[Cutscene] = []
         self._listeners: list[NarrativeListener] = []
+        self._cutscene_listeners: list[CutsceneListener] = []
 
     @property
     def session(self) -> int:
@@ -670,12 +738,26 @@ class StubNarrative:
         return (Scope(1, 1, None, 1),)
 
     @property
+    def cutscenes(self) -> tuple[Cutscene, ...]:
+        return tuple(self.played)
+
+    @property
     def discontinuities(self) -> tuple[Discontinuity, ...]:
         return ()
 
     def subscribe(self, listener: NarrativeListener) -> Callable[[], None]:
         self._listeners.append(listener)
         return lambda: self._listeners.remove(listener) if listener in self._listeners else None
+
+    def subscribe_cutscenes(self, listener: CutsceneListener) -> Callable[[], None]:
+        listeners = self._cutscene_listeners
+        listeners.append(listener)
+        return lambda: listeners.remove(listener) if listener in listeners else None
+
+    def play(self, item: Cutscene) -> None:
+        self.played[item.index - 1 :] = [item]
+        for listener in list(self._cutscene_listeners):
+            listener(item)
 
     @property
     def processed_frame(self) -> int:
@@ -824,6 +906,9 @@ def test_observer_follows_services_and_checks_the_language() -> None:
         assert hub.voice_status is not None
         assert hub.voice_status.state is VoiceState.BUSY
         narrative.publish(record(1, "雨停了。", Completeness.COMPLETE))
+        # 播片段的开始与结束也交给宿主显示。
+        narrative.play(cutscene(1, first=5, last=5))
+        narrative.play(cutscene(1, first=5, last=40, end=4 * SECOND, closed=41))
         # 结束的完整句子经 ocr@1 的 check_script 核对文字系统：3 句中文即相符。
         for occurrence, text in enumerate(CHINESE, start=2):
             narrative.publish(closed(occurrence, text))
@@ -838,8 +923,16 @@ def test_observer_follows_services_and_checks_the_language() -> None:
 
     asyncio.run(main())
     kinds = [type(e) for e in collected.events if not isinstance(e, PluginEvent)]
-    # 第一句出现；之后三句各出现、结束一次，第三句结束时文字系统相符。
-    assert kinds == [VoiceEvent, *[LineEvent] * 7, ScriptEvent, SceneEvent, LanguageEvent]
+    # 第一句出现；播片段开始、结束；之后三句各出现、结束一次，第三句结束时文字系统相符。
+    assert kinds == [
+        VoiceEvent,
+        LineEvent,
+        *[CutsceneEvent] * 2,
+        *[LineEvent] * 6,
+        ScriptEvent,
+        SceneEvent,
+        LanguageEvent,
+    ]
     [script] = [e for e in collected.events if isinstance(e, ScriptEvent)]
     assert script.result is ScriptResult.MATCH
     [language] = [e for e in collected.events if isinstance(e, LanguageEvent)]
@@ -848,6 +941,7 @@ def test_observer_follows_services_and_checks_the_language() -> None:
     # 停用时记下了剧情记录此刻的各句，退订后不再跟随。
     assert hub.final is not None
     assert [r.text for r in hub.final.records] == ["雨停了。", *CHINESE]
+    assert [c.closed_frame for c in hub.final.cutscenes] == [41]
     assert hub.end_ns is not None
     assert hub.voice is None
     assert hub.narrative is None

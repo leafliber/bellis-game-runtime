@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from game_runtime.kernel import Manifest, Plugin, PluginContext, Tier
 from game_runtime.narrative import (
     NARRATIVE,
+    Cutscene,
     Discontinuity,
     NarrativeRecord,
     NarrativeService,
@@ -45,9 +46,9 @@ VOICE_FILE: Final = "voice.jsonl"
 VOICE_FEED_FILE: Final = "voice-feed.jsonl"
 """`voice-activity@1` 的喂入标记，末尾是停止记录时的 `FeedEnd`。"""
 NARRATIVE_FILE: Final = "narrative.jsonl"
-"""`narrative@1` 每句的每次变化。"""
+"""`narrative@1` 每句的每次变化，播片段的开始与结束（`type` 为 `cutscene`）按处理的顺序插在其间。"""
 NARRATIVE_FINAL_FILE: Final = "narrative-final.jsonl"
-"""处理完全部更新后 `narrative@1` 的各句、剧情范围与中断。"""
+"""处理完全部更新后 `narrative@1` 的各句、剧情范围、播片段与中断。"""
 STREAM_FILES: Final = (SCENE_FILE, VOICE_FILE, VOICE_FEED_FILE)
 RESULT_FILES: Final = (*STREAM_FILES, NARRATIVE_FILE, NARRATIVE_FINAL_FILE)
 """逐条比对的文件。"""
@@ -167,8 +168,8 @@ class ResultsHub:
         return release
 
     async def drain(self, timeout: float) -> bool:
-        """等剧情记录处理完积压的更新（至多 `timeout` 秒）；有输出目录时再把它最后的记录、范围与
-        中断写进 `narrative-final.jsonl`。没有剧情记录时直接返回真；超时返回假，不写。"""
+        """等剧情记录处理完积压的更新（至多 `timeout` 秒）；有输出目录时再把它最后的记录、范围、
+        播片段与中断写进 `narrative-final.jsonl`。没有剧情记录时直接返回真；超时返回假，不写。"""
         narrative, directory = self.narrative, self.directory
         if narrative is None:
             return True
@@ -180,6 +181,7 @@ class ResultsHub:
             return True
         lines = [narrative_line(record) for record in narrative.records()]
         lines += [_tagged("scope", scope) for scope in narrative.scopes]
+        lines += [cutscene_line(cutscene) for cutscene in narrative.cutscenes]
         lines += [_tagged("discontinuity", gap) for gap in narrative.discontinuities]
         write_atomic(directory / NARRATIVE_FINAL_FILE, "".join(f"{x}\n" for x in lines).encode())
         return True
@@ -196,7 +198,12 @@ def narrative_line(record: NarrativeRecord) -> str:
     return json.dumps(_without_session(record), ensure_ascii=False, separators=(",", ":"))
 
 
-def _tagged(kind: str, value: Scope | Discontinuity) -> str:
+def cutscene_line(cutscene: Cutscene) -> str:
+    """一个播片段写成的一行：`type` 为 `cutscene`，不含运行号。"""
+    return _tagged("cutscene", cutscene)
+
+
+def _tagged(kind: str, value: Scope | Cutscene | Discontinuity) -> str:
     record = {"type": kind, **_without_session(value)}
     return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
 
@@ -204,8 +211,8 @@ def _tagged(kind: str, value: Scope | Discontinuity) -> str:
 class ResultsPlugin(Plugin[ResultsConfig]):
     """订阅感知服务，每条结果写一行：`scene.jsonl` 每帧一个 `SceneState`，`voice.jsonl` 每条
     `VoiceChange`，`voice-feed.jsonl` 每个喂入标记（停用时末尾写一个 `FeedEnd`），
-    `narrative.jsonl` 每句的每次变化（`NarrativeRecord`，不含运行号）。宿主用 `results_plugin`
-    得到交服务给 `ResultsHub` 的子类。"""
+    `narrative.jsonl` 每句的每次变化（`NarrativeRecord`，不含运行号），播片段的开始与结束按通知
+    的顺序插在其间。宿主用 `results_plugin` 得到交服务给 `ResultsHub` 的子类。"""
 
     manifest = Manifest(
         id="results",
@@ -245,6 +252,9 @@ class ResultsPlugin(Plugin[ResultsConfig]):
         def on_record(record: NarrativeRecord) -> None:
             write(NARRATIVE_FILE, narrative_line(record))
 
+        def on_cutscene(cutscene: Cutscene) -> None:
+            write(NARRATIVE_FILE, cutscene_line(cutscene))
+
         def end() -> None:
             write(VOICE_FEED_FILE, mark_line(FeedEnd(voice.fed_block)))
 
@@ -253,6 +263,7 @@ class ResultsPlugin(Plugin[ResultsConfig]):
         ctx.register(voice.subscribe_feed(on_mark))
         if narrative is not None:
             ctx.register(narrative.subscribe(on_record))
+            ctx.register(narrative.subscribe_cutscenes(on_cutscene))
         hub = type(self).hub
         if hub is not None:
             hub.narrative, hub.directory = narrative, directory

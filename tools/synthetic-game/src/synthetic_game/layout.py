@@ -94,6 +94,11 @@ class Layout:
     def continue_marker(self) -> Rect:
         return self.rect(1190, 650, 1214, 672)
 
+    # 播片
+    def subtitle_band(self) -> Rect:
+        """字幕底下的半透明深色条：盖住名字栏与对白框，字幕在对白文字的位置上。"""
+        return self.rect(40, 425, 1240, 690)
+
     # 选项与计时选择
     def choice_prompt(self) -> Rect:
         return self.rect(140, 70, 1140, 170)

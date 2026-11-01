@@ -1,7 +1,7 @@
-"""一句的边界、修订号、完整度与剧情范围：按处理的顺序逐个观察，确定性地更新记录。
+"""一句的边界、修订号、完整度、播片段与剧情范围：按处理的顺序逐个观察，确定性地更新记录。
 
-规则见 `docs/modules/narrative-planner.md` 的“一句的边界”“完整度”与“剧情范围”。这里不读墙钟，
-时刻都取观察里帧的采集时刻；同样的观察序列总得到同样的记录。
+规则见 `docs/modules/narrative-planner.md` 的“一句的边界”“完整度”“播片段”与“剧情范围”。这里不读
+墙钟，时刻都取观察里帧的采集时刻；同样的观察序列总得到同样的记录。
 """
 
 from dataclasses import dataclass, replace
@@ -9,6 +9,7 @@ from typing import Final
 
 from game_runtime.narrative.record import (
     Completeness,
+    Cutscene,
     Discontinuity,
     LowConfidenceLine,
     NarrativeRecord,
@@ -90,15 +91,38 @@ type Observation = BoxFrame | OtherScreen | Unjudged | Unread | Gap
 
 
 @dataclass(frozen=True, slots=True)
-class Changes:
-    """处理一个观察产生的变化：要通知与写入的记录（按发生的顺序）、新的剧情范围与中断。"""
+class Playback:
+    """一帧的播片状态，取自它的 `SceneState`。"""
 
-    records: tuple[NarrativeRecord, ...] = ()
+    capture_ns: int
+    since_ns: int | None
+    """在播片中时为这段播片的开始时刻（`playing_since_ns`）；不在播片中为 None。"""
+    ended_ns: int | None = None
+    """本帧起不再在播片中时为刚结束的播片的结束时刻（`playing_ended_ns`）。"""
+
+
+type Event = NarrativeRecord | Cutscene
+"""一次变化：一句或一个播片段的新状态。"""
+
+
+@dataclass(frozen=True, slots=True)
+class Changes:
+    """处理一个观察产生的变化：要通知与写入的句子与播片段（按发生的顺序）、新的剧情范围与中断。"""
+
+    events: tuple[Event, ...] = ()
     scope: Scope | None = None
     discontinuity: Discontinuity | None = None
 
+    @property
+    def records(self) -> tuple[NarrativeRecord, ...]:
+        return tuple(event for event in self.events if isinstance(event, NarrativeRecord))
+
+    @property
+    def cutscenes(self) -> tuple[Cutscene, ...]:
+        return tuple(event for event in self.events if isinstance(event, Cutscene))
+
     def __bool__(self) -> bool:
-        return bool(self.records) or self.scope is not None or self.discontinuity is not None
+        return bool(self.events) or self.scope is not None or self.discontinuity is not None
 
 
 NO_CHANGES: Final = Changes()
@@ -143,7 +167,7 @@ class _Open:
 
 
 class SentenceTracker:
-    """逐个观察，维护当前句与本次运行的全部记录。不是线程安全的。"""
+    """逐个观察，维护当前句、当前的播片段与本次运行的全部记录。不是线程安全的。"""
 
     def __init__(self, session: int, params: TrackerParams | None = None) -> None:
         self.session = session
@@ -153,6 +177,9 @@ class SentenceTracker:
         self._scope = 0
         self._scope_after: str | None = None
         self._scopes: list[Scope] = []
+        self._cutscenes: list[Cutscene] = []
+        self._playing = False
+        """最后一个播片段还没结束。"""
         self._discontinuities: list[Discontinuity] = []
 
     @property
@@ -169,33 +196,91 @@ class SentenceTracker:
         return tuple(self._scopes)
 
     @property
+    def cutscenes(self) -> tuple[Cutscene, ...]:
+        """本次运行的各播片段的最新状态，按编号。"""
+        return tuple(self._cutscenes)
+
+    @property
+    def playing(self) -> Cutscene | None:
+        """还没结束的播片段；不在播片中时为 None。"""
+        return self._cutscenes[-1] if self._playing else None
+
+    @property
     def discontinuities(self) -> tuple[Discontinuity, ...]:
         return tuple(self._discontinuities)
 
-    def observe(self, observation: Observation) -> Changes:
-        """处理一个观察，返回产生的变化。"""
+    def observe(self, observation: Observation, playback: Playback | None = None) -> Changes:
+        """处理一个观察，返回产生的变化。`playback` 是这一帧的播片状态；没有时不改变播片段。"""
+        if isinstance(observation, Gap):
+            closed = self._close(observation.first_frame)
+            gap = Discontinuity(
+                self.session, observation.first_frame, observation.last_frame, observation.count
+            )
+            self._discontinuities.append(gap)
+            return Changes(closed, discontinuity=gap)
+        before: tuple[Event, ...] = ()
+        scope = None
+        if playback is not None:
+            before, scope = self._follow(observation.frame_number, playback)
         match observation:
             case BoxFrame():
                 changes = self._box(observation)
                 self._mark_scope(observation.scope_screen)
-                return changes
             case OtherScreen():
-                closed = self._close(observation.frame_number)
+                changes = Changes(self._close(observation.frame_number))
                 if observation.starts_scope:
                     self._scope_after = observation.screen
-                return Changes(closed)
             case Unjudged():
-                return NO_CHANGES
+                changes = NO_CHANGES
             case Unread():
                 self._mark_scope(observation.scope_screen)
-                return NO_CHANGES
-            case Gap():
-                closed = self._close(observation.first_frame)
-                gap = Discontinuity(
-                    self.session, observation.first_frame, observation.last_frame, observation.count
+                changes = NO_CHANGES
+        if not before:
+            return changes
+        return Changes((*before, *changes.events), scope=scope or changes.scope)
+
+    # 播片段
+
+    def _follow(
+        self, frame_number: int, playback: Playback
+    ) -> tuple[tuple[Event, ...], Scope | None]:
+        """按本帧的播片状态结束或新开播片段：开始与结束的那一帧都先结束当前句。返回按发生的顺序的
+        变化与新开播片段时开始的剧情范围。"""
+        events: list[Event] = []
+        current = self.playing
+        if current is not None:
+            if playback.since_ns == current.first_ns:
+                self._cutscenes[-1] = replace(
+                    current, last_frame=frame_number, last_ns=playback.capture_ns
                 )
-                self._discontinuities.append(gap)
-                return Changes(closed, discontinuity=gap)
+                return (), None
+            # 不再在播片中；开始时刻不同（中断里结束了一段又开始一段）时结束时刻不知道。
+            events += self._close(frame_number)
+            ended = playback.ended_ns if playback.since_ns is None else None
+            closed = replace(current, end_ns=ended, closed_frame=frame_number)
+            self._cutscenes[-1] = closed
+            self._playing = False
+            events.append(closed)
+        if playback.since_ns is None:
+            return tuple(events), None
+        events += self._close(frame_number)
+        scope = self._next_scope(frame_number)
+        opened = Cutscene(
+            session=self.session,
+            index=len(self._cutscenes) + 1,
+            scope=self._scope,
+            first_frame=frame_number,
+            first_ns=playback.since_ns,
+            last_frame=frame_number,
+            last_ns=playback.capture_ns,
+            end_ns=None,
+            closed_frame=None,
+            sentences=(),
+        )
+        self._cutscenes.append(opened)
+        self._playing = True
+        events.append(opened)
+        return tuple(events), scope
 
     # 对白框
 
@@ -231,11 +316,14 @@ class SentenceTracker:
         speaker = frame.speaker if speaker_key is not None else None
         speaker_low = self._low_confidence(speaker)
         text_low = self._low_confidence(frame.text)
+        cutscene = self.playing
+        occurrence = len(self._records) + 1
         record = NarrativeRecord(
             session=self.session,
-            occurrence=len(self._records) + 1,
+            occurrence=occurrence,
             scope=self._scope,
             screen=frame.screen,
+            cutscene=None if cutscene is None else cutscene.index,
             speaker=None if speaker is None else speaker.text,
             text=frame.text.text,
             revision=1,
@@ -249,6 +337,8 @@ class SentenceTracker:
             closed_frame=None,
             low_confidence=speaker_low + text_low,
         )
+        if cutscene is not None:
+            self._cutscenes[-1] = replace(cutscene, sentences=(*cutscene.sentences, occurrence))
         current = _Open(
             record,
             key,
@@ -349,12 +439,12 @@ class SentenceTracker:
         return (closed,)
 
     def _mark_scope(self, screen: str | None) -> None:
-        """判出了坏结局或存读档类的画面 `screen`：下一句开始新的剧情范围。"""
+        """判出了坏结局或存读档类的画面 `screen`：下一句或下一个播片段开始新的剧情范围。"""
         if screen is not None:
             self._scope_after = screen
 
     def _next_scope(self, frame_number: int) -> Scope | None:
-        """新开一句之前：第一句或触发过新范围时，开始新的剧情范围。"""
+        """新开一句或一个播片段之前：第一个或触发过新范围时，开始新的剧情范围。"""
         if self._scope and self._scope_after is None:
             return None
         self._scope += 1

@@ -1,5 +1,6 @@
-"""合成游戏全部画面上的判别：按适配包的签名与真值逐帧核对，含逐字显示、计时选择、弹窗与三种坏结局，
-以及不同分辨率与没有 OCR 的情形。
+"""合成游戏全部画面上的判别：按适配包的签名与真值逐帧核对，含逐字显示、计时选择、弹窗、播片与三种
+坏结局，以及不同分辨率与没有 OCR 的情形。播片不命中任何签名，按持续整屏的动态判出；别的画面不是
+播片。
 
 帧由合成游戏渲染、带手动时钟的采集时刻，经 `SceneAnalyzer` 逐帧判别；固定文字项用按真值给出文字的
 OCR 替身，真实 OCR 由 `ocr@1` 提供。适配包里锚点引用的摘要就是 `synthetic_game.anchors` 裁出的模板。
@@ -66,6 +67,9 @@ class Walk:
         self.number = 0
         self.seen: set[str] = set()
         self.endings: set[str] = set()
+        self.history: list[tuple[Truth, SceneState]] = []
+        self.playing: list[int] = []
+        """看播片时在播片中的各帧在 `history` 里的下标。"""
 
     def observe(self) -> SceneState:
         self.number += 1
@@ -89,15 +93,18 @@ class Walk:
             frame.width,
             frame.height,
         )
-        if truth.overlay is None:
+        if truth.overlay is None and truth.scene in SCREENS:
             self.seen.add(SCREENS[truth.scene])
         if truth.scene is SceneType.BAD_ENDING:
             self.endings.add(truth.node)
+        self.history.append((truth, state))
         return state
 
     def expected(self, truth: Truth) -> tuple[Verdict, str | None]:
         if truth.overlay is not None:
             return Verdict.NONE, None  # 弹窗不是画面
+        if truth.scene is SceneType.CUTSCENE:
+            return Verdict.NONE, None  # 播片不是画面，不命中任何签名
         screen = SCREENS[truth.scene]
         if self.ocr is None and screen in WITH_TEXTS:
             return Verdict.UNDETERMINED, None
@@ -118,6 +125,36 @@ class Walk:
         """画面不再变化后稳定下来。"""
         self.wait(FRAME_INTERVAL)
         assert self.wait(0.3).stability is Stability.STABLE
+
+    def watch_cutscene(self) -> None:
+        """刚进入播片：逐帧看完，回到选项后再看 2 秒。约 2 秒后判出播片，开始时刻是播片的第一帧；
+        回到选项的那一帧是最后一个动帧，1.5 秒后不再在播片中，结束时刻是它的下一帧。"""
+        start = len(self.history) - 1
+        (cutscene, entered), (_, before) = self.history[start], self.history[start - 1]
+        assert cutscene.scene is SceneType.CUTSCENE
+        assert before.stability is Stability.STABLE
+        while self.game.truth().scene is SceneType.CUTSCENE:
+            assert self.wait(FRAME_INTERVAL).stability is not Stability.STABLE
+        switch = len(self.history) - 1
+        assert self.history[switch][0].scene is SceneType.CHOICE
+        for _ in range(60):
+            self.wait(FRAME_INTERVAL)
+        states = [state for _, state in self.history]
+        playing = [n for n in range(start, len(states)) if states[n].playing]
+        first, last = playing[0], playing[-1]
+        assert playing == list(range(first, last + 1))
+        self.playing += playing
+        # 最近 2 秒不再含播片之前那个已稳定的帧时判出；之后的帧都在播片中。
+        second = 2_000_000_000
+        assert states[first].capture_ns - second >= before.capture_ns
+        assert states[first - 1].capture_ns - second < before.capture_ns
+        assert first < switch
+        assert {states[n].playing_since_ns for n in playing} == {entered.capture_ns}
+        switched = states[switch].capture_ns
+        assert states[last + 1].capture_ns - switched >= 1_500_000_000
+        assert states[last].capture_ns - switched < 1_500_000_000
+        assert states[last + 1].playing_ended_ns == states[switch + 1].capture_ns
+        assert [n for n, s in enumerate(states) if s.playing_ended_ns is not None] == [last + 1]
 
     def read_dialogue(self, *, watch_typing: bool = False) -> None:
         """读完当前的对话节点：每句等逐字显示完再推进。"""
@@ -161,12 +198,13 @@ def play_everything(walk: Walk) -> None:
     walk.click("popup.ok")
     walk.click("shop.leave")
 
-    # 开场对话，逐字显示；选项进插曲再回来；回去睡觉的坏结局。
+    # 开场对话，逐字显示；选项进插曲、看完播片再回来；回去睡觉的坏结局。
     walk.click("menu.start")
     walk.read_dialogue(watch_typing=True)
     walk.settle()
     walk.click("choice.1")
     walk.read_dialogue()
+    walk.watch_cutscene()
     walk.settle()
     walk.click("choice.2")
     walk.settle()
@@ -203,6 +241,8 @@ def play_everything(walk: Walk) -> None:
 
     assert walk.seen == set(SCREENS.values())
     assert walk.endings == {"sleep", "late", "burn"}
+    # 别的画面（逐字显示、计时条、换画面的转场）都不是播片。
+    assert [n for n, (_, state) in enumerate(walk.history) if state.playing] == walk.playing
 
 
 @pytest.mark.parametrize("size", [(1280, 720), (2560, 1440)])

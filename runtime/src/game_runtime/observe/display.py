@@ -14,6 +14,7 @@ from game_runtime.adapter import Adapter
 from game_runtime.kernel import EntryStatus, Reason, State
 from game_runtime.narrative import Completeness, NarrativeRecord
 from game_runtime.observe.hub import (
+    CutsceneEvent,
     Event,
     LanguageEvent,
     LanguageResult,
@@ -135,6 +136,8 @@ class Formatter:
                 return self.voice(event)
             case LineEvent():
                 return self.line(event)
+            case CutsceneEvent():
+                return self.cutscene(event)
             case LanguageEvent():
                 return self.language(event)
             case ScriptEvent():
@@ -169,6 +172,8 @@ class Formatter:
         adapter = self.adapter
         if adapter is not None and len(adapter.dialogue_boxes) > 1:
             head += " " + ("不限画面" if record.screen is None else self.screen(record.screen))
+        if record.cutscene is not None:
+            head += f" 播片 {record.cutscene}"
         completeness = COMPLETENESS[record.completeness]
         if (
             event.kind is LineKind.CLOSE
@@ -195,6 +200,16 @@ class Formatter:
             for line in record.low_confidence
         )
         return f" 低置信度：{items}"
+
+    def cutscene(self, event: CutsceneEvent) -> str:
+        """开始：判出播片的帧；结束：时长、其中的句数与不再在播片中的那一帧。"""
+        cutscene = event.cutscene
+        head = f"{self.stamp(event.at_ns)} 播片 {cutscene.index}"
+        if not event.ended:
+            return f"{head} 开始，帧 {cutscene.first_frame}"
+        seconds = cutscene.duration_ns / 1e9
+        sentences = len(cutscene.sentences)
+        return f"{head} 结束：{seconds:.1f} 秒，{sentences} 句，帧 {cutscene.closed_frame}"
 
     def language(self, event: LanguageEvent) -> str:
         head = f"{self.stamp(event.at_ns)} 语言核对 {self.screen(event.screen)}"
@@ -369,10 +384,12 @@ def summary(formatter: Formatter, *, narrative_problem: str | None) -> list[str]
         final = hub.final
         scopes = "—" if final is None else str(len(final.scopes))
         gaps = "—" if final is None else str(len(final.discontinuities))
+        cutscenes = hub.cutscenes()
+        played = sum(c.duration_ns for c in cutscenes) / 1e9
         lines.append(
             f"  剧情记录：{len(records)} 句，完整 {counts[Completeness.COMPLETE]}、"
             f"部分 {counts[Completeness.PARTIAL]}、缺口 {counts[Completeness.GAP]}；"
-            f"剧情范围 {scopes}，中断 {gaps}"
+            f"剧情范围 {scopes}，中断 {gaps}；播片段 {len(cutscenes)}，共 {played:.1f} 秒"
         )
     shares = hub.scene_shares()
     frames = sum(s.frames for s in shares)
