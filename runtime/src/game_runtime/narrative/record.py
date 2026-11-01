@@ -101,13 +101,16 @@ def compare_key(text: str) -> str:
     )
 
 
-def continues(current: str, observed: str) -> bool:
+def continues(current: str, observed: str, *, partial: bool = False) -> bool:
     """`observed` 是否还是比较文本为 `current` 的那一句：`observed` 有一个前缀与 `current`
     （n 个字）的编辑距离不超过 ⌊n / 4⌋，前缀的长度不限。`observed` 比 `current` 短超过 ⌊n / 4⌋
-    个字时没有这样的前缀（重新开始的逐字显示）。"""
+    个字时没有这样的前缀（重新开始的逐字显示）。当前句还是部分（`partial`）而 n 不到 4 时容差取 1：
+    那只是逐字显示开头的读数。"""
     if observed.startswith(current):
         return True
     limit = len(current) // REVISION_TOLERANCE
+    if partial and limit == 0:
+        limit = 1
     if len(observed) < len(current) - limit:
         return False
     row = _banded_row(current, observed[: len(current) + limit], limit)
