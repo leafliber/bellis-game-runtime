@@ -21,7 +21,7 @@
 | 只跑实时核的启动、生命线、心跳、采集主循环、音频主循环与动作块测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link` |
 | 只跑音频环的布局核对、读写与 Python–Rust 互通测试 | `uv run pytest runtime/tests/audio_ring protocol/tests/test_ring_layouts.py` |
 | 只跑动作块、假输入后端与失效释放的联调测试，并打印假后端上的释放时延 | `uv run pytest runtime/tests/core_link/test_actions.py -s` |
-| 只跑取帧接口与 `scene@1`（变化与稳定、画面签名、模板文件、合成游戏全部画面的判别、插件在内核中）的测试 | `uv run pytest runtime/tests/frames runtime/tests/scene` |
+| 只跑取帧接口与 `scene@1`（变化与稳定、播片、画面签名、模板文件、合成游戏全部画面的判别、插件在内核中）的测试 | `uv run pytest runtime/tests/frames runtime/tests/scene` |
 | 只跑 `scene@1` 经假显示面、实时核与帧环的联调测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link/test_scene.py` |
 | 只读运行：按适配包拉起实时核与感知插件，在终端里显示画面判别、配音忙闲、剧情记录与语言核对，结束时打印摘要；不发输入，不连 Bellis，按回车或 Ctrl+C 停止（先编译 release 版 `realtime-core`；`--status-interval` 改状态行的间隔，见[只读运行](docs/modules/offline-tools.md#只读运行)） | `uv run observe <适配包 id>` |
 | 只读运行并同时录制（与 `uv run record` 录下的相同） | `uv run observe <适配包 id> --record --name <名字>` |
@@ -58,7 +58,7 @@
 | 只核对本地数据目录里的模型制品，不联网 | `uv run fetch-models --check` |
 | 只跑 OCR 的测试（含语言核对的文字系统一层；本地数据目录里没有模型时，真实推理的那部分跳过） | `uv run pytest runtime/tests/ocr` |
 | 用本地数据目录里的真实模型跑 OCR 的识别测试（模型不在时跳过并写明原因） | `uv run pytest -m ocr_model` |
-| 只跑 `narrative@1` 的测试（一句的边界与完整度、按采集时刻的 OCR 节流、不写画面的对白框、存储与留存、合成剧情按真值逐句核对、积压与中断、插件在内核中；没有 OCR 模型时真实推理的那一项跳过） | `uv run pytest runtime/tests/narrative` |
+| 只跑 `narrative@1` 的测试（一句的边界与完整度、播片段与字幕、按采集时刻的 OCR 节流、不写画面的对白框、存储与留存、合成剧情按真值逐句核对、积压与中断、插件在内核中；没有 OCR 模型时真实推理的那一项跳过） | `uv run pytest runtime/tests/narrative` |
 | 用真实 OCR 模型跑一遍合成剧情的剧情记录，打印逐句的核对结果（模型不在时跳过） | `uv run pytest -m ocr_model runtime/tests/narrative -s` |
 | GS-04：渲染样本与真值：合成游戏的（验证评测工具）与按字体、字号、底色、描边与阴影变化的泛化样本（字体取本机系统自带的，没有时或加 `--no-system-fonts` 时用合成游戏的字体子集，见[GS-04 的评测工具](docs/modules/perception.md#gs-04-的评测工具)） | `uv run gs04 synth <目录>` |
 | GS-04：评测一个样本目录，按类别与标签（字体、字号、底色、字形）分组，报告写入 `reports/gs04/`（引擎 `ppocrv5-mobile`、`ppocrv5-server`） | `uv run gs04 eval <样本目录> --engine <引擎>` |
