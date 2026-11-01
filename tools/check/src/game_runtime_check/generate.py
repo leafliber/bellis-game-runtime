@@ -4,7 +4,8 @@
 `--check` 运行：重新生成到临时目录，与入库的逐字节比较，不一致即失败。
 
 管线：Rust 的 `core-protocol-export` 写出 JSON Schema、帧环与音频环的偏移表与示例消息；
-datamodel-codegen 从 Schema 生成 Pydantic 模型；本模块从 Schema 的 `x-methods` 写出方法目录。
+datamodel-codegen 从 Schema 生成 Pydantic 模型；本模块从 Schema 的 `x-methods`、
+`x-operator-methods` 与 `x-test-device-methods` 写出方法目录。
 两份 Python 文件都经 ruff 整理。输出不含时间戳与路径，换行一律 LF，Windows 与 Linux 上逐字节相同。
 """
 
@@ -133,12 +134,17 @@ def ref_name(reference: Mapping[str, Any]) -> str:
     return target.removeprefix(prefix)
 
 
-def method_constants(methods: Mapping[str, Mapping[str, Any]]) -> tuple[list[str], list[str]]:
-    """一组方法的常量定义行与常量名。"""
+def method_constants(
+    methods: Mapping[str, Mapping[str, Any]], prefix: str = ""
+) -> tuple[list[str], list[str]]:
+    """一组方法的常量定义行与常量名。常量名是方法名的大写，没有以 `prefix` 起头时加上它：操作员许可
+    连接的 `input.released` 与核连接的同名，以前缀区分。"""
     lines: list[str] = []
     constants: list[str] = []
     for name, method in methods.items():
         constant = name.replace(".", "_").upper()
+        if not constant.startswith(prefix):
+            constant = prefix + constant
         direction = str(method["direction"]).upper()
         params = f"models.{ref_name(method['params'])}"
         result = method["result"]
@@ -162,15 +168,19 @@ def method_index(variable: str, constants: list[str], doc: str) -> list[str]:
 
 
 def render_methods(schema: Mapping[str, Any]) -> bytes:
-    """从 Schema 的 `x-methods`、`x-test-device-methods`、`x-protocol-version` 与 `x-error-codes`
-    写出方法目录。"""
+    """从 Schema 的 `x-methods`、`x-operator-methods`、`x-test-device-methods`、
+    `x-protocol-version` 与 `x-error-codes` 写出方法目录。"""
     core_lines, core_constants = method_constants(schema["x-methods"])
+    operator_lines, operator_constants = method_constants(
+        schema["x-operator-methods"], prefix="OPERATOR_"
+    )
     test_lines, test_constants = method_constants(schema["x-test-device-methods"])
     lines = [
         PYTHON_HEADER,
         '"""核协议的 JSON-RPC 方法目录、协议版本与自定义错误码。',
         "",
-        "`METHODS` 是核连接上的方法；`TEST_DEVICE_METHODS` 是只用于测试的测试设备连接上的方法。",
+        "`METHODS` 是核连接上的方法；`OPERATOR_METHODS` 是操作员许可连接上的方法；",
+        "`TEST_DEVICE_METHODS` 是只用于测试的测试设备连接上的方法。",
         '"""',
         "",
         "from collections.abc import Mapping",
@@ -186,6 +196,14 @@ def render_methods(schema: Mapping[str, Any]) -> bytes:
         *core_lines,
         "",
         *method_index("METHODS", core_constants, "核连接上的全部方法，按方法名索引。"),
+        "",
+        *operator_lines,
+        "",
+        *method_index(
+            "OPERATOR_METHODS",
+            operator_constants,
+            "操作员许可连接上的全部方法，按方法名索引。",
+        ),
         "",
         *test_lines,
         "",

@@ -2,7 +2,8 @@
 //! “启动与生命线”与“动作块的执行”）。
 //!
 //! 线程：
-//! - 调用 [`run`] 的线程：以假后端启动时先连上测试设备；释放全部输入，连接主进程并握手，发出
+//! - 调用 [`run`] 的线程：有操作员许可连接时先连上操作员控制台，以假后端启动时接着连上测试设备；释放全部
+//!   输入（控制台随即收到 `input.released(core_start)`），连接主进程并握手，发出
 //!   `input.released(core_start)`，再启动其余线程，然后等会话结束；
 //! - `RpcPeer` 的读线程：处理 `producer.heartbeat`、`producer.revoke`、`core.stop`、`action.submit`、
 //!   `frame_ring.attach` 与 `capture.set_target`，处理函数在读线程上同步执行，只动控制状态、发通知或把命令
@@ -12,7 +13,8 @@
 //! - 健康：启动时立即发一次 `core.health`，之后按周期发；
 //! - 采集：取帧写进帧环（`frames` 模块）；
 //! - 两条生命线：一个线程等核连接关闭，一个线程读 stdin 直到 EOF；
-//! - 以假后端启动时另有测试设备连接的读线程、发送线程与生命线（`fake` 模块）。
+//! - 操作员许可连接的读线程、发送线程与生命线（`operator` 模块）；以假后端启动时另有测试设备连接的读线程、
+//!   发送线程，作为测试许可源时还有生命线（`fake` 模块）。
 //!
 //! 握手与 `core_start` 在启动读线程之前完成，所以读线程处理任何产出者消息之前，`core_start` 已经发出；
 //! 发送队列也在 `core_start` 之后才开始写。
@@ -38,19 +40,21 @@ use core_protocol::messages::{
 };
 use core_protocol::methods::{
     ActionReceipt, ActionSubmit, AudioRingAttach, AudioSetTarget, CaptureSetTarget, CoreHealth,
-    CoreHello, CoreStop, FrameRingAttach, InputReleased, Method, Notification, ProducerHeartbeat,
-    ProducerRevoke, error_code,
+    CoreHello, CoreStop, FrameRingAttach, InputReleased, Method, Notification,
+    OperatorInputReleased, ProducerHeartbeat, ProducerRevoke, error_code,
 };
 use frame_ring::FrameRingWriter;
 use serde_json::{Map, Value, json};
 
 use crate::audio::{self, Audio, AudioStatus, AudioThread, audio_opener_for};
-use crate::config::{HELLO_TIMEOUT, InputSetup, Launch, Options};
+use crate::config::{FakePermit, HELLO_TIMEOUT, InputSetup, Launch, Options, PermitSource};
 use crate::control::{Control, Limits, Notice, Notices};
-use crate::fake::{Post, TestDevice, connect_test_device};
+use crate::fake::{DeviceRole, FakeBackend, connect_test_device};
 use crate::frames::{Capture, CaptureThread, FrameStatus, TargetError, opener_for};
 use crate::ledger::InputBackend;
+use crate::operator::connect_operator;
 use crate::queue::SendQueue;
+use crate::side::{Post, SideConnection};
 
 /// 实时核的程序版本，经 `core.hello` 报给主进程。
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -69,6 +73,9 @@ const OUTBOX_FLUSH_WAIT: Duration = Duration::from_millis(200);
 
 /// 会话结束时等假输入事件（释放全部输入的抬起）写给测试一方的时限。只用于测试。
 const DEVICE_FLUSH_WAIT: Duration = Duration::from_millis(500);
+
+/// 会话结束时等 `input.released` 写给操作员控制台的时限。等不到也照常退出：输入此前已经释放。
+const OPERATOR_FLUSH_WAIT: Duration = Duration::from_millis(200);
 
 /// 会话怎样结束。每一种都已释放全部输入。
 #[derive(Debug)]
@@ -97,6 +104,8 @@ impl fmt::Display for Ended {
 pub enum StartError {
     /// 连不上主进程或握手失败。
     Connect(ChannelError),
+    /// 连不上操作员控制台或握手失败（只在给了操作员许可连接时连接）。
+    Operator(ChannelError),
     /// 连不上测试设备或握手失败（只在假后端时连接）。
     TestDevice(ChannelError),
     /// `core.hello` 没有得到合法的接受。
@@ -109,6 +118,7 @@ impl fmt::Display for StartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Connect(error) => write!(f, "cannot connect to the main process: {error}"),
+            Self::Operator(error) => write!(f, "cannot connect to the operator console: {error}"),
             Self::TestDevice(error) => write!(f, "cannot connect to the test device: {error}"),
             Self::Hello(reason) => write!(f, "core.hello failed: {reason}"),
             Self::Thread(error) => write!(f, "cannot start a thread: {error}"),
@@ -125,7 +135,8 @@ impl std::error::Error for StartError {}
 ///
 /// # Errors
 ///
-/// 连不上主进程或测试设备、握手失败或无法创建线程时返回 [`StartError`]；此时已释放全部输入。
+/// 连不上主进程、操作员控制台或测试设备、握手失败或无法创建线程时返回 [`StartError`]；此时已释放全部
+/// 输入。
 pub fn run(
     options: &Options,
     launch: &Launch,
@@ -133,20 +144,15 @@ pub fn run(
     stdin: impl Read + Send + 'static,
 ) -> Result<Ended, StartError> {
     let frames = Arc::new(FrameStatus::default());
-    let outbox = Arc::new(Outbox::default());
     let limits = Limits {
         heartbeat_timeout: options.heartbeat_timeout,
         max_frame_age: options.max_frame_age,
     };
-    let (control, device) = start_input(input, limits, &frames, &outbox, &launch.role)?;
-    // 每次启动先释放全部输入，再接受任何产出者与动作。
+    let (control, outbox, sides) = start_input(input, limits, &frames, &launch.role)?;
+    // 每次启动先释放全部输入，再接受任何产出者与动作。操作员控制台随即收到 `core_start`。
     let started = control.release_on_start();
     log!("released all inputs on start");
-    let finish_device = |device: Option<TestDevice>| {
-        if let Some(device) = device {
-            device.finish(DEVICE_FLUSH_WAIT);
-        }
-    };
+    outbox.mirror(&started);
 
     let credentials = &launch.credentials;
     let connection = match connect(
@@ -157,7 +163,7 @@ pub fn run(
     ) {
         Ok(connection) => connection,
         Err(error) => {
-            finish_device(device);
+            sides.finish();
             return Err(StartError::Connect(error));
         }
     };
@@ -167,14 +173,14 @@ pub fn run(
             .map_err(StartError::Connect)
     });
     if let Err(error) = greeted {
-        finish_device(device);
+        sides.finish();
         return Err(error);
     }
 
     let (media, media_threads) = match Media::spawn(frames) {
         Ok(spawned) => spawned,
         Err(error) => {
-            finish_device(device);
+            sides.finish();
             return Err(StartError::Thread(error));
         }
     };
@@ -190,7 +196,7 @@ pub fn run(
         Ok(peer) => Arc::new(peer),
         Err(error) => {
             media_threads.stop();
-            finish_device(device);
+            sides.finish();
             return Err(StartError::Thread(error));
         }
     };
@@ -209,9 +215,9 @@ pub fn run(
         Ok(workers) => workers,
         Err(error) => {
             // 起不了线程就断开核连接：按核连接断开释放。
-            Outbox::log(&control.release_on_exit(ReleaseReason::CoreConnectionLost));
+            outbox.log(&control.release_on_exit(ReleaseReason::CoreConnectionLost));
             outbox.close(OUTBOX_FLUSH_WAIT);
-            finish_device(device);
+            sides.finish();
             media_threads.stop();
             peer.close();
             return Err(StartError::Thread(error));
@@ -225,7 +231,7 @@ pub fn run(
         Ended::Stopped => {}
         // 生命线：先释放，再记录；连接已断开时无法通知主进程。
         Ended::ConnectionClosed(_) => {
-            Outbox::log(&control.release_on_exit(ReleaseReason::CoreConnectionLost));
+            outbox.log(&control.release_on_exit(ReleaseReason::CoreConnectionLost));
         }
         // 连接可能仍在：尽量告诉主进程。
         Ended::StdinClosed => outbox.post(control.release_on_exit(ReleaseReason::StdinClosed)),
@@ -235,43 +241,93 @@ pub fn run(
         let _ = worker.join();
     }
     outbox.close(OUTBOX_FLUSH_WAIT);
-    // 释放全部输入的抬起写给测试一方之后才断开它。
-    finish_device(device);
+    // 释放全部输入的 `input.released` 写给操作员控制台、抬起写给测试一方之后才断开它们。
+    sides.finish();
     media_threads.stop();
     peer.close();
     Ok(reason)
 }
 
-/// 建立控制状态与输入后端。以假后端启动时先连上测试设备、开始处理测试许可源的请求；测试许可源只在
-/// 这里与假后端一起出现。
+/// 旁路连接：操作员许可连接与测试设备连接，各自可能没有。
+#[derive(Default)]
+struct Sides {
+    operator: Option<SideConnection>,
+    device: Option<SideConnection>,
+}
+
+impl Sides {
+    /// 等队列里的通知与事件写出（各有时限），再断开。
+    fn finish(self) {
+        if let Some(operator) = self.operator {
+            operator.finish(OPERATOR_FLUSH_WAIT);
+        }
+        if let Some(device) = self.device {
+            device.finish(DEVICE_FLUSH_WAIT);
+        }
+    }
+}
+
+/// 建立控制状态、输入后端与许可源。有操作员许可连接时先连上控制台、开始处理它的请求；以假后端启动时
+/// 接着连上测试设备。测试许可源只在这里与假后端一起、且只在没有操作员许可连接时出现。
+///
+/// 交出的 [`Outbox`] 是发给主进程的通知的出口；有操作员许可连接时，它把每条 `input.released` 也放进那条
+/// 连接的发送队列。
 fn start_input(
     input: InputSetup,
     limits: Limits,
     frames: &Arc<FrameStatus>,
-    outbox: &Arc<Outbox>,
     role: &str,
-) -> Result<(Arc<Control>, Option<TestDevice>), StartError> {
-    match input {
-        InputSetup::None => Ok((
+) -> Result<(Arc<Control>, Arc<Outbox>, Sides), StartError> {
+    let operator_queue = input.operator().map(|_| Arc::new(SendQueue::default()));
+    let outbox = Arc::new(Outbox::new(operator_queue.clone()));
+    let InputSetup::Fake {
+        test_device,
+        permit,
+    } = input
+    else {
+        return Ok((
             Arc::new(Control::new(limits, Arc::clone(frames), None)),
-            None,
-        )),
-        InputSetup::Fake { test_device } => {
-            let (connection, backend) =
-                connect_test_device(&test_device, role).map_err(StartError::TestDevice)?;
-            let backend: Box<dyn InputBackend> = Box::new(backend);
-            let control = Arc::new(Control::new(limits, Arc::clone(frames), Some(backend)));
-            let post: Post = {
-                let outbox = Arc::clone(outbox);
-                Arc::new(move |notices| outbox.post(notices))
-            };
-            let device = connection
-                .start(&control, &post)
-                .map_err(StartError::Thread)?;
-            log!("input backend: fake, via the test device (tests only)");
-            Ok((control, Some(device)))
+            outbox,
+            Sides::default(),
+        ));
+    };
+    let (backend, events) = FakeBackend::new();
+    let backend: Box<dyn InputBackend> = Box::new(backend);
+    let control = Arc::new(Control::new(limits, Arc::clone(frames), Some(backend)));
+    let post: Post = {
+        let outbox = Arc::clone(&outbox);
+        Arc::new(move |notices| outbox.post(notices))
+    };
+    let mut sides = Sides::default();
+    let device_role = match permit {
+        FakePermit::TestLease => DeviceRole::LeaseSource,
+        FakePermit::Source(PermitSource::Operator(operator)) => {
+            let connection = connect_operator(&operator, role).map_err(StartError::Operator)?;
+            let queue = operator_queue.unwrap_or_default();
+            sides.operator = Some(
+                connection
+                    .start(queue, &control, &post)
+                    .map_err(StartError::Thread)?,
+            );
+            log!("lease source: the operator console");
+            DeviceRole::EventsOnly
+        }
+    };
+    let connection = connect_test_device(&test_device, role).map_err(StartError::TestDevice)?;
+    sides.device = Some(
+        connection
+            .start(device_role, events, &control, &post)
+            .map_err(StartError::Thread)?,
+    );
+    match device_role {
+        DeviceRole::LeaseSource => {
+            log!("input backend: fake, lease from the test device (tests only)");
+        }
+        DeviceRole::EventsOnly => {
+            log!("input backend: fake, events to the test device (tests only)");
         }
     }
+    Ok((control, outbox, sides))
 }
 
 /// 处理函数经它把命令交给采集线程与音频线程；健康线程从这里读音频的状态。
@@ -380,13 +436,16 @@ fn notification<M: Notification>(params: &M::Params) -> Value {
 ///
 /// - `send`：在调用线程上直接写。读线程上的处理函数用它，`producer.revoke` 与 `core.stop` 由此在回应之前
 ///   发出 `input.released`；
-/// - `post`：放进发送队列，由发送线程写。调度线程与测试设备连接的线程用它，从不等网络写入。
+/// - `post`：放进发送队列，由发送线程写。调度线程与旁路连接的线程用它，从不等网络写入。
+///
+/// 有操作员许可连接时，经过这里的每条 `input.released`（含只记日志、主进程收不到的）也放进操作员许可连接
+/// 的发送队列（[`Self::mirror`]），由它的发送线程写给控制台。
 ///
 /// 读线程启动后才拿到对端；在那之前到达的处理函数等它就位，最多几微秒。发送线程在拿到对端之后才启动。
-#[derive(Default)]
 struct Outbox {
     peer: OnceLock<Weak<RpcPeer>>,
     queue: SendQueue,
+    operator: Option<Arc<SendQueue>>,
 }
 
 fn to_params(method: &str, params: &impl serde::Serialize) -> Option<Map<String, Value>> {
@@ -399,6 +458,14 @@ fn to_params(method: &str, params: &impl serde::Serialize) -> Option<Map<String,
 }
 
 impl Outbox {
+    fn new(operator: Option<Arc<SendQueue>>) -> Self {
+        Self {
+            peer: OnceLock::new(),
+            queue: SendQueue::default(),
+            operator,
+        }
+    }
+
     fn attach(&self, peer: &Arc<RpcPeer>) {
         let _ = self.peer.set(Arc::downgrade(peer));
     }
@@ -420,20 +487,31 @@ impl Outbox {
         }
     }
 
-    /// 记下通知中的释放：主进程收不到时，日志是唯一的记录。
-    fn log(notices: &Notices) {
+    /// 把一次释放的 `input.released` 放进操作员许可连接的发送队列；没有这条连接时什么也不做。
+    fn mirror(&self, released: &InputReleasedParams) {
+        if let Some(queue) = &self.operator
+            && let Some(params) = to_params(OperatorInputReleased::NAME, released)
+        {
+            queue.push(OperatorInputReleased::NAME, params);
+        }
+    }
+
+    /// 记下通知中的释放：主进程收不到时，日志是唯一的记录。操作员控制台照常收到。
+    fn log(&self, notices: &Notices) {
         for notice in &notices.0 {
             if let Notice::Released(released) = notice {
                 log_released(released);
+                self.mirror(released);
             }
         }
     }
 
-    fn each(notices: Notices, mut deliver: impl FnMut(&'static str, Map<String, Value>)) {
+    fn each(&self, notices: Notices, mut deliver: impl FnMut(&'static str, Map<String, Value>)) {
         for notice in notices.0 {
             let (method, params) = match &notice {
                 Notice::Released(released) => {
                     log_released(released);
+                    self.mirror(released);
                     (
                         InputReleased::NAME,
                         to_params(InputReleased::NAME, released),
@@ -451,12 +529,12 @@ impl Outbox {
 
     /// 在调用线程上直接发出这些通知。
     fn send(&self, notices: Notices) {
-        Self::each(notices, |method, params| self.write(method, &params));
+        self.each(notices, |method, params| self.write(method, &params));
     }
 
     /// 把这些通知放进发送队列，立即返回。
     fn post(&self, notices: Notices) {
-        Self::each(notices, |method, params| self.queue.push(method, params));
+        self.each(notices, |method, params| self.queue.push(method, params));
     }
 
     /// 发送线程的循环，直到 [`Self::close`]。

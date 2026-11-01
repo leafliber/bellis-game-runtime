@@ -334,7 +334,7 @@ class FakeDevice:
         return peer
 
     async def _request_grant(self, token: int, expires_ns: int) -> None:
-        params = models.FakeLeaseGrantParams(token=token, expires_ns=expires_ns)
+        params = models.LeaseGrantParams(token=token, expires_ns=expires_ns)
         await self._current().request(
             TEST_LEASE_GRANT.name, params.model_dump(mode="json"), timeout=self._rpc_timeout
         )
@@ -383,7 +383,7 @@ class FakeDevice:
 
     async def _revoke(self, token: int | None) -> None:
         await self._stop_renewing()
-        params = models.FakeLeaseRevokeParams(token=self._token if token is None else token)
+        params = models.LeaseRevokeParams(token=self._token if token is None else token)
         await self._current().request(
             TEST_LEASE_REVOKE.name, params.model_dump(mode="json"), timeout=self._rpc_timeout
         )

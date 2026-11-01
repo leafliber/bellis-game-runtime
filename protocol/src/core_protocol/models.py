@@ -536,7 +536,7 @@ class ReleaseReason(StrEnum):
     """
     LEASE_SOURCE_LOST = "lease_source_lost"
     """
-    与许可源的连接断开；G0 的许可源是测试设备连接。
+    与许可源的连接断开：操作员许可连接或测试设备连接。
     """
     NO_LEASE = "no_lease"
     """
@@ -638,9 +638,9 @@ class LatestAudio(BaseModel):
     """
 
 
-class FakeLeaseGrantParams(BaseModel):
+class LeaseGrantParams(BaseModel):
     """
-    `test_lease.grant` 的 params：测试许可源授予或续约输入许可。只用于测试。
+    `operator_lease.grant` 与 `test_lease.grant` 的 params：许可源授予或续约输入许可。
     """
 
     model_config = ConfigDict(
@@ -656,9 +656,9 @@ class FakeLeaseGrantParams(BaseModel):
     """
 
 
-class FakeLeaseRevokeParams(BaseModel):
+class LeaseRevokeParams(BaseModel):
     """
-    `test_lease.revoke` 的 params：测试许可源吊销输入许可。只用于测试。
+    `operator_lease.revoke` 与 `test_lease.revoke` 的 params：许可源吊销输入许可。
     """
 
     model_config = ConfigDict(

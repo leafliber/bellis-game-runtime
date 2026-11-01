@@ -17,17 +17,17 @@ use crate::messages::{
     CaptureSetTargetParams, CaptureState, CaptureTarget, Click, ControlStep, CoreHealthParams,
     CoreHelloParams, CoreHelloResult, DropReason, Dropped, Empty, Executed, FakeAudioTarget,
     FakeAxisRelease, FakeAxisSet, FakeClick, FakeInputEvent, FakeInputEventParams, FakeKeyDown,
-    FakeKeyPress, FakeKeyUp, FakeLeaseGrantParams, FakeLeaseRevokeParams, FakeMouseDown,
-    FakeMouseMove, FakeMouseUp, FakeReleaseAll, FakeScroll, FakeTarget, FrameRingAttachParams,
-    HeldAxis, HeldInput, HeldKey, HeldMouseButton, InputReleasedParams, KeyPress, LatestAudio,
-    LatestFrame, LeaseStatus, MouseButton, MouseMove, Producer, ProducerHeartbeatParams,
-    ProducerRevokeParams, RejectReason, Rejected, ReleaseReason, Scroll, WindowTarget,
+    FakeKeyPress, FakeKeyUp, FakeMouseDown, FakeMouseMove, FakeMouseUp, FakeReleaseAll, FakeScroll,
+    FakeTarget, FrameRingAttachParams, HeldAxis, HeldInput, HeldKey, HeldMouseButton,
+    InputReleasedParams, KeyPress, LatestAudio, LatestFrame, LeaseGrantParams, LeaseRevokeParams,
+    LeaseStatus, MouseButton, MouseMove, Producer, ProducerHeartbeatParams, ProducerRevokeParams,
+    RejectReason, Rejected, ReleaseReason, Scroll, WindowTarget,
 };
 use crate::methods::{
     ActionReceipt, ActionSubmit, AudioRingAttach, AudioSetTarget, CaptureSetTarget, CoreHealth,
     CoreHello, CoreStop, FakeInput, FrameRingAttach, InputReleased, Method, MethodInfo,
-    ProducerHeartbeat, ProducerRevoke, Request, TestLeaseGrant, TestLeaseRevoke, catalog,
-    error_code, test_device_catalog,
+    OperatorLeaseGrant, OperatorLeaseRevoke, ProducerHeartbeat, ProducerRevoke, Request,
+    TestLeaseGrant, TestLeaseRevoke, catalog, error_code, operator_catalog, test_device_catalog,
 };
 use crate::{audio_ring, frame_ring};
 
@@ -83,8 +83,8 @@ fn to_json<T: Serialize + ?Sized>(value: &T) -> String {
 /// 核协议的 JSON Schema（2020-12）。
 ///
 /// `$defs` 是全部消息类型；`x-methods` 按方法名列出核连接上每个方法的方向与 params、result 的引用，
-/// 通知的 `result` 为 `null`；`x-test-device-methods` 同样列出只用于测试的测试设备连接上的方法；
-/// `x-protocol-version` 与 `x-error-codes` 是协议版本与自定义错误码。
+/// 通知的 `result` 为 `null`；`x-operator-methods` 与 `x-test-device-methods` 同样列出操作员许可连接与
+/// 只用于测试的测试设备连接上的方法；`x-protocol-version` 与 `x-error-codes` 是协议版本与自定义错误码。
 #[must_use]
 pub fn schema() -> Value {
     let mut generator = SchemaSettings::draft2020_12()
@@ -92,6 +92,7 @@ pub fn schema() -> Value {
         .with_transform(RecursiveTransform(mark_type_discriminator))
         .into_generator();
     let methods = method_refs(&catalog(), &mut generator);
+    let operator_methods = method_refs(&operator_catalog(), &mut generator);
     let test_device_methods = method_refs(&test_device_catalog(), &mut generator);
     let error_codes: Map<String, Value> = error_code::ALL
         .iter()
@@ -103,6 +104,7 @@ pub fn schema() -> Value {
         "description": "主进程与实时核之间核连接上的消息，由 core/crates/core-protocol 生成。",
         "x-protocol-version": PROTOCOL_VERSION,
         "x-methods": methods,
+        "x-operator-methods": operator_methods,
         "x-test-device-methods": test_device_methods,
         "x-error-codes": error_codes,
         "$defs": generator.take_definitions(true),
@@ -456,15 +458,25 @@ pub fn fixtures() -> Vec<Fixture> {
                 }),
             },
         ),
+        Fixture::params::<OperatorLeaseGrant>(
+            None,
+            &LeaseGrantParams {
+                token: 5,
+                expires_ns: 5_500_000_000,
+            },
+        ),
+        Fixture::result::<OperatorLeaseGrant>(None, &Empty {}),
+        Fixture::params::<OperatorLeaseRevoke>(None, &LeaseRevokeParams { token: 5 }),
+        Fixture::result::<OperatorLeaseRevoke>(None, &Empty {}),
         Fixture::params::<TestLeaseGrant>(
             None,
-            &FakeLeaseGrantParams {
+            &LeaseGrantParams {
                 token: 2,
                 expires_ns: 5_500_000_000,
             },
         ),
         Fixture::result::<TestLeaseGrant>(None, &Empty {}),
-        Fixture::params::<TestLeaseRevoke>(None, &FakeLeaseRevokeParams { token: 2 }),
+        Fixture::params::<TestLeaseRevoke>(None, &LeaseRevokeParams { token: 2 }),
         Fixture::result::<TestLeaseRevoke>(None, &Empty {}),
     ];
     let events = [
@@ -561,11 +573,15 @@ mod tests {
     use serde_json::Value;
 
     use super::{fixtures, schema};
-    use crate::methods::{MethodInfo, catalog, test_device_catalog};
+    use crate::methods::{
+        InputReleased, Method, MethodInfo, OperatorInputReleased, catalog, operator_catalog,
+        test_device_catalog,
+    };
 
-    /// 两组方法：核连接上的与测试设备连接上的。
+    /// 三组方法：核连接上的、操作员许可连接上的与测试设备连接上的。
     fn all_methods() -> Vec<MethodInfo> {
         let mut methods = catalog();
+        methods.extend(operator_catalog());
         methods.extend(test_device_catalog());
         methods
     }
@@ -695,6 +711,7 @@ mod tests {
         let defs = schema["$defs"].as_object().unwrap();
         for (key, catalog) in [
             ("x-methods", catalog()),
+            ("x-operator-methods", operator_catalog()),
             ("x-test-device-methods", test_device_catalog()),
         ] {
             let methods = schema[key].as_object().unwrap();
@@ -717,11 +734,26 @@ mod tests {
         }
     }
 
+    /// 测试设备连接与核连接、操作员许可连接没有同名的方法；操作员许可连接与核连接只共有
+    /// `input.released`，两处的 params 相同。
     #[test]
-    fn the_two_groups_do_not_share_method_names() {
+    fn the_groups_share_only_input_released() {
         let core: BTreeSet<&str> = catalog().iter().map(|method| method.name).collect();
+        let operator: BTreeSet<&str> = operator_catalog()
+            .iter()
+            .map(|method| method.name)
+            .collect();
         for method in test_device_catalog() {
             assert!(!core.contains(method.name), "{}", method.name);
+            assert!(!operator.contains(method.name), "{}", method.name);
         }
+        let shared: Vec<&str> = core.intersection(&operator).copied().collect();
+        assert_eq!(shared, [InputReleased::NAME]);
+        assert_eq!(OperatorInputReleased::NAME, InputReleased::NAME);
+        let schema = schema();
+        assert_eq!(
+            schema["x-operator-methods"][InputReleased::NAME]["params"],
+            schema["x-methods"][InputReleased::NAME]["params"]
+        );
     }
 }

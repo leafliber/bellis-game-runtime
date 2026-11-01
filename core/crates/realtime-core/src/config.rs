@@ -1,10 +1,10 @@
 //! 启动参数与凭据（`docs/modules/realtime-core.md` 的“启动与生命线”与“输入代理”）。
 //!
 //! 凭据按 Bellis 的子进程约定（`ChildEnv`）从环境变量取得：通道地址、base64url 编码的会话密钥与连接时使用
-//! 的角色；只用于测试的测试设备连接另用一组环境变量。时限与输入后端从命令行参数取得，缺省值的依据见
-//! 模块文档。测试许可源只能与假输入后端一起启用，由 [`InputSetup::select`] 强制。
+//! 的角色；操作员许可连接与只用于测试的测试设备连接各另用一组环境变量。时限与输入后端从命令行参数取得，
+//! 缺省值的依据见模块文档。输入后端与许可源的门禁由 [`InputSetup::select`] 强制：许可源只有一个，测试许可源
+//! 只能与假输入后端一起、且只在没有操作员许可连接时启用。
 
-use std::fmt;
 use std::time::Duration;
 
 use bellis_channel::ChannelCredentials;
@@ -19,6 +19,10 @@ pub const ENV_ROLE: &str = "BELLIS_ROLE";
 pub const ENV_TEST_DEVICE_PATH: &str = "GAME_RUNTIME_TEST_DEVICE_PATH";
 /// 测试设备连接的会话密钥（base64url 无填充），只用于测试。
 pub const ENV_TEST_DEVICE_KEY: &str = "GAME_RUNTIME_TEST_DEVICE_KEY";
+/// 操作员许可连接的地址：独立运行中操作员控制台的通道地址（GR-36）。
+pub const ENV_OPERATOR_PATH: &str = "GAME_RUNTIME_OPERATOR_PATH";
+/// 操作员许可连接的会话密钥（base64url 无填充）。
+pub const ENV_OPERATOR_KEY: &str = "GAME_RUNTIME_OPERATOR_KEY";
 
 /// 心跳超时的缺省值：主进程以 100ms 为周期发心跳，连续丢失约 5 次才算超时。
 pub const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -105,7 +109,8 @@ impl Options {
     }
 }
 
-/// 主进程交来的连接信息。
+/// 主进程交来的连接信息。`Debug` 不含密钥（[`ChannelCredentials`] 的 `Debug` 已隐去）。
+#[derive(Debug)]
 pub struct Launch {
     /// 通道地址与会话密钥。
     pub credentials: ChannelCredentials,
@@ -113,6 +118,8 @@ pub struct Launch {
     pub role: String,
     /// 测试设备连接的地址与密钥，只用于测试；没有给出时为 `None`。
     pub test_device: Option<ChannelCredentials>,
+    /// 操作员许可连接的地址与密钥；没有给出时为 `None`。
+    pub operator: Option<ChannelCredentials>,
 }
 
 impl Launch {
@@ -120,7 +127,8 @@ impl Launch {
     ///
     /// # Errors
     ///
-    /// 缺少变量、测试设备的地址与密钥只给出一个，或密钥格式不正确时返回说明，说明中不含密钥。
+    /// 缺少变量、测试设备或操作员许可连接的地址与密钥只给出一个，或密钥格式不正确时返回说明，说明中
+    /// 不含密钥。
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let optional = |name: &str| get(name).filter(|v| !v.is_empty());
         let required = |name: &str| optional(name).ok_or_else(|| format!("{name} is not set"));
@@ -129,92 +137,106 @@ impl Launch {
         let role = required(ENV_ROLE)?;
         let credentials = ChannelCredentials::decode(path, &key)
             .map_err(|error| format!("{ENV_CHANNEL_KEY} is invalid: {}", error.code().as_str()))?;
-        let test_device = match (
-            optional(ENV_TEST_DEVICE_PATH),
-            optional(ENV_TEST_DEVICE_KEY),
-        ) {
-            (None, None) => None,
-            (Some(path), Some(key)) => {
-                Some(ChannelCredentials::decode(path, &key).map_err(|error| {
-                    format!(
-                        "{ENV_TEST_DEVICE_KEY} is invalid: {}",
-                        error.code().as_str()
-                    )
-                })?)
-            }
-            _ => {
-                return Err(format!(
-                    "give both {ENV_TEST_DEVICE_PATH} and {ENV_TEST_DEVICE_KEY}, or neither"
-                ));
-            }
+        let pair = |path_name: &str, key_name: &str| match (optional(path_name), optional(key_name))
+        {
+            (None, None) => Ok(None),
+            (Some(path), Some(key)) => ChannelCredentials::decode(path, &key)
+                .map(Some)
+                .map_err(|error| format!("{key_name} is invalid: {}", error.code().as_str())),
+            _ => Err(format!("give both {path_name} and {key_name}, or neither")),
         };
+        let test_device = pair(ENV_TEST_DEVICE_PATH, ENV_TEST_DEVICE_KEY)?;
+        let operator = pair(ENV_OPERATOR_PATH, ENV_OPERATOR_KEY)?;
         Ok(Self {
             credentials,
             role,
             test_device,
+            operator,
         })
     }
 }
 
-impl fmt::Debug for Launch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Launch")
-            .field("path", &self.credentials.path)
-            .field("role", &self.role)
-            .field(
-                "test_device",
-                &self.test_device.as_ref().map(|device| &device.path),
-            )
-            .finish_non_exhaustive()
-    }
+/// 生产许可源：真实后端只能与它一起选出（G2 第 2 步），没有自己给自己许可的路径。G3 的 Bellis 控制连接
+/// 也加在这里。
+#[derive(Debug)]
+pub enum PermitSource {
+    /// 操作员许可连接：独立运行中操作员控制台的测试会话授予许可（GR-36）。
+    Operator(ChannelCredentials),
 }
 
-/// 输入后端与许可源的组合。测试许可源只能与假后端一起出现：它只在 [`InputSetup::Fake`] 里，
-/// 由 [`InputSetup::select`] 构造。
+/// 假输入后端的许可源。
+#[derive(Debug)]
+pub enum FakePermit {
+    /// 测试许可源，经测试设备连接。只用于测试，只在没有操作员许可连接时构造。
+    TestLease,
+    /// 生产许可源；测试设备连接只承载假输入事件。
+    Source(PermitSource),
+}
+
+/// 输入后端与许可源的组合，只由 [`InputSetup::select`] 构造。许可源只有一个：测试许可源只在
+/// [`InputSetup::Fake`] 里、且只在没有生产许可源时出现。真实后端（G2 第 2 步）加进来时只带
+/// [`PermitSource`]，所以它不能与测试许可源一起出现。
+#[derive(Debug)]
 pub enum InputSetup {
     /// 没有输入后端，也没有许可源：动作块照常校验与调度，但权威检查因没有许可从不通过，不发任何输入。
     None,
-    /// 假输入后端与测试许可源，都经测试设备连接。只用于测试。
+    /// 假输入后端，事件经测试设备连接交给测试一方。只用于测试。
     Fake {
         /// 测试设备连接的地址与密钥。
         test_device: ChannelCredentials,
+        /// 许可从哪里来。
+        permit: FakePermit,
     },
 }
 
 impl InputSetup {
-    /// 按 `--input-backend` 与测试设备的凭据选出组合。
+    /// 按 `--input-backend`、测试设备的凭据与操作员许可连接的凭据选出组合。
     ///
     /// # Errors
     ///
-    /// 假后端没有测试设备的凭据，或给了测试设备的凭据却不是假后端（测试许可源不能与其它后端或
-    /// 没有后端同时启用）时返回说明。
+    /// 以下情形返回说明：假后端没有测试设备的凭据；给了测试设备的凭据却不是假后端（测试许可源不能与
+    /// 其它后端或没有后端同时启用）；给了操作员许可连接的凭据却没有输入后端。
     pub fn select(
         backend: Option<InputBackendKind>,
         test_device: Option<ChannelCredentials>,
+        operator: Option<ChannelCredentials>,
     ) -> Result<Self, String> {
-        match (backend, test_device) {
-            (None, None) => Ok(Self::None),
-            (Some(InputBackendKind::Fake), Some(test_device)) => Ok(Self::Fake { test_device }),
-            (Some(InputBackendKind::Fake), None) => Err(format!(
-                "--input-backend fake needs the test device: set {ENV_TEST_DEVICE_PATH} and \
-                 {ENV_TEST_DEVICE_KEY}"
+        match (backend, test_device, operator) {
+            (None, None, None) => Ok(Self::None),
+            (None, _, Some(_)) => Err(format!(
+                "the operator lease connection ({ENV_OPERATOR_PATH}) needs an input backend"
             )),
-            (None, Some(_)) => Err(format!(
+            (None, Some(_), None) => Err(format!(
                 "the test lease source ({ENV_TEST_DEVICE_PATH}) is only available with \
                  --input-backend fake"
             )),
+            (Some(InputBackendKind::Fake), None, _) => Err(format!(
+                "--input-backend fake needs the test device: set {ENV_TEST_DEVICE_PATH} and \
+                 {ENV_TEST_DEVICE_KEY}"
+            )),
+            (Some(InputBackendKind::Fake), Some(test_device), operator) => Ok(Self::Fake {
+                test_device,
+                permit: match operator {
+                    Some(operator) => FakePermit::Source(PermitSource::Operator(operator)),
+                    None => FakePermit::TestLease,
+                },
+            }),
         }
     }
-}
 
-impl fmt::Debug for InputSetup {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// 操作员许可连接的地址与密钥；没有时为 `None`。
+    #[must_use]
+    pub fn operator(&self) -> Option<&ChannelCredentials> {
         match self {
-            Self::None => f.write_str("InputSetup::None"),
-            Self::Fake { test_device } => f
-                .debug_struct("InputSetup::Fake")
-                .field("test_device", &test_device.path)
-                .finish_non_exhaustive(),
+            Self::Fake {
+                permit: FakePermit::Source(PermitSource::Operator(operator)),
+                ..
+            } => Some(operator),
+            Self::None
+            | Self::Fake {
+                permit: FakePermit::TestLease,
+                ..
+            } => None,
         }
     }
 }
@@ -222,8 +244,9 @@ impl fmt::Debug for InputSetup {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_FRAME_AGE, ENV_CHANNEL_KEY, ENV_CHANNEL_PATH, ENV_ROLE, ENV_TEST_DEVICE_KEY,
-        ENV_TEST_DEVICE_PATH, InputBackendKind, InputSetup, Launch, Options,
+        DEFAULT_MAX_FRAME_AGE, ENV_CHANNEL_KEY, ENV_CHANNEL_PATH, ENV_OPERATOR_KEY,
+        ENV_OPERATOR_PATH, ENV_ROLE, ENV_TEST_DEVICE_KEY, ENV_TEST_DEVICE_PATH, FakePermit,
+        InputBackendKind, InputSetup, Launch, Options, PermitSource,
     };
     use bellis_channel::{ChannelCredentials, create_session_key, encode_session_key};
     use std::collections::HashMap;
@@ -279,28 +302,69 @@ mod tests {
         }
     }
 
+    fn credentials(path: &str) -> ChannelCredentials {
+        ChannelCredentials::decode(path, &encode_session_key(&create_session_key())).unwrap()
+    }
+
     fn device() -> ChannelCredentials {
-        ChannelCredentials::decode("device-path", &encode_session_key(&create_session_key()))
-            .unwrap()
+        credentials("device-path")
+    }
+
+    fn operator() -> ChannelCredentials {
+        credentials("operator-path")
     }
 
     /// 门禁：测试许可源只能与假后端一起启用，假后端也离不开测试设备。
     #[test]
     fn the_test_lease_source_only_comes_with_the_fake_backend() {
-        assert!(matches!(
-            InputSetup::select(None, None),
-            Ok(InputSetup::None)
-        ));
-        match InputSetup::select(Some(InputBackendKind::Fake), Some(device())) {
-            Ok(InputSetup::Fake { test_device }) => assert_eq!(test_device.path, "device-path"),
+        let setup = InputSetup::select(None, None, None).unwrap();
+        assert!(matches!(setup, InputSetup::None));
+        assert!(setup.operator().is_none());
+        match InputSetup::select(Some(InputBackendKind::Fake), Some(device()), None) {
+            Ok(InputSetup::Fake {
+                test_device,
+                permit: FakePermit::TestLease,
+            }) => assert_eq!(test_device.path, "device-path"),
             other => panic!("{other:?}"),
         }
-        let error = InputSetup::select(None, Some(device())).unwrap_err();
+        let error = InputSetup::select(None, Some(device()), None).unwrap_err();
         assert!(
             error.contains("only available with --input-backend fake"),
             "{error}"
         );
-        let error = InputSetup::select(Some(InputBackendKind::Fake), None).unwrap_err();
+        let error = InputSetup::select(Some(InputBackendKind::Fake), None, None).unwrap_err();
+        assert!(error.contains(ENV_TEST_DEVICE_PATH), "{error}");
+    }
+
+    /// 门禁：给了操作员许可连接时许可只来自它，测试许可源不构造；它离不开输入后端。
+    #[test]
+    fn the_operator_is_the_only_permit_source_when_given() {
+        let setup = InputSetup::select(
+            Some(InputBackendKind::Fake),
+            Some(device()),
+            Some(operator()),
+        )
+        .unwrap();
+        assert_eq!(setup.operator().unwrap().path, "operator-path");
+        match setup {
+            InputSetup::Fake {
+                test_device,
+                permit: FakePermit::Source(PermitSource::Operator(operator)),
+            } => {
+                assert_eq!(test_device.path, "device-path");
+                assert_eq!(operator.path, "operator-path");
+            }
+            other => panic!("{other:?}"),
+        }
+        // 没有输入后端：许可无处可用。
+        for device in [None, Some(device())] {
+            let error = InputSetup::select(None, device, Some(operator())).unwrap_err();
+            assert!(error.contains("needs an input backend"), "{error}");
+            assert!(error.contains(ENV_OPERATOR_PATH), "{error}");
+        }
+        // 假后端仍离不开测试设备：假输入事件要交给它。
+        let error =
+            InputSetup::select(Some(InputBackendKind::Fake), None, Some(operator())).unwrap_err();
         assert!(error.contains(ENV_TEST_DEVICE_PATH), "{error}");
     }
 
@@ -327,6 +391,41 @@ mod tests {
         env.insert(ENV_TEST_DEVICE_KEY, "bad".to_owned());
         let error = Launch::from_env(|name| env.get(name).cloned()).unwrap_err();
         assert!(error.contains(ENV_TEST_DEVICE_KEY), "{error}");
+    }
+
+    #[test]
+    fn launch_reads_the_operator_only_as_a_pair_and_never_prints_its_key() {
+        let key = encode_session_key(&create_session_key());
+        let operator_key = encode_session_key(&create_session_key());
+        let mut env = HashMap::from([
+            (ENV_CHANNEL_PATH, "pipe-path".to_owned()),
+            (ENV_CHANNEL_KEY, key.clone()),
+            (ENV_ROLE, "game-runtime.core".to_owned()),
+        ]);
+        assert!(
+            Launch::from_env(|name| env.get(name).cloned())
+                .unwrap()
+                .operator
+                .is_none()
+        );
+        env.insert(ENV_OPERATOR_KEY, operator_key.clone());
+        let error = Launch::from_env(|name| env.get(name).cloned()).unwrap_err();
+        assert!(error.contains("or neither"), "{error}");
+        assert!(!error.contains(&operator_key), "{error}");
+        env.insert(ENV_OPERATOR_PATH, "operator-path".to_owned());
+        let launch = Launch::from_env(|name| env.get(name).cloned()).unwrap();
+        assert_eq!(launch.operator.as_ref().unwrap().path, "operator-path");
+        assert!(launch.test_device.is_none());
+        let shown = format!("{launch:?}");
+        assert!(shown.contains("operator-path"), "{shown}");
+        assert!(!shown.contains(&operator_key), "{shown}");
+        assert!(!shown.contains(&key), "{shown}");
+        // 不规范的密钥：说明里只有变量名与错误码，没有密钥本身。
+        let bad = format!("{}B", &operator_key[..42]);
+        env.insert(ENV_OPERATOR_KEY, bad.clone());
+        let error = Launch::from_env(|name| env.get(name).cloned()).unwrap_err();
+        assert!(error.contains(ENV_OPERATOR_KEY), "{error}");
+        assert!(!error.contains(&bad), "{error}");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! 核连接上各方法的 params 与 result 类型，字段含义见 `docs/modules/core-protocol.md` 的“消息集”；
-//! 文件末尾是只用于测试的测试设备连接上的消息（同一文档的“测试设备连接”）。
+//! 文件末尾是许可源授予与吊销输入许可的消息（同一文档的“操作员许可连接”与“测试设备连接”共用），以及
+//! 只用于测试的测试设备连接上的其余消息。
 //!
 //! 约定：结构体一律拒绝未知字段；联合类型一律以 `type` 字段为内部标签，每个分支是一个拒绝未知
 //! 字段的具名结构体；以 `_ns` 结尾的时刻字段是与帧环同一单调时钟的纳秒读数。
@@ -468,7 +469,7 @@ pub enum ReleaseReason {
     LeaseExpired,
     /// 输入许可被许可源吊销，或许可源换发了更新的令牌。
     LeaseRevoked,
-    /// 与许可源的连接断开；G0 的许可源是测试设备连接。
+    /// 与许可源的连接断开：操作员许可连接或测试设备连接。
     LeaseSourceLost,
     /// 没有输入许可：许可源从未授予，或没有许可源。
     NoLease,
@@ -552,28 +553,34 @@ pub enum CaptureState {
     Capturing,
 }
 
-// ---------------------------------------------------------------- 测试设备连接（只用于测试）
+// ---------------------------------------------------------------- 输入许可
 //
-// 实时核以假输入后端（`--input-backend fake`）启动时，另作为通道客户端连到测试一方；以下是这条连接上的
-// 消息。测试一方既是测试许可源，也是假输入设备。生产中没有这条连接，这些消息也不是游戏桥控制连接的契约。
+// 许可源直接交给实时核的许可，不经主进程：操作员许可连接上的 `operator_lease.*` 与只用于测试的测试设备
+// 连接上的 `test_lease.*` 用同样的 params。这些消息不是游戏桥控制连接的契约（那份契约的源在 Bellis）。
 
-/// `test_lease.grant` 的 params：测试许可源授予或续约输入许可。只用于测试。
+/// `operator_lease.grant` 与 `test_lease.grant` 的 params：许可源授予或续约输入许可。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct FakeLeaseGrantParams {
+pub struct LeaseGrantParams {
     /// 许可令牌，只增不减：等于当前令牌即续约，大于当前令牌即换发新的许可。
     pub token: u64,
     /// 到期时刻，与帧环同一时钟。
     pub expires_ns: u64,
 }
 
-/// `test_lease.revoke` 的 params：测试许可源吊销输入许可。只用于测试。
+/// `operator_lease.revoke` 与 `test_lease.revoke` 的 params：许可源吊销输入许可。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct FakeLeaseRevokeParams {
+pub struct LeaseRevokeParams {
     /// 吊销这个令牌及更早的全部令牌。
     pub token: u64,
 }
+
+// ---------------------------------------------------------------- 测试设备连接（只用于测试）
+//
+// 实时核以假输入后端（`--input-backend fake`）启动时，另作为通道客户端连到测试一方；以下是这条连接上的
+// 消息。测试一方是假输入设备，没有操作员许可连接时也是测试许可源（`test_lease.*`，params 见上）。生产中
+// 没有这条连接，这些消息也不是游戏桥控制连接的契约。
 
 /// `fake_input.event` 的 params：假输入后端交给假输入设备的一个事件。只用于测试。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

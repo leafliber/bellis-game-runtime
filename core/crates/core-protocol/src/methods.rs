@@ -3,8 +3,9 @@
 //! 核连接上实时核是通道客户端，主进程是服务端，两边都可以发请求与通知（JSON-RPC 2.0）。
 //! 有 result 的方法是请求，没有的是通知。
 //!
-//! 两个目录：[`catalog`] 是核连接上的方法；[`test_device_catalog`] 是只用于测试的测试设备连接上的方法
-//! （实时核以假输入后端启动时连到测试一方），见 `docs/modules/core-protocol.md` 的“测试设备连接”。
+//! 三个目录：[`catalog`] 是核连接上的方法；[`operator_catalog`] 是操作员许可连接上的方法（独立运行中实时核
+//! 连到操作员控制台），见 `docs/modules/core-protocol.md` 的“操作员许可连接”；[`test_device_catalog`] 是只用于
+//! 测试的测试设备连接上的方法（实时核以假输入后端启动时连到测试一方），见同一文档的“测试设备连接”。
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::Serialize;
@@ -13,8 +14,8 @@ use serde::de::DeserializeOwned;
 use crate::messages::{
     ActionBlock, ActionReceiptParams, ActionSubmitResult, AudioRingAttachParams,
     AudioSetTargetParams, CaptureSetTargetParams, CoreHealthParams, CoreHelloParams,
-    CoreHelloResult, Empty, FakeInputEventParams, FakeLeaseGrantParams, FakeLeaseRevokeParams,
-    FrameRingAttachParams, InputReleasedParams, ProducerHeartbeatParams, ProducerRevokeParams,
+    CoreHelloResult, Empty, FakeInputEventParams, FrameRingAttachParams, InputReleasedParams,
+    LeaseGrantParams, LeaseRevokeParams, ProducerHeartbeatParams, ProducerRevokeParams,
 };
 
 /// 消息的发送方。
@@ -29,6 +30,10 @@ pub enum Direction {
     CoreToTest,
     /// 测试一方发往实时核（测试设备连接，只用于测试）。
     TestToCore,
+    /// 实时核发往操作员控制台（操作员许可连接）。
+    CoreToOperator,
+    /// 操作员控制台发往实时核（操作员许可连接）。
+    OperatorToCore,
 }
 
 /// 一个 JSON-RPC 方法。
@@ -151,12 +156,24 @@ methods! {
 }
 
 methods! {
+    /// 操作员许可连接上的全部方法，按声明顺序。独立运行中实时核连到操作员控制台，由它授予、续约与吊销
+    /// 输入许可（GR-36）。
+    fn operator_catalog;
+    /// 操作员控制台授予或续约输入许可。
+    OperatorLeaseGrant = "operator_lease.grant", OperatorToCore, LeaseGrantParams => Empty;
+    /// 操作员控制台吊销输入许可；释放完成后才回应。
+    OperatorLeaseRevoke = "operator_lease.revoke", OperatorToCore, LeaseRevokeParams => Empty;
+    /// 输入已释放的确认，与核连接上的 `input.released` 同名、同 params。
+    OperatorInputReleased = "input.released", CoreToOperator, InputReleasedParams;
+}
+
+methods! {
     /// 测试设备连接上的全部方法，按声明顺序。只用于测试：实时核以假输入后端启动时才有这条连接。
     fn test_device_catalog;
-    /// 测试许可源授予或续约输入许可。
-    TestLeaseGrant = "test_lease.grant", TestToCore, FakeLeaseGrantParams => Empty;
-    /// 测试许可源吊销输入许可；释放完成后才回应。
-    TestLeaseRevoke = "test_lease.revoke", TestToCore, FakeLeaseRevokeParams => Empty;
+    /// 测试许可源授予或续约输入许可。有操作员许可连接时不处理，回“方法不存在”。
+    TestLeaseGrant = "test_lease.grant", TestToCore, LeaseGrantParams => Empty;
+    /// 测试许可源吊销输入许可；释放完成后才回应。有操作员许可连接时不处理。
+    TestLeaseRevoke = "test_lease.revoke", TestToCore, LeaseRevokeParams => Empty;
     /// 假输入后端交给假输入设备的一个事件。
     FakeInput = "fake_input.event", CoreToTest, FakeInputEventParams;
 }
@@ -169,7 +186,8 @@ pub mod error_code {
     pub const FRAME_RING_MISMATCH: i32 = -32002;
     /// `capture.set_target` 或 `audio.set_target` 的目标在这个平台或系统上不支持。
     pub const CAPTURE_UNSUPPORTED: i32 = -32003;
-    /// `test_lease.grant` 不被接受：令牌小于当前令牌、已吊销或已过期，或到期时刻已过。只用于测试。
+    /// `operator_lease.grant` 或只用于测试的 `test_lease.grant` 不被接受：令牌小于当前令牌、已吊销或已过期，
+    /// 或到期时刻已过。
     pub const LEASE_REFUSED: i32 = -32004;
     /// `audio_ring.attach` 打不开共享内存，或音频环头部与参数不符；`audio.set_target` 的假音频输出同样。
     pub const AUDIO_RING_MISMATCH: i32 = -32005;

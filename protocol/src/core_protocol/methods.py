@@ -1,7 +1,8 @@
 # 由 `uv run generate` 从 core/crates/core-protocol 生成，不要手改。
 """核协议的 JSON-RPC 方法目录、协议版本与自定义错误码。
 
-`METHODS` 是核连接上的方法；`TEST_DEVICE_METHODS` 是只用于测试的测试设备连接上的方法。
+`METHODS` 是核连接上的方法；`OPERATOR_METHODS` 是操作员许可连接上的方法；
+`TEST_DEVICE_METHODS` 是只用于测试的测试设备连接上的方法。
 """
 
 from collections.abc import Mapping
@@ -63,11 +64,28 @@ METHODS: Final[Mapping[str, Method]] = {
 }
 """核连接上的全部方法，按方法名索引。"""
 
+OPERATOR_LEASE_GRANT: Final = Request(
+    "operator_lease.grant", Direction.OPERATOR_TO_CORE, models.LeaseGrantParams, models.Empty
+)
+OPERATOR_LEASE_REVOKE: Final = Request(
+    "operator_lease.revoke", Direction.OPERATOR_TO_CORE, models.LeaseRevokeParams, models.Empty
+)
+OPERATOR_INPUT_RELEASED: Final = Notification(
+    "input.released", Direction.CORE_TO_OPERATOR, models.InputReleasedParams
+)
+
+OPERATOR_METHODS: Final[Mapping[str, Method]] = {
+    OPERATOR_LEASE_GRANT.name: OPERATOR_LEASE_GRANT,
+    OPERATOR_LEASE_REVOKE.name: OPERATOR_LEASE_REVOKE,
+    OPERATOR_INPUT_RELEASED.name: OPERATOR_INPUT_RELEASED,
+}
+"""操作员许可连接上的全部方法，按方法名索引。"""
+
 TEST_LEASE_GRANT: Final = Request(
-    "test_lease.grant", Direction.TEST_TO_CORE, models.FakeLeaseGrantParams, models.Empty
+    "test_lease.grant", Direction.TEST_TO_CORE, models.LeaseGrantParams, models.Empty
 )
 TEST_LEASE_REVOKE: Final = Request(
-    "test_lease.revoke", Direction.TEST_TO_CORE, models.FakeLeaseRevokeParams, models.Empty
+    "test_lease.revoke", Direction.TEST_TO_CORE, models.LeaseRevokeParams, models.Empty
 )
 FAKE_INPUT_EVENT: Final = Notification(
     "fake_input.event", Direction.CORE_TO_TEST, models.FakeInputEventParams
