@@ -100,7 +100,7 @@
 
 ### 模型制品
 
-清单在 `runtime/src/game_runtime/ocr/models.py`，管理规则见[模型制品](game-adapter.md#模型制品)；配置 `data_dir` 是本地数据目录，绝对路径，缺省按[术语](../architecture.md#术语)中的位置与 `BELLIS_GAME_RUNTIME_DATA`。都是 GS-04 的候选：
+清单在 `runtime/src/game_runtime/ocr/models.py`，管理规则见[模型制品](game-adapter.md#模型制品)；配置 `data_dir` 是本地数据目录，绝对路径，缺省按[术语](../architecture.md#术语)中的位置与 `BELLIS_GAME_RUNTIME_DATA`。缺省用 mobile 一组（GS-04），server 一组留作对照：
 
 | 制品 | 来源 | 许可 |
 | --- | --- | --- |
@@ -283,11 +283,11 @@ numpy（BSD-3-Clause，另含 0BSD、MIT、Zlib、CC0-1.0 的部分）与 opencv
 
 ### 语音检测模型
 
-- 候选为 Silero VAD 的 ONNX 模型，经 ONNX Runtime 在 CPU 上运行。模型有递归状态：每帧前面接上上一帧末尾的 64 个采样点，连同上一帧留下的状态一起送入，输出这一帧是语音的概率；新的一段从零状态开始。
+- Silero VAD v6.2 的 ONNX 模型，经 ONNX Runtime 在 CPU 上运行。模型有递归状态：每帧前面接上上一帧末尾的 64 个采样点，连同上一帧留下的状态一起送入，输出这一帧是语音的概率；新的一段从零状态开始。
 - 核心只依赖 `SpeechModel` 接口（`sample_rate`、`frame_size`、`reset`、`probability`），按 GS-06 换型号不改核心。
 - **线程**：算子内与算子间各 1 个线程，顺序执行。每帧的计算量很小：本机（Windows 11，混合架构的 CPU，2026-11-01）上连续推理 2000 帧，1、2、4 个线程与由 ONNX Runtime 自定时每帧分别约 0.080、0.075、0.071、0.070 ms（一帧是 32 ms 的声音），多开线程几乎不快，还要占游戏与 OCR 的核心；单线程也让同一台机器上同样的输入给出同样的概率。
 - **占用的目标**：预处理与推理合计，每处理 1 秒的声音耗时不超过 30 ms（约一个核心的 3%）；GS-06 记录实测值，超出即先减少读取与拷贝，再考虑换更小的模型。
-- **制品**：清单在 `runtime/src/game_runtime/voice_activity/models.py`，管理规则见[模型制品](game-adapter.md#模型制品)；配置 `data_dir` 是本地数据目录，绝对路径，缺省按[术语](../architecture.md#术语)中的位置与 `BELLIS_GAME_RUNTIME_DATA`。激活时核对大小与 SHA-256，没有或不符即激活失败并提示运行 `uv run fetch-models`；输入输出不是 Silero VAD 的接口时同样激活失败。是 GS-06 的候选：
+- **制品**：清单在 `runtime/src/game_runtime/voice_activity/models.py`，管理规则见[模型制品](game-adapter.md#模型制品)；配置 `data_dir` 是本地数据目录，绝对路径，缺省按[术语](../architecture.md#术语)中的位置与 `BELLIS_GAME_RUNTIME_DATA`。激活时核对大小与 SHA-256，没有或不符即激活失败并提示运行 `uv run fetch-models`；输入输出不是 Silero VAD 的接口时同样激活失败：
 
 | 制品 | 来源 | 许可 |
 | --- | --- | --- |
