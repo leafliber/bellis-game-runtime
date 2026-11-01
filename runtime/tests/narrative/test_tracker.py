@@ -585,15 +585,15 @@ def kinds(changes: Changes) -> list[tuple[str, int, bool]]:
     ]
 
 
-def test_a_cutscene_closes_the_sentence_around_it_and_its_subtitles_are_sentences() -> None:
+def test_a_cutscene_records_its_subtitles_as_sentences() -> None:
     feed = Feed()
     feed.box("门后也许")  # 帧 1：还在逐字显示
     feed.play()
     feed.box(FIRST, "")  # 帧 2：判出播片，读到第一句字幕
-    # 先结束当前句（缺口），再开始播片段，然后才是这一帧上的字幕。
+    # 先开始播片段，再按这一帧的文字结束当前句（缺口）、新开字幕的一句。
     assert kinds(feed.changes) == [
-        ("record", 1, True),
         ("cutscene", 1, False),
+        ("record", 1, True),
         ("record", 2, False),
     ]
     assert feed.changes.scope is None
@@ -605,8 +605,8 @@ def test_a_cutscene_closes_the_sentence_around_it_and_its_subtitles_are_sentence
     assert feed.changes.events == ()  # 播片中的帧只让最后的帧号前进，不通知
     last = feed.number
     feed.stop(ended=feed.at(last - 3))
-    feed.box("我们回去吧。")  # 不再在播片中：先结束字幕与播片段，这一帧上的对白在播片段之外
-    assert kinds(feed.changes) == [("record", 3, True), ("cutscene", 1, True), ("record", 4, False)]
+    feed.box("我们回去吧。")  # 不再在播片中：先结束播片段，这一帧上的对白在播片段之外
+    assert kinds(feed.changes) == [("cutscene", 1, True), ("record", 3, True), ("record", 4, False)]
 
     first, second, third, fourth = feed.records
     assert (first.completeness, first.closed_frame, first.cutscene) == (Completeness.GAP, 2, None)
@@ -631,6 +631,33 @@ def test_a_cutscene_closes_the_sentence_around_it_and_its_subtitles_are_sentence
     assert feed.changes.cutscenes == (cutscene,)
     assert cutscene.duration_ns == feed.at(last - 3) - feed.at(2)
     assert feed.tracker.playing is None
+
+
+def test_a_sentence_shown_across_the_start_and_end_of_a_cutscene_stays_one_sentence() -> None:
+    """镜头运动被判成播片时对白一直显示着：边界不结束当前句，也不把它算进播片段。"""
+    feed = Feed()
+    for _ in range(20):  # 帧 1–20：判为完整
+        feed.box(FIRST)
+    feed.play()
+    feed.box(FIRST)  # 帧 21：判出播片
+    assert kinds(feed.changes) == [("cutscene", 1, False)]
+    for _ in range(5):
+        feed.box(FIRST)
+    feed.stop(ended=feed.at(feed.number))
+    feed.box(FIRST)  # 不再在播片中
+    assert kinds(feed.changes) == [("cutscene", 1, True)]
+    feed.box(SECOND)
+
+    first, second = feed.records
+    assert (first.text, first.cutscene, first.completeness, first.closed_frame) == (
+        FIRST,
+        None,
+        Completeness.COMPLETE,
+        feed.number,
+    )
+    assert (second.text, second.cutscene) == (SECOND, None)
+    [cutscene] = feed.cutscenes
+    assert (cutscene.first_frame, cutscene.sentences) == (21, ())
 
 
 def test_the_open_cutscene_is_the_latest_state() -> None:
@@ -689,11 +716,7 @@ def test_a_gap_does_not_end_the_cutscene() -> None:
     assert kinds(feed.changes) == [("record", 2, False)]
     feed.play(since=feed.at(8))  # 中断里结束了一段又开始一段
     feed.unjudged()  # 帧 11
-    assert kinds(feed.changes) == [
-        ("record", 2, True),
-        ("cutscene", 1, True),
-        ("cutscene", 2, False),
-    ]
+    assert kinds(feed.changes) == [("cutscene", 1, True), ("cutscene", 2, False)]
     feed.stop(ended=None)  # 结束的那一帧随中断丢了
     feed.unjudged()  # 帧 12
 

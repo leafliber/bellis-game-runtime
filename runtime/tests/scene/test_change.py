@@ -172,8 +172,15 @@ class Reel:
         return self.times[number] * MS
 
     def show(
-        self, kind: Kind, count: int = 1, *, rows: int = 36, step: int | None = None
+        self,
+        kind: Kind,
+        count: int = 1,
+        *,
+        rows: int = 36,
+        step: int | None = None,
+        interface: bool = False,
     ) -> Change:
+        """`interface` 为这些帧上签名判出了画面。"""
         for _ in range(count):
             now = 0 if not self.times else self.times[-1] + (step or self.step)
             self.times.append(now)
@@ -185,7 +192,7 @@ class Reel:
                 band[:] = 255 - band
             elif kind == "spot":
                 self.image[0:4, 0:4, :3] = 255 - self.image[0:4, 0:4, :3]
-            self.changes.append(self.detector.update(self.image, now * MS))
+            self.changes.append(self.detector.update(self.image, now * MS, interface=interface))
         return self.changes[-1]
 
     def playing(self) -> list[int]:
@@ -326,6 +333,41 @@ def test_a_freeze_of_playing_end_ends_the_playing_and_a_new_one_starts_later() -
     second = [n for n in reel.playing() if n > 145]
     assert second[0] == 211  # 另起的一段从帧 150（4950 ms）起，到 6963 ms 覆盖 2 秒
     assert {reel.changes[n].playing_since_ns for n in second} == {reel.at(150)}
+
+
+def test_a_recognized_screen_breaks_the_run_of_motion() -> None:
+    """《魔女审判》审判里对白显示着时的镜头运动：整屏地动，但对白画面的签名不时命中。命中的帧
+    不是动帧并打断这一段，从下一个动帧重新计时。"""
+    reel = Reel()
+    reel.show("still", 30)
+    reel.show("motion", 50)  # 帧 30–79：990–2607 ms，还不到 2 秒
+    reel.show("motion", 5, interface=True)  # 帧 80–84：照样整屏地动，签名命中
+    reel.show("motion", 50)  # 帧 85–134：2805–4422 ms，又不到 2 秒
+    reel.show("still", 30)
+
+    assert all(c.changed_fraction == 1 for c in reel.changes[80:85])
+    assert reel.playing() == []
+    assert all(c.playing_ended_ns is None for c in reel.changes)
+
+
+@pytest.mark.parametrize("still", [0, 10])
+def test_a_recognized_screen_ends_the_playing(still: int) -> None:
+    """在播片中命中签名的帧起不再在播片中，结束时刻是最后一个动帧之后那一帧（帧 100，命中的帧
+    或之前停住的第一帧）；之后的动帧另起一段。"""
+    reel = Reel()
+    reel.show("still", 30)
+    reel.show("motion", 70)  # 帧 30–99，帧 91 起在播片中
+    reel.show("still", still)
+    hit = len(reel.times)
+    left = reel.show("motion", interface=True)
+    reel.show("motion", 40)  # 1.3 秒：另起的一段还不是播片
+
+    assert reel.playing() == list(range(91, hit))
+    assert (left.playing, left.playing_since_ns, left.playing_ended_ns) == (
+        False,
+        None,
+        reel.at(100),
+    )
 
 
 def test_motion_from_the_very_first_frame_counts() -> None:
