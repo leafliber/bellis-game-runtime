@@ -133,8 +133,8 @@ def test_an_uncalibrated_roi_is_reported_without_fallback(witch_trial_adapter: A
 
     async def scenario() -> None:
         try:
-            with pytest.raises(NotCalibratedError, match="ROI dialogue（对白框）尚未标定"):
-                await service.recognize(gradient_frame(2560, 1440), "dialogue")
+            with pytest.raises(NotCalibratedError, match="ROI choices（选项）尚未标定"):
+                await service.recognize(gradient_frame(2560, 1440), "choices")
             with pytest.raises(LookupError, match="没有声明 ROI nowhere"):
                 await service.recognize(gradient_frame(2560, 1440), "nowhere")
         finally:

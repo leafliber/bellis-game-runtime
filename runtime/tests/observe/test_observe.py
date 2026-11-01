@@ -105,6 +105,21 @@ def witch_trial() -> Adapter:
     return load_adapter(GAMES_DIR / "witch-trial")
 
 
+@pytest.fixture(scope="module")
+def uncalibrated(witch_trial: Adapter) -> Adapter:
+    """《魔女审判》去掉对白框的标定（第 9 步之前的样子）：剧情记录不运行。"""
+    names = {"speaker", "dialogue", "continue-marker", "hud-border"}
+    rois = {
+        name: roi.model_copy(update={"rect": None}) if name in names else roi
+        for name, roi in witch_trial.rois.items()
+    }
+    signatures = tuple(
+        s.model_copy(update={"anchors": ()}) if s.id == "dialogue-continue" else s
+        for s in witch_trial.signatures
+    )
+    return witch_trial.model_copy(update={"rois": rois, "signatures": signatures})
+
+
 def state(
     frame: int,
     verdict: Verdict,
@@ -548,10 +563,10 @@ def test_the_summary_gives_the_script_result(
     assert f"  语言核对（文字系统）：{expected}" in lines
 
 
-def test_summary_without_narrative_voice_or_checks(witch_trial: Adapter) -> None:
-    hub, _, formatter = make_hub(witch_trial)
+def test_summary_without_narrative_voice_or_checks(uncalibrated: Adapter) -> None:
+    hub, _, formatter = make_hub(uncalibrated)
     hub.end_ns = SECOND
-    lines = summary(formatter, narrative_problem=narrative_problem(witch_trial))
+    lines = summary(formatter, narrative_problem=narrative_problem(uncalibrated))
     assert lines[1].startswith("  剧情记录：不运行，适配包 witch-trial 的")
     assert lines[2] == "  画面判别：没有处理过任何帧"
     assert lines[3] == "  配音：voice-activity@1 没有激活"
@@ -559,8 +574,8 @@ def test_summary_without_narrative_voice_or_checks(witch_trial: Adapter) -> None
     assert lines[5] == "  语言核对（固定文字）：适配包没有声明，没有核对"
 
 
-def test_banner_lists_plugins_and_what_is_not_calibrated(witch_trial: Adapter) -> None:
-    _hub, _, formatter = make_hub(witch_trial)
+def test_banner_lists_plugins_and_what_is_not_calibrated(uncalibrated: Adapter) -> None:
+    _hub, _, formatter = make_hub(uncalibrated)
     plugins = [
         EntryStatus("game", "game-adapter", "1", Tier.CRITICAL, State.ACTIVE, (), "i1", True, 0),
         EntryStatus(
@@ -577,11 +592,11 @@ def test_banner_lists_plugins_and_what_is_not_calibrated(witch_trial: Adapter) -
     ]
     lines = banner(
         formatter,
-        witch_trial,
+        uncalibrated,
         frame_size=(2560, 1440),
         recording=None,
         plugins=plugins,
-        narrative_problem=narrative_problem(witch_trial),
+        narrative_problem=narrative_problem(uncalibrated),
     )
     assert lines[0] == "只读运行 witch-trial（魔法少女的魔女审判 0.1.0）：不发任何输入，不连 Bellis"
     assert lines[1] == "帧环 2560×1440；不录制"
@@ -597,7 +612,7 @@ def test_banner_lists_plugins_and_what_is_not_calibrated(witch_trial: Adapter) -
     recording = Recording(GAMES_DIR / "x", 50 * 10**9, 1_200_000)
     with_recording = banner(
         formatter,
-        witch_trial,
+        uncalibrated,
         frame_size=(2560, 1440),
         recording=recording,
         plugins=plugins,
