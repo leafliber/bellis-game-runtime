@@ -22,6 +22,7 @@ from game_runtime.narrative import (
     Unread,
     compare_key,
     continues,
+    same_name,
 )
 
 MS = 1_000_000
@@ -43,12 +44,15 @@ class Feed:
         marker: bool = False,
         screen: str | None = "dialogue",
         confidence: float = 0.97,
+        speaker_confidence: float = 0.99,
         scope_screen: str | None = None,
     ) -> tuple[NarrativeRecord, ...]:
         self.number += 1
         reading = Reading("dialogue", ((text, confidence),) if text else ())
         names = (
-            None if speaker is None else Reading("speaker", ((speaker, 0.99),) if speaker else ())
+            None
+            if speaker is None
+            else Reading("speaker", ((speaker, speaker_confidence),) if speaker else ())
         )
         frame = BoxFrame(
             self.number, self.number * self.step * MS, screen, reading, names, marker, scope_screen
@@ -84,9 +88,24 @@ class Feed:
 # 比较文本与同一句
 
 
-def test_compare_key_folds_width_and_drops_whitespace() -> None:
-    assert compare_key(" 雨停了，\n钟楼 ") == "雨停了,钟楼"
-    assert compare_key("ＡＢ　ｃ？") == "ABc?"
+def test_compare_key_keeps_only_letters_and_digits() -> None:
+    assert compare_key(" 雨停了，\n钟楼 ") == "雨停了钟楼"
+    assert compare_key("ＡＢ　ｃ？１２") == "ABc12"
+    assert compare_key("「那扇门——不，那面墙……」♪") == "那扇门不那面墙"
+    assert compare_key("等等ー々〇") == "等等ー々〇"  # 长音符、叠字符与〇是字母或数字
+    assert compare_key("……！？") == ""
+
+
+@pytest.mark.parametrize(
+    "variants",
+    [
+        ("……我先走了。", "…我先走了。", "·我先走了.", "我先走了"),  # 省略号读成“…”“·”或漏掉
+        ("那扇门——不对", "那扇门-不对", "那扇门—不对", "那扇门不对"),  # 破折号
+        ("（等等！）", "(等等!)", "「等等」"),  # 全角与半角、括号与引号
+    ],
+)
+def test_misread_punctuation_gives_the_same_compare_key(variants: tuple[str, ...]) -> None:
+    assert len({compare_key(v) for v in variants}) == 1
 
 
 @pytest.mark.parametrize(
@@ -94,17 +113,56 @@ def test_compare_key_folds_width_and_drops_whitespace() -> None:
     [
         ("雨停", "雨停了", True),  # 逐字显示
         ("雨停了", "雨停了", True),
-        ("雨停了,钟楼的指", "雨停了,钟搂的指针", True),  # 8 个字容许 2 处读错
-        ("雨停了,钟楼的指", "雨挺了,钟搂的指针", True),
-        ("雨停了,钟楼的指", "雨挺了,钟搂的拍针", False),
-        ("雨停了,钟楼的指针停在七点。", "你", False),  # 重新开始的逐字显示
-        ("门后也许有路,也许什么都没有。", "门", False),  # 同一个字开头的下一句
+        ("雨停了钟楼的指针", "雨停了钟搂的指针停", True),  # 8 个字容许 2 处读错
+        ("雨停了钟楼的指针", "雨挺了钟搂的指针停", True),
+        ("雨停了钟楼的指针", "雨挺了钟搂的拍针停", False),
         ("雨停", "雨挺了", False),  # 不到 4 个字不容错
-        ("雨停了,钟楼的指针停在七点", "雨停了,钟楼的指针停在七", True),  # 末尾少一个字
+        ("门怎么开了", "咦门怎么开了风好大", True),  # 早一帧漏读了开头的一个字
+        ("门怎么开了", "咦咦门怎么开了", False),  # 5 个字只容 1 个
+        ("我先走了明天见", "那么我先走了明天见", False),  # 7 个字只容 1 个
+        ("我先走了明天见再", "那么我先走了明天见再会", True),  # 8 个字容 2 个
+        ("么我先走了明天见", "那么我先走了明天见再会", True),  # 漏读开头与逐字显示
+        ("钟楼的指针停在七点", "钟楼的指针停在七点钟楼的指针停在八点", True),  # b 的尾部不计
+        ("雨停了钟楼的指针停在七点", "雨停了钟楼的指针停在七", True),  # 末尾少一个字
+        ("雨停了钟楼的指针停在七点", "雨停了钟楼的指针停", True),  # 少 3 个字：还在容差里
+        ("雨停了钟楼的指针停在七点", "雨停了钟楼的指针", False),  # 少 4 个字：重新开始的逐字显示
+        ("雨停了钟楼的指针停在七点", "你", False),
+        ("门后也许有路也许什么都没有", "门", False),  # 同一个字开头的下一句
+        ("门后也许有路也许什么都没有", "门后也许有路也许", False),
     ],
 )
 def test_continues(current: str, observed: str, same: bool) -> None:
     assert continues(current, observed) is same
+
+
+def test_continues_on_long_text_stays_within_the_band() -> None:
+    """长句只算带内：一处读错的长句仍续得上，前面多出超过容差的字即续不上。"""
+    sentence = "雨停了钟楼的指针停在七点" * 40
+    assert continues(sentence, "咦" + sentence[:200] + "拍" + sentence[201:] + "又一句")
+    assert not continues(sentence, "咦" * (len(sentence) // 4 + 1) + sentence)
+
+
+@pytest.mark.parametrize(
+    ("current", "observed", "same"),
+    [
+        ("林小满", "林小满", True),
+        ("林小满", "林小蛮", True),  # 花哨的字形上读错一个字
+        ("林小满", "林小", True),
+        ("欧阳晓星", "欧阳晚星", True),
+        ("欧阳晓星", "欧阳晚月", False),  # 4 个字只容 1 个
+        ("阿遥", "旁白", False),
+        ("林小满", "周远", False),
+        ("阿遥", "阿远", True),  # 代价：只差一字的两个名字当成同一个
+        ("", "", True),  # 只有标点的名字（“？？？”与“？”）
+        ("", "阿遥", False),
+        ("司徒青云长老", "司徒清云长老", True),  # 6 个字容 1 个……
+        ("司徒青云长老", "司徒清云长者", False),  # ……不容 2 个
+        ("司徒青云长老大人", "司徒清云长者大人", True),  # 8 个字容 2 个
+    ],
+)
+def test_same_name(current: str, observed: str, same: bool) -> None:
+    assert same_name(current, observed) is same
+    assert same_name(observed, current) is same
 
 
 # 修订号与完整度
@@ -118,7 +176,7 @@ def test_typing_revises_one_sentence_until_the_marker_completes_it() -> None:
     [record] = feed.records
     assert (record.text, record.revision, record.completeness) == (
         "你听见了吗？",
-        6,
+        5,  # 最后的“？”只换文字，不加修订号
         Completeness.COMPLETE,
     )
     assert (record.first_frame, record.revision_frame, record.complete_frame) == (1, 6, 6)
@@ -144,10 +202,10 @@ def test_without_a_marker_the_text_must_stay_unchanged_for_frames_and_time() -> 
 def test_a_sentence_that_grows_after_completing_is_partial_again() -> None:
     """逐字显示中途的停顿被判为完整时自行纠正。"""
     feed = Feed(TrackerParams(complete_frames=2, complete_after_ns=0))
-    feed.box("……")
-    feed.box("……")
+    feed.box("原来")
+    feed.box("原来")
     assert feed.records[0].completeness is Completeness.COMPLETE
-    feed.box("……原来")
+    feed.box("原来如此")
     [record] = feed.records
     assert (record.completeness, record.complete_frame, record.revision) == (
         Completeness.PARTIAL,
@@ -165,6 +223,91 @@ def test_ocr_misreading_mid_typing_stays_the_same_sentence() -> None:
     assert feed.summary() == [("阿遥", "雨停了，钟楼的指针", 3, Completeness.COMPLETE)]
 
 
+def test_misread_ellipses_and_dashes_stay_the_same_sentence() -> None:
+    feed = Feed()
+    feed.box("…那么，我先走了。明天")
+    feed.box("……那么，我先走了。明天见·明天再")  # 省略号读法不同，句末多读了一截
+    feed.box("那扇门——不，那面墙", "旁白")
+    feed.box("那扇门一不，那面墙后面", "旁白")  # “——”读成“一”：多一个字，在容差里
+    feed.box("那扇门-不，那面墙后面有风。", "旁白", marker=True)
+
+    assert feed.summary() == [
+        ("阿遥", "……那么，我先走了。明天见·明天再", 2, Completeness.GAP),
+        ("旁白", "那扇门-不，那面墙后面有风。", 3, Completeness.COMPLETE),
+    ]
+
+
+def test_a_missed_first_character_while_fading_in_stays_the_same_sentence() -> None:
+    feed = Feed()
+    feed.box("（门怎么开了")
+    feed.box("（咦，门怎么开了！？风好大……）", marker=True)
+
+    assert feed.summary() == [("阿遥", "（咦，门怎么开了！？风好大……）", 2, Completeness.COMPLETE)]
+
+
+def test_punctuation_only_changes_update_the_text_but_not_the_revision() -> None:
+    """只差标点：文字与读出它的帧号换成新的，修订号与连续不变的帧数不变，照常通知。"""
+    feed = Feed(TrackerParams(complete_frames=3, complete_after_ns=0, low_confidence=0.8))
+    feed.box("雨停了")
+    [changed] = feed.box("雨停了，", confidence=0.6)
+    assert (changed.text, changed.revision, changed.revision_frame) == ("雨停了，", 1, 2)
+    assert changed.low_confidence == (LowConfidenceLine("dialogue", "雨停了，", 0.6),)
+    assert changed.completeness is Completeness.PARTIAL
+    [completed] = feed.box("雨停了。")  # 第 3 个比较文本不变的帧
+    assert (completed.text, completed.revision, completed.revision_frame) == ("雨停了。", 1, 3)
+    assert (completed.completeness, completed.complete_frame) == (Completeness.COMPLETE, 3)
+    assert completed.low_confidence == ()
+
+
+def test_a_complete_sentence_keeps_its_text_when_only_punctuation_differs() -> None:
+    """完整之后只差标点的读数是噪声：不改记录，不通知。"""
+    feed = Feed()
+    feed.box("雨停了。", marker=True)
+    assert feed.box("雨停了·") == ()
+    assert feed.box("雨停了。▼") == ()
+    [record] = feed.records
+    assert (record.text, record.revision, record.revision_frame, record.last_frame) == (
+        "雨停了。",
+        1,
+        1,
+        3,
+    )
+    [revised] = feed.box("雨停了。钟")  # 比较文本变了：回到部分
+    assert (revised.revision, revised.completeness) == (2, Completeness.PARTIAL)
+
+
+def test_punctuation_only_text_ends_the_sentence_and_is_not_recorded() -> None:
+    feed = Feed()
+    feed.box("你听见了")
+    assert [r.completeness for r in feed.box("……")] == [Completeness.GAP]
+    assert feed.box("……") == ()
+    feed.box("……嗯", marker=True)
+
+    assert feed.summary() == [
+        ("阿遥", "你听见了", 1, Completeness.GAP),
+        ("阿遥", "……嗯", 1, Completeness.COMPLETE),
+    ]
+    assert feed.records[0].closed_frame == 2
+
+
+def test_restarted_typing_is_a_new_sentence() -> None:
+    """b 比 a 短超过 ⌊n/4⌋ 个字就是重新开始的逐字显示，哪怕 b 是 a 的开头；少的在容差里时是 OCR
+    漏读了句末，还是这一句。"""
+    sentence = "门后也许有路，也许什么都没有。"  # 比较文本 13 个字，容差 3
+    restarted = Feed()
+    restarted.box(sentence, marker=True)
+    restarted.box("门后也许有路，也许什")  # 少 4 个字：推进后同样开头的下一句
+    assert restarted.summary() == [
+        ("阿遥", sentence, 1, Completeness.COMPLETE),
+        ("阿遥", "门后也许有路，也许什", 1, Completeness.PARTIAL),
+    ]
+
+    misread = Feed()
+    misread.box(sentence, marker=True)
+    misread.box("门后也许有路，也许什么")  # 少 3 个字
+    assert misread.summary() == [("阿遥", "门后也许有路，也许什么", 2, Completeness.PARTIAL)]
+
+
 # 边界
 
 
@@ -177,7 +320,7 @@ def test_advancing_before_complete_is_a_gap_and_the_next_line_is_new() -> None:
     feed.other()
 
     assert feed.summary() == [
-        ("阿遥", "你听见了吗？", 6, Completeness.COMPLETE),
+        ("阿遥", "你听见了吗？", 5, Completeness.COMPLETE),
         ("旁白", "门后也许", 4, Completeness.GAP),
         ("阿遥", "你听", 1, Completeness.GAP),
     ]
@@ -249,6 +392,32 @@ def test_speakers_split_only_when_both_are_read_and_differ() -> None:
     assert feed.summary() == [
         ("阿遥", "你听见了", 3, Completeness.GAP),
         ("旁白", "你听见了吗", 1, Completeness.PARTIAL),
+    ]
+
+
+def test_a_misread_character_in_the_name_is_the_same_speaker() -> None:
+    feed = Feed()
+    feed.box("你听", speaker="林小满")
+    feed.box("你听见了", speaker="林小蛮")  # 花哨的字形上读错一个字
+    feed.box("你听见了吗", speaker="林小满")
+    feed.box("你听见了吗？", speaker="周远")  # 两个不同的名字：文字续得上也拆开
+
+    assert feed.summary() == [
+        ("林小满", "你听见了吗", 3, Completeness.GAP),
+        ("周远", "你听见了吗？", 1, Completeness.PARTIAL),
+    ]
+
+
+def test_a_name_of_only_punctuation_is_read() -> None:
+    """“？？？”是读到了的名字：与“？”是同一个，与有字的名字不同。"""
+    feed = Feed()
+    feed.box("你是谁", speaker="？？？")
+    feed.box("你是谁？", speaker="？")
+    feed.box("你是谁？我", speaker="林小满")
+
+    assert feed.summary() == [
+        ("？？？", "你是谁？", 1, Completeness.GAP),
+        ("林小满", "你是谁？我", 1, Completeness.PARTIAL),
     ]
 
 
@@ -346,6 +515,19 @@ def test_low_confidence_lines_are_marked_for_the_current_revision() -> None:
     assert feed.records[0].low_confidence == (LowConfidenceLine("dialogue", "雨停", 0.6),)
     feed.box("雨停了", confidence=0.95)
     assert feed.records[0].low_confidence == ()
+
+
+def test_low_confidence_lines_come_from_the_frames_of_the_speaker_and_the_text() -> None:
+    feed = Feed(TrackerParams(low_confidence=0.8))
+    feed.box("雨停", speaker="林小满", speaker_confidence=0.6)
+    feed.box("雨停了", speaker="林小蛮", speaker_confidence=0.95, confidence=0.7)
+
+    [record] = feed.records
+    assert record.speaker == "林小满"
+    assert record.low_confidence == (
+        LowConfidenceLine("speaker", "林小满", 0.6),
+        LowConfidenceLine("dialogue", "雨停了", 0.7),
+    )
 
 
 def test_changes_are_reported_only_when_the_content_changes() -> None:

@@ -25,6 +25,7 @@ from game_runtime.narrative.record import (
     Scope,
     compare_key,
     continues,
+    same_name,
 )
 from game_runtime.narrative.store import (
     NARRATIVE_DIR,
@@ -85,5 +86,6 @@ __all__ = [
     "read_records",
     "read_scopes",
     "read_sessions",
+    "same_name",
     "store_path",
 ]

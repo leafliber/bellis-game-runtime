@@ -275,8 +275,10 @@ class Expected:
     closed_frame: int | None = None
     same: int = 0
     changed_ns: int = 0
+    key: str = ""
+    """当前文字的比较文本。"""
     texts: list[str] = field(default_factory=list[str])
-    """显示过的各个文字，按顺序。"""
+    """记录先后取过的各个文字，按顺序。"""
 
 
 def row(item: Expected | NarrativeRecord) -> tuple[Any, ...]:
@@ -400,7 +402,8 @@ class Play:
             self._close(number)
             current = None
         visible = truth.visible_text
-        if not visible:
+        key = compare_key(visible)
+        if not key:
             self._close(number)
             return
         if current is None:
@@ -411,7 +414,8 @@ class Play:
             current = Expected(self.serial, speaker, self.scope, number, capture_ns, truth.text)
             self.expected.append(current)
             self.current = current
-        if visible != current.text:
+        if key != current.key:
+            current.key = key
             current.text = visible
             current.texts.append(visible)
             current.revision += 1
@@ -422,6 +426,11 @@ class Play:
             current.complete_frame = None
         else:
             current.same += 1
+            if visible != current.text and current.completeness is not Completeness.COMPLETE:
+                # 只差标点：还没完整的句子换成这一帧的原文，修订号与连续不变的帧数都不变。
+                current.text = visible
+                current.texts.append(visible)
+                current.revision_frame = number
         current.last_frame, current.last_ns = number, capture_ns
         if current.completeness is not Completeness.COMPLETE:
             marker = self.marker and visible == truth.text
@@ -678,9 +687,10 @@ def test_the_whole_story_matches_the_truth(data_dir: Path) -> None:
         ("旁白", Completeness.PARTIAL, 3),  # 停在逐字显示中
     ]
     first, revealed, skipped, knocked, again, instant, *_, last = records
-    # 逐字显示：每多显示一个字修订号加一；看完的一句文字就是全文。
+    # 逐字显示：每多显示一个字修订号加一，多显示的是标点时只换文字；看完的一句文字就是全文。
     assert first.text == intro.lines[0].text
-    assert first.revision == len(outcome.expected[0].texts) >= len(first.text) - 2
+    assert first.revision == outcome.expected[0].revision >= len(compare_key(first.text)) - 2
+    assert len(outcome.expected[0].texts) > first.revision
     assert first.complete_frame == first.revision_frame
     # 补全：显示到一半的文字直接变成全文，仍是同一句。
     assert revealed.text == intro.lines[1].text
@@ -924,7 +934,8 @@ def test_an_ocr_error_leaves_that_frame_out(
     recognizer = TruthRecognizer()
     intro = NODES["intro"]
     assert isinstance(intro, Dialogue)
-    recognizer.failing.add(intro.lines[0].text[:3])
+    # “雨停”出错：下一帧的“雨停了”比较文本又变了，少的就是出错的那一次修订。
+    recognizer.failing.add(intro.lines[0].text[:2])
     Shared.recognizer = recognizer
 
     async def script(play: Play) -> None:
@@ -1009,11 +1020,14 @@ def test_subscribers_get_every_change_in_order(
     outcome = asyncio.run(Rig(data_dir).run(script))
 
     first, second, *_ = outcome.records
-    # 第一句：每次修订（最后一次修订的那一帧继续标记出现，同时判为完整）、结束各通知一次，按发生的
-    # 顺序；第二句在结束第一句的同一帧之后新建。
+    # 第一句：文字每换一次（修订，或只差标点）、结束各通知一次，按发生的顺序；最后一次换文字的那一帧
+    # 继续标记出现，同时判为完整。第二句在结束第一句的同一帧之后新建。
     mine = [r for r in received if r.occurrence == 1]
-    assert [r.revision for r in mine[:-1]] == list(range(1, first.revision + 1))
-    assert [r.completeness for r in mine[:-2]] == [Completeness.PARTIAL] * (first.revision - 1)
+    assert [r.text for r in mine[:-1]] == outcome.expected[0].texts
+    revisions = [r.revision for r in mine[:-1]]
+    assert revisions == sorted(revisions)
+    assert sorted(set(revisions)) == list(range(1, first.revision + 1))
+    assert [r.completeness for r in mine[:-2]] == [Completeness.PARTIAL] * (len(mine) - 2)
     assert mine[-2].completeness is Completeness.COMPLETE
     assert mine[-2].closed_frame is None
     assert mine[-1] == first

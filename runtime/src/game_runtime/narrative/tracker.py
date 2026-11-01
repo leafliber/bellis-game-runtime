@@ -15,6 +15,7 @@ from game_runtime.narrative.record import (
     Scope,
     compare_key,
     continues,
+    same_name,
 )
 
 
@@ -125,11 +126,20 @@ class _Open:
 
     record: NarrativeRecord
     key: str
-    speaker_key: str
+    speaker_key: str | None
+    """说话人的比较文本；还没读到名字时为 None（只有标点的名字读到了，比较文本为空）。"""
     same_frames: int
     """比较文本连续不变的对白框帧数，含最近一次变化的那一帧。"""
     changed_ns: int
     """比较文本最近一次变化的帧的采集时刻。"""
+    speaker_low: tuple[LowConfidenceLine, ...]
+    """读出说话人的那一帧上名字栏的低置信度行。"""
+    text_low: tuple[LowConfidenceLine, ...]
+    """读出记录里的文字的那一帧上对白文字的低置信度行。"""
+
+    @property
+    def low_confidence(self) -> tuple[LowConfidenceLine, ...]:
+        return self.speaker_low + self.text_low
 
 
 class SentenceTracker:
@@ -191,7 +201,7 @@ class SentenceTracker:
 
     def _box(self, frame: BoxFrame) -> Changes:
         key = compare_key(frame.text.text)
-        speaker_key = "" if frame.speaker is None else compare_key(frame.speaker.text)
+        speaker_key = _name_key(frame.speaker)
         current = self._open
         if not key:
             return Changes(self._close(frame.frame_number))
@@ -203,20 +213,29 @@ class SentenceTracker:
         return Changes((*closed, opened), scope=scope)
 
     @staticmethod
-    def _same_sentence(current: _Open, screen: str | None, key: str, speaker_key: str) -> bool:
+    def _same_sentence(
+        current: _Open, screen: str | None, key: str, speaker_key: str | None
+    ) -> bool:
         if current.record.screen != screen:
             return False
-        if current.speaker_key and speaker_key and current.speaker_key != speaker_key:
+        if (
+            current.speaker_key is not None
+            and speaker_key is not None
+            and not same_name(current.speaker_key, speaker_key)
+        ):
             return False
         return continues(current.key, key)
 
-    def _start(self, frame: BoxFrame, key: str, speaker_key: str) -> NarrativeRecord:
+    def _start(self, frame: BoxFrame, key: str, speaker_key: str | None) -> NarrativeRecord:
+        speaker = frame.speaker if speaker_key is not None else None
+        speaker_low = self._low_confidence(speaker)
+        text_low = self._low_confidence(frame.text)
         record = NarrativeRecord(
             session=self.session,
             occurrence=len(self._records) + 1,
             scope=self._scope,
             screen=frame.screen,
-            speaker=frame.speaker.text if frame.speaker is not None and speaker_key else None,
+            speaker=None if speaker is None else speaker.text,
             text=frame.text.text,
             revision=1,
             completeness=Completeness.PARTIAL,
@@ -227,38 +246,57 @@ class SentenceTracker:
             revision_frame=frame.frame_number,
             complete_frame=None,
             closed_frame=None,
-            low_confidence=self._low_confidence(frame),
+            low_confidence=speaker_low + text_low,
         )
-        current = _Open(record, key, speaker_key, same_frames=1, changed_ns=frame.capture_ns)
+        current = _Open(
+            record,
+            key,
+            speaker_key,
+            same_frames=1,
+            changed_ns=frame.capture_ns,
+            speaker_low=speaker_low,
+            text_low=text_low,
+        )
         current.record = self._judge(current, frame)
         self._open = current
         self._records.append(current.record)
         return current.record
 
-    def _update(self, current: _Open, frame: BoxFrame, key: str, speaker_key: str) -> Changes:
+    def _update(
+        self, current: _Open, frame: BoxFrame, key: str, speaker_key: str | None
+    ) -> Changes:
+        """同一句的又一帧：比较文本变了是新的修订；只差标点时，还没完整的句子换成这一帧的原文。"""
         record = current.record
         before = record
+        text = frame.text.text
         if key != current.key:
             record = replace(
                 record,
-                text=frame.text.text,
+                text=text,
                 revision=record.revision + 1,
                 revision_frame=frame.frame_number,
                 completeness=Completeness.PARTIAL,
                 complete_frame=None,
-                low_confidence=self._low_confidence(frame),
             )
             current.key = key
             current.same_frames = 1
             current.changed_ns = frame.capture_ns
+            current.text_low = self._low_confidence(frame.text)
         else:
             current.same_frames += 1
-        if not current.speaker_key and speaker_key and frame.speaker is not None:
-            record = replace(
-                record, speaker=frame.speaker.text, low_confidence=self._low_confidence(frame)
-            )
+            if text != record.text and record.completeness is not Completeness.COMPLETE:
+                record = replace(record, text=text, revision_frame=frame.frame_number)
+                current.text_low = self._low_confidence(frame.text)
+        if current.speaker_key is None and speaker_key is not None and frame.speaker is not None:
+            record = replace(record, speaker=frame.speaker.text)
             current.speaker_key = speaker_key
-        record = replace(record, last_frame=frame.frame_number, last_ns=frame.capture_ns)
+            current.speaker_low = self._low_confidence(frame.speaker)
+        record = replace(
+            record,
+            last_frame=frame.frame_number,
+            last_ns=frame.capture_ns,
+            low_confidence=current.low_confidence,
+        )
         current.record = record
         current.record = self._judge(current, frame)
         self._records[-1] = current.record
@@ -282,11 +320,11 @@ class SentenceTracker:
             )
         return record
 
-    def _low_confidence(self, frame: BoxFrame) -> tuple[LowConfidenceLine, ...]:
-        readings = (frame.speaker, frame.text) if frame.speaker is not None else (frame.text,)
+    def _low_confidence(self, reading: Reading | None) -> tuple[LowConfidenceLine, ...]:
+        if reading is None:
+            return ()
         return tuple(
             LowConfidenceLine(reading.roi, text, confidence)
-            for reading in readings
             for text, confidence in reading.lines
             if confidence < self.params.low_confidence
         )
@@ -323,6 +361,13 @@ class SentenceTracker:
         self._scope_after = None
         self._scopes.append(scope)
         return scope
+
+
+def _name_key(reading: Reading | None) -> str | None:
+    """名字的比较文本；没有名字栏或名字栏的原文全是空白（没读到名字）时为 None。"""
+    if reading is None or not reading.text or reading.text.isspace():
+        return None
+    return compare_key(reading.text)
 
 
 def _content(record: NarrativeRecord) -> NarrativeRecord:
