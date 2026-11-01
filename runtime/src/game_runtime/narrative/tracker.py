@@ -33,16 +33,20 @@ class Reading:
 
 @dataclass(frozen=True, slots=True)
 class BoxFrame:
-    """判出对白框画面的一帧，及其名字栏与对白文字的识别结果。"""
+    """读了对白框文字的一帧，及其名字栏与对白文字的识别结果。"""
 
     frame_number: int
     capture_ns: int
-    screen: str
+    screen: str | None
+    """对白框所在的画面；对白框没写画面时为 None。同一句须是同一个对白框。"""
     text: Reading
     speaker: Reading | None
     """没有名字栏时为 None。"""
     marker: bool
     """继续标记可见。"""
+    scope_screen: str | None = None
+    """本帧判出的画面的通用类型是坏结局或存读档时为这个画面：处理完这一帧之后，下一句开始新的
+    剧情范围（没写画面的对白框在这类画面上也读文字）。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,9 +61,19 @@ class OtherScreen:
 
 @dataclass(frozen=True, slots=True)
 class Unjudged:
-    """没有判出画面的一帧，或 OCR 出错的一帧：不改变任何记录。"""
+    """没有判出画面的一帧：不改变任何记录。"""
 
     frame_number: int
+
+
+@dataclass(frozen=True, slots=True)
+class Unread:
+    """该读对白框而没有读的一帧（节流跳过、没写画面的对白框遇到过场、OCR 出错）：不改变记录，也
+    不计入连续帧数。"""
+
+    frame_number: int
+    scope_screen: str | None = None
+    """同 `BoxFrame.scope_screen`。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +85,7 @@ class Gap:
     count: int
 
 
-type Observation = BoxFrame | OtherScreen | Unjudged | Gap
+type Observation = BoxFrame | OtherScreen | Unjudged | Unread | Gap
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,13 +166,18 @@ class SentenceTracker:
         """处理一个观察，返回产生的变化。"""
         match observation:
             case BoxFrame():
-                return self._box(observation)
+                changes = self._box(observation)
+                self._mark_scope(observation.scope_screen)
+                return changes
             case OtherScreen():
                 closed = self._close(observation.frame_number)
                 if observation.starts_scope:
                     self._scope_after = observation.screen
                 return Changes(closed)
             case Unjudged():
+                return NO_CHANGES
+            case Unread():
+                self._mark_scope(observation.scope_screen)
                 return NO_CHANGES
             case Gap():
                 closed = self._close(observation.first_frame)
@@ -184,7 +203,7 @@ class SentenceTracker:
         return Changes((*closed, opened), scope=scope)
 
     @staticmethod
-    def _same_sentence(current: _Open, screen: str, key: str, speaker_key: str) -> bool:
+    def _same_sentence(current: _Open, screen: str | None, key: str, speaker_key: str) -> bool:
         if current.record.screen != screen:
             return False
         if current.speaker_key and speaker_key and current.speaker_key != speaker_key:
@@ -289,6 +308,11 @@ class SentenceTracker:
         closed = replace(record, completeness=completeness, closed_frame=frame_number)
         self._records[-1] = closed
         return (closed,)
+
+    def _mark_scope(self, screen: str | None) -> None:
+        """判出了坏结局或存读档类的画面 `screen`：下一句开始新的剧情范围。"""
+        if screen is not None:
+            self._scope_after = screen
 
     def _next_scope(self, frame_number: int) -> Scope | None:
         """新开一句之前：第一句或触发过新范围时，开始新的剧情范围。"""

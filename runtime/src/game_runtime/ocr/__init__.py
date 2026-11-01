@@ -13,7 +13,16 @@ from game_runtime.ocr.engine import (
     Recognizer,
 )
 from game_runtime.ocr.models import DEFAULT_MODEL_SET, MODEL_SETS, ModelSet, ModelSetName
-from game_runtime.ocr.plugin import OCR, OcrConfig, OcrPlugin, UnsupportedLanguageError
+from game_runtime.ocr.plugin import OCR, OcrConfig, OcrPlugin
+from game_runtime.ocr.script import (
+    SCRIPT_MIN_RATIO,
+    SCRIPT_SENTENCES,
+    Script,
+    ScriptCheck,
+    UnsupportedScriptError,
+    check_script,
+    script_of,
+)
 from game_runtime.ocr.service import (
     FixedTextOutcome,
     FrameLike,
@@ -22,6 +31,7 @@ from game_runtime.ocr.service import (
     OcrLine,
     OcrResult,
     OcrService,
+    UnsupportedLanguageError,
     crop_bgr,
     recognize_frame,
 )
@@ -30,6 +40,8 @@ __all__ = [
     "DEFAULT_MODEL_SET",
     "MODEL_SETS",
     "OCR",
+    "SCRIPT_MIN_RATIO",
+    "SCRIPT_SENTENCES",
     "EngineOptions",
     "FixedTextOutcome",
     "FrameLike",
@@ -47,8 +59,13 @@ __all__ = [
     "OcrService",
     "RecognizedLine",
     "Recognizer",
+    "Script",
+    "ScriptCheck",
     "UnsupportedLanguageError",
+    "UnsupportedScriptError",
+    "check_script",
     "crop_bgr",
     "onnxruntime_version",
     "recognize_frame",
+    "script_of",
 ]

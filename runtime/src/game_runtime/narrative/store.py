@@ -22,25 +22,17 @@ from game_runtime.narrative.record import (
 
 NARRATIVE_DIR: Final = "narrative"
 """本地数据目录下放剧情记录的子目录。"""
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
+"""存储文件的格式版本（`user_version`）。2：`records.screen` 可为空（对白框没写画面）。"""
 
-_SCHEMA: Final = """
-CREATE TABLE sessions (
-    session INTEGER PRIMARY KEY AUTOINCREMENT,
-    adapter_version TEXT NOT NULL
-);
-CREATE TABLE scopes (
-    session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
-    scope INTEGER NOT NULL,
-    after_screen TEXT,
-    first_frame INTEGER NOT NULL,
-    PRIMARY KEY (session, scope)
-);
-CREATE TABLE records (
+
+def _records_table(name: str) -> str:
+    return f"""
+CREATE TABLE {name} (
     session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
     occurrence INTEGER NOT NULL,
     scope INTEGER NOT NULL,
-    screen TEXT NOT NULL,
+    screen TEXT,
     speaker TEXT,
     text TEXT NOT NULL,
     revision INTEGER NOT NULL,
@@ -55,6 +47,22 @@ CREATE TABLE records (
     low_confidence TEXT NOT NULL,
     PRIMARY KEY (session, occurrence)
 );
+"""
+
+
+_SCHEMA: Final = f"""
+CREATE TABLE sessions (
+    session INTEGER PRIMARY KEY AUTOINCREMENT,
+    adapter_version TEXT NOT NULL
+);
+CREATE TABLE scopes (
+    session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
+    scope INTEGER NOT NULL,
+    after_screen TEXT,
+    first_frame INTEGER NOT NULL,
+    PRIMARY KEY (session, scope)
+);
+{_records_table("records")}
 CREATE TABLE discontinuities (
     session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
     first_frame INTEGER NOT NULL,
@@ -63,6 +71,16 @@ CREATE TABLE discontinuities (
     PRIMARY KEY (session, first_frame)
 );
 """
+
+_UPGRADES: Final = {
+    1: (
+        _records_table("records_v2"),
+        "INSERT INTO records_v2 SELECT * FROM records;",
+        "DROP TABLE records;",
+        "ALTER TABLE records_v2 RENAME TO records;",
+    ),
+}
+"""从各旧版本升到下一版的语句：版本 1 的 `records.screen` 不能为空，按新表重建，记录照留。"""
 
 _INSERT_RECORD: Final = (
     "INSERT OR REPLACE INTO records (session, occurrence, scope, screen, speaker, text, revision, "
@@ -156,7 +174,7 @@ class NarrativeStore:
 
 
 def _prepare(connection: sqlite3.Connection) -> None:
-    """新文件建表；已有的文件核对版本。"""
+    """新文件建表；已有的文件核对版本，旧版本就地升级。"""
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     if version == 0:
         tables = connection.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
@@ -168,10 +186,16 @@ def _prepare(connection: sqlite3.Connection) -> None:
         connection.executescript(
             f"BEGIN; {_SCHEMA} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
         )
-    elif version != SCHEMA_VERSION:
+    elif version != SCHEMA_VERSION and version not in _UPGRADES:
         raise NarrativeStoreError(f"存储文件的版本 {version} 不认识，应为 {SCHEMA_VERSION}")
     else:
         connection.execute("PRAGMA journal_mode = WAL")
+        while version < SCHEMA_VERSION:
+            statements = "\n".join(_UPGRADES[version])
+            connection.executescript(
+                f"BEGIN; {statements} PRAGMA user_version = {version + 1}; COMMIT;"
+            )
+            version += 1
     connection.execute("PRAGMA synchronous = NORMAL")
 
 
@@ -311,7 +335,7 @@ def _record_of(row: Sequence[object]) -> NarrativeRecord:
         session=_int(session),
         occurrence=_int(occurrence),
         scope=_int(scope),
-        screen=str(screen),
+        screen=None if screen is None else str(screen),
         speaker=None if speaker is None else str(speaker),
         text=str(text),
         revision=_int(revision),

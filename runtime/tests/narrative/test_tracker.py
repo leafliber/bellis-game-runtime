@@ -19,6 +19,7 @@ from game_runtime.narrative import (
     SentenceTracker,
     TrackerParams,
     Unjudged,
+    Unread,
     compare_key,
     continues,
 )
@@ -40,15 +41,18 @@ class Feed:
         speaker: str | None = "阿遥",
         *,
         marker: bool = False,
-        screen: str = "dialogue",
+        screen: str | None = "dialogue",
         confidence: float = 0.97,
+        scope_screen: str | None = None,
     ) -> tuple[NarrativeRecord, ...]:
         self.number += 1
         reading = Reading("dialogue", ((text, confidence),) if text else ())
         names = (
             None if speaker is None else Reading("speaker", ((speaker, 0.99),) if speaker else ())
         )
-        frame = BoxFrame(self.number, self.number * self.step * MS, screen, reading, names, marker)
+        frame = BoxFrame(
+            self.number, self.number * self.step * MS, screen, reading, names, marker, scope_screen
+        )
         return self.tracker.observe(frame).records
 
     def typing(
@@ -64,6 +68,10 @@ class Feed:
     def unjudged(self) -> None:
         self.number += 1
         self.tracker.observe(Unjudged(self.number))
+
+    def unread(self, scope_screen: str | None = None) -> None:
+        self.number += 1
+        self.tracker.observe(Unread(self.number, scope_screen))
 
     @property
     def records(self) -> tuple[NarrativeRecord, ...]:
@@ -214,6 +222,23 @@ def test_unjudged_frames_neither_count_nor_close() -> None:
     assert feed.records[0].completeness is Completeness.COMPLETE
 
 
+def test_unread_frames_neither_count_nor_close() -> None:
+    """节流跳过、过场或 OCR 出错而没有读的帧：不改变记录，也不计入连续帧数。"""
+    feed = Feed(TrackerParams(complete_frames=3, complete_after_ns=0))
+    feed.box("门后")
+    for _ in range(5):
+        feed.unread()
+    feed.box("门后")
+    assert feed.records[0].completeness is Completeness.PARTIAL
+    feed.box("门后")
+    [record] = feed.records
+    assert (record.completeness, record.last_frame, record.closed_frame) == (
+        Completeness.COMPLETE,
+        8,
+        None,
+    )
+
+
 def test_speakers_split_only_when_both_are_read_and_differ() -> None:
     feed = Feed()
     feed.box("你听", speaker="")  # 名字栏还在淡入
@@ -238,10 +263,13 @@ def test_another_dialogue_screen_is_another_sentence() -> None:
     feed = Feed()
     feed.box("雨停了", screen="dialogue")
     feed.box("雨停了，钟楼", screen="narration")
+    feed.box("雨停了，钟楼的", screen=None)  # 不写画面的对白框是另一个对白框
+    feed.box("雨停了，钟楼的指针", screen=None)
 
-    assert [(r.screen, r.completeness) for r in feed.records] == [
-        ("dialogue", Completeness.GAP),
-        ("narration", Completeness.PARTIAL),
+    assert [(r.screen, r.completeness, r.revision) for r in feed.records] == [
+        ("dialogue", Completeness.GAP, 1),
+        ("narration", Completeness.GAP, 1),
+        (None, Completeness.PARTIAL, 2),
     ]
 
 
@@ -263,6 +291,30 @@ def test_a_gap_in_processing_closes_the_sentence() -> None:
 
 
 # 剧情范围
+
+
+def test_scope_screens_count_whether_or_not_the_box_was_read() -> None:
+    """不写画面的对白框在坏结局上也读文字：那一帧上新开的句子仍在原来的范围里，下一句才开始新的
+    范围；没读的帧（过场、节流）判出这类画面同样开始新的范围。"""
+    feed = Feed()
+    feed.box("第一句。", marker=True, screen=None)
+    feed.box("坏结局", marker=True, screen=None, scope_screen="bad-ending")
+    feed.box("", screen=None)
+    feed.box("第三句。", marker=True, screen=None)
+    feed.unread("save-load")
+    feed.box("钟声又响了一次。", marker=True, screen=None)
+
+    assert [(r.text, r.scope) for r in feed.records] == [
+        ("第一句。", 1),
+        ("坏结局", 1),
+        ("第三句。", 2),
+        ("钟声又响了一次。", 3),
+    ]
+    assert [(s.scope, s.after_screen, s.first_frame) for s in feed.tracker.scopes] == [
+        (1, None, 1),
+        (2, "bad-ending", 4),
+        (3, "save-load", 6),
+    ]
 
 
 def test_bad_endings_and_loads_start_new_scopes() -> None:

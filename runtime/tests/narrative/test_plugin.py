@@ -127,6 +127,7 @@ def test_manifest() -> None:
     assert manifest.permissions == (NARRATIVE_WRITE,) == ("narrative.write",)
     config = NarrativeConfig()
     assert (config.complete_frames, config.complete_after, config.low_confidence) == (3, 0.5, 0.8)
+    assert (config.ocr_interval, config.ocr_interval_ns) == (0.25, 250_000_000)
     assert (config.max_backlog, config.keep_sessions, config.max_records) == (600, 20, 200_000)
     assert config.tracker_params().complete_after_ns == 500_000_000
 
@@ -204,7 +205,11 @@ def test_a_relative_data_dir_is_a_config_error(data_dir: Path) -> None:
         kernel_bad = await settle(profile(data_dir, narrative={"max_backlog": 1}))
         [bad] = kernel_bad.status("narrative").reasons
         assert bad.code is ReasonCode.CONFIG_INVALID
+        kernel_interval = await settle(profile(data_dir, narrative={"ocr_interval": -0.1}))
+        [interval] = kernel_interval.status("narrative").reasons
+        assert interval.code is ReasonCode.CONFIG_INVALID
         await kernel.shutdown()
         await kernel_bad.shutdown()
+        await kernel_interval.shutdown()
 
     asyncio.run(scenario())

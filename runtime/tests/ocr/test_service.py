@@ -1,5 +1,6 @@
 """`ocr@1` 的服务，不用模型文件：ROI 的换算与裁出、识别框换回客户区、尚未标定、语言核对的
-相符与不符、`scene@1` 的 `read_lines`、工作线程不阻塞事件循环、停用。识别器是按脚本回答的假识别器。
+固定文字一层的相符与不符、`scene@1` 的 `read_lines`、工作线程不阻塞事件循环、停用。识别器是按脚本
+回答的假识别器。文字系统一层见 `test_script.py`。
 """
 
 import asyncio
@@ -221,14 +222,16 @@ def test_language_check_fails_when_any_item_differs(synthetic_adapter: Adapter) 
     assert check.mismatches[0].result.text == "說明"
 
 
-def test_language_check_needs_calibrated_items(
+def test_language_check_needs_items_on_the_screen(
     synthetic_adapter: Adapter, witch_trial_adapter: Adapter
 ) -> None:
+    """固定文字为空（《魔女审判》）或这个画面没有声明任何一项都是 LookupError：只做文字系统一层。"""
+
     async def scenario() -> None:
         uncalibrated = OcrService(witch_trial_adapter, ScriptedRecognizer(), model="fake")
         synthetic = OcrService(synthetic_adapter, ScriptedRecognizer(), model="fake")
         try:
-            with pytest.raises(NotCalibratedError, match="语言核对的固定文字尚未标定"):
+            with pytest.raises(LookupError, match="画面 dialogue 没有语言核对的固定文字"):
                 await uncalibrated.check_language(gradient_frame(2560, 1440), "dialogue")
             with pytest.raises(LookupError, match="画面 dialogue 没有语言核对的固定文字"):
                 await synthetic.check_language(gradient_frame(1280, 720), "dialogue")

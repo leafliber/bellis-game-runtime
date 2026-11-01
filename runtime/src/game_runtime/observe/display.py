@@ -17,14 +17,19 @@ from game_runtime.observe.hub import (
     Event,
     LanguageEvent,
     LanguageResult,
+    LanguageWatch,
     LineEvent,
     LineKind,
     ObserveHub,
     PluginEvent,
     SceneEvent,
+    ScriptEvent,
+    ScriptResult,
+    ScriptWatch,
     Share,
     VoiceEvent,
 )
+from game_runtime.ocr import SCRIPT_SENTENCES, ScriptCheck
 from game_runtime.recording import SessionStatus
 from game_runtime.scene import Stability, Verdict
 from game_runtime.voice_activity import VoiceState, VoiceStatus
@@ -58,6 +63,7 @@ LANGUAGE: Final = {
     LanguageResult.MISMATCH: "不符",
     LanguageResult.ERROR: "出错",
 }
+SCRIPT: Final = {ScriptResult.MATCH: "相符", ScriptResult.MISMATCH: "不符"}
 GB: Final = 10**9
 
 
@@ -79,6 +85,11 @@ def size(count: int) -> str:
 
 def reasons(items: Sequence[Reason]) -> str:
     return "；".join(f"{r.code.value}：{r.message}" for r in items)
+
+
+def percent(check: ScriptCheck) -> str:
+    """属于这个文字系统的比例，写成百分数。"""
+    return "—" if check.ratio is None else f"{check.ratio * 100:.0f}%"
 
 
 def plugin_state(status: EntryStatus) -> str:
@@ -126,6 +137,8 @@ class Formatter:
                 return self.line(event)
             case LanguageEvent():
                 return self.language(event)
+            case ScriptEvent():
+                return self.script(event)
             case PluginEvent():
                 return self.plugin(event)
 
@@ -155,7 +168,7 @@ class Formatter:
         head = f"{self.stamp(event.at_ns)} 剧情 #{record.occurrence} {LINE_KINDS[event.kind]}"
         adapter = self.adapter
         if adapter is not None and len(adapter.dialogue_boxes) > 1:
-            head += f" {self.screen(record.screen)}"
+            head += " " + ("不限画面" if record.screen is None else self.screen(record.screen))
         completeness = COMPLETENESS[record.completeness]
         if (
             event.kind is LineKind.CLOSE
@@ -198,6 +211,16 @@ class Formatter:
                 for o in check.mismatches
             )
         return f"{head}（{check.tag}）：{items}{frame}"
+
+    def script(self, event: ScriptEvent) -> str:
+        record, check = event.checks[-1]
+        head = f"{self.stamp(event.at_ns)} 语言核对 文字系统{SCRIPT[event.result]}"
+        head += f"（{check.tag}，{check.script.label}）："
+        if event.result is ScriptResult.MATCH:
+            return head + "、".join(f"#{r.occurrence} {percent(c)}" for r, c in event.checks)
+        return (
+            head + f"#{record.occurrence}「{record.text}」{check.script.label}占 {percent(check)}"
+        )
 
     def plugin(self, event: PluginEvent) -> str:
         line = f"{self.stamp(time.perf_counter_ns())} 插件 {event.entry} {event.state.value}"
@@ -245,14 +268,24 @@ def banner(
     if uncalibrated:
         lines.append("尚未标定：" + "、".join(uncalibrated))
     lines += [f"scene@1：{problem}" for problem in hub.scene_problems]
-    watch = hub.language
-    if watch is None:
+    watch, script = hub.language, hub.script
+    if watch is None or script is None:
         lines.append("语言核对：observer 没有激活，不核对")
-    elif watch.problem is not None:
-        lines.append(f"语言核对：尚未标定，不核对（{watch.problem}）")
     else:
-        screens = "、".join(formatter.screen(s) for s in watch.screens)
-        lines.append(f"语言核对：{screens}每次出现时核对，共 {len(watch.items)} 项")
+        if script.script is None:
+            lines.append(f"语言核对（文字系统）：不核对，{script.problem}")
+        elif narrative_problem is not None:
+            lines.append("语言核对（文字系统）：不核对，不运行剧情记录")
+        else:
+            lines.append(
+                f"语言核对（文字系统）：{script.tag} 按{script.script.label}，"
+                f"核对剧情记录里前 {SCRIPT_SENTENCES} 句完整的句子"
+            )
+        if not watch.items:
+            lines.append("语言核对（固定文字）：适配包没有声明，不核对")
+        else:
+            screens = "、".join(formatter.screen(s) for s in watch.screens)
+            lines.append(f"语言核对（固定文字）：{screens}每次出现时核对，共 {len(watch.items)} 项")
     lines.append("按回车或 Ctrl+C 停止。")
     return lines
 
@@ -358,7 +391,7 @@ def summary(formatter: Formatter, *, narrative_problem: str | None) -> list[str]
         span = sum(s.ns for s in voice)
         items = "、".join(f"{_voice_label(s.key)} {_percent(s.ns, span)}" for s in voice)
         lines.append(f"  配音（{span / 1e9:.1f} 秒）：{items}")
-    lines.append("  " + _language_summary(formatter))
+    lines += ["  " + line for line in _language_summary(formatter, narrative_problem)]
     return lines
 
 
@@ -369,20 +402,44 @@ def _scene_label(formatter: Formatter, share: Share) -> str:
         return formatter.screen(share.key)
 
 
-def _language_summary(formatter: Formatter) -> str:
+def _language_summary(formatter: Formatter, narrative_problem: str | None) -> list[str]:
     hub = formatter.hub
-    watch = hub.language
-    if watch is None:
-        return "语言核对：observer 没有激活，没有核对"
-    if watch.problem is not None:
-        return "语言核对：尚未标定，没有核对"
+    if hub.language is None or hub.script is None:
+        return ["语言核对：observer 没有激活，没有核对"]
+    return [
+        "语言核对（文字系统）：" + _script_summary(hub.script, narrative_problem),
+        "语言核对（固定文字）：" + _fixed_summary(formatter, hub.language),
+    ]
+
+
+def _script_summary(watch: ScriptWatch, narrative_problem: str | None) -> str:
+    if watch.script is None:
+        return f"不核对，{watch.problem}"
+    if narrative_problem is not None:
+        return "不核对，不运行剧情记录"
+    tail = f"；另有 {watch.undecided} 句无从判断，不计" if watch.undecided else ""
+    if watch.result is ScriptResult.MATCH:
+        return "相符（" + "、".join(f"#{r.occurrence}" for r, _ in watch.checks) + "）" + tail
+    if watch.result is ScriptResult.MISMATCH:
+        record, check = watch.checks[-1]
+        label = check.script.label
+        return f"不符（#{record.occurrence}「{record.text}」{label}占 {percent(check)}）{tail}"
+    if not watch.checks:
+        return ("没有判断了的完整句子" if watch.undecided else "没有完整的句子") + tail
+    return f"判断了 {len(watch.checks)} 句，都相符，不到 {SCRIPT_SENTENCES} 句{tail}"
+
+
+def _fixed_summary(formatter: Formatter, watch: LanguageWatch) -> str:
+    hub = formatter.hub
+    if not watch.items:
+        return "适配包没有声明，没有核对"
     if not hub.language_results:
         screens = "、".join(formatter.screen(s) for s in watch.screens)
-        return f"语言核对：没有核对过（{screens}没有稳定出现）"
+        return f"没有核对过（{screens}没有稳定出现）"
     parts: list[str] = []
     for screen, counter in hub.language_results.items():
         counts = "、".join(
             f"{LANGUAGE[result]} {counter[result]}" for result in LanguageResult if counter[result]
         )
         parts.append(f"{formatter.screen(screen)} {counter.total()} 次，{counts}")
-    return "语言核对：" + "；".join(parts)
+    return "；".join(parts)

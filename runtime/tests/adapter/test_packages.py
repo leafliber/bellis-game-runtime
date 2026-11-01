@@ -18,10 +18,11 @@ from game_runtime.adapter import (
 )
 from game_runtime.adapter.check import check_games_dir, check_package, package_dirs
 from game_runtime.core_link import WindowRule
+from game_runtime.ocr import SCRIPT_MIN_RATIO, Script, check_script, script_of
 from synthetic_game import GameConfig, Key, SceneType
 from synthetic_game.layout import Layout, Rect
 from synthetic_game.shell import WINDOW_TITLE
-from synthetic_game.story import UI
+from synthetic_game.story import NODES, UI, Dialogue
 
 SET1 = {Key.ENTER: 0x1C, Key.SPACE: 0x39, Key.ESCAPE: 0x01, Key.UP: 0xE048, Key.DOWN: 0xE050}
 """合成游戏用到的键的 Set 1 扫描码。"""
@@ -117,9 +118,10 @@ def test_synthetic_screens_map_to_the_truth_scene_types(synthetic: Adapter) -> N
 
 
 def test_synthetic_language_check_reads_the_title_menu_buttons(synthetic: Adapter) -> None:
-    check = synthetic.language_check()
+    check = synthetic.language.fixed_texts
 
     assert synthetic.language.tag == "zh-Hans"
+    assert script_of(synthetic.language.tag) is Script.HAN
     assert [(item.screen, item.roi, item.text) for item in check] == [
         ("title-menu", "menu-start", UI.menu_start),
         ("title-menu", "menu-shop", UI.menu_shop),
@@ -146,6 +148,19 @@ def test_synthetic_dialogue_box_reads_the_name_and_the_line(synthetic: Adapter) 
         column, row = int(point.at.x * width), int(point.at.y * height)
         assert triangle.left < column < triangle.right - 1
         assert triangle.top < row < triangle.center[1]  # 三角形朝下，上半部分最宽
+
+
+def test_every_synthetic_line_is_in_the_declared_script(synthetic: Adapter) -> None:
+    """文字系统一层在合成游戏的每句台词上都相符（台词是原创的中文）。"""
+    lines = [
+        line.text for node in NODES.values() if isinstance(node, Dialogue) for line in node.lines
+    ]
+    assert lines
+    for text in lines:
+        check = check_script(text, synthetic.language.tag)
+        assert check.matches, (text, check.ratio)
+        assert check.ratio is not None
+        assert check.ratio >= SCRIPT_MIN_RATIO
 
 
 def test_synthetic_whitelist_covers_the_inputs_the_game_handles(synthetic: Adapter) -> None:
@@ -218,15 +233,13 @@ def test_witch_trial_calibration_is_pending_without_guessed_coordinates(
         "签名 choice",
         "签名 trial",
         "签名 bad-ending",
-        "语言核对的固定文字",
-        "阅读节奏",
     )
     with pytest.raises(NotCalibratedError):
         witch_trial.roi("dialogue")
-    with pytest.raises(NotCalibratedError):
-        witch_trial.language_check()
-    with pytest.raises(NotCalibratedError):
-        witch_trial.require_pacing()
+    # 固定文字与阅读节奏不是标定项：没有固定文字即只做文字系统一层，没有阅读节奏即用通用缺省。
+    assert witch_trial.language.fixed_texts == ()
+    assert witch_trial.pacing is None
+    assert script_of(witch_trial.language.tag) is Script.HAN
 
 
 def test_witch_trial_dialogue_box_is_declared_but_not_calibrated(witch_trial: Adapter) -> None:

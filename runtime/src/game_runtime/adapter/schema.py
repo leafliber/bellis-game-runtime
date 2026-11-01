@@ -172,7 +172,7 @@ class Language(_Model):
     ]
     """BCP 47 的语言加可选的文字与地区，如 `zh-Hans`。"""
     fixed_texts: tuple[FixedText, ...]
-    """语言核对用的固定文字；为空即尚未标定。"""
+    """语言核对的固定文字一层，可为空：为空即只做文字系统一层，不算尚未标定。"""
 
 
 ARK = "volcengine-ark"
@@ -368,6 +368,9 @@ class Pacing(_Model):
     reread_per_char: Seconds
     """缺省同 `read_per_char`。"""
     voice_unknown_wait: PositiveSeconds
+    """配音未知时代替“配音为闲”的最长等待，从文字完整时算起。"""
+    voice_busy_wait: PositiveSeconds
+    """配音一直为忙时代替“配音为闲”的最长等待，从文字完整时算起。"""
 
     @model_validator(mode="before")
     @classmethod
@@ -424,19 +427,21 @@ class Signature(_Model):
 
 
 class DialogueBox(_Model):
-    """一个画面上的对白框：剧情记录只在这些画面上读文字。
+    """一个对白框：剧情记录按它读文字。
 
     引用的 ROI 与签名只须已声明，可以尚未标定；取用见 `Adapter.require_dialogue_boxes`。
     """
 
-    screen: Ident
-    """对白框所在的画面；类型须为“对话”或以“对话”为 base 的扩展。"""
+    screen: Ident | None = None
+    """对白框所在的画面，类型须为“对话”或以“对话”为 base 的扩展：只在判为这个画面的帧上读。
+    不写即通用缺省：在每个不是过场的帧上读，判别结果不限。"""
     text: Ident
     """对白文字的 ROI。"""
     speaker: Ident | None = None
     """名字栏的 ROI；没有名字栏的画面不写。"""
     continue_signature: Ident | None = None
-    """继续标记的签名：指向同一画面，本帧命中即继续标记可见；游戏没有继续标记时不写。"""
+    """继续标记的签名：指向同一画面（不写 `screen` 时指向一个对话类的画面），本帧命中即继续标记
+    可见；游戏没有继续标记时不写。"""
 
     @model_validator(mode="after")
     def _distinct(self) -> Self:
@@ -477,7 +482,7 @@ class Adapter(_Model):
     risk: Risk
     rois: Mapping[Ident, Roi] = Field(default_factory=dict[str, Roi])
     pacing: Pacing | None = None
-    """没有即尚未设定。"""
+    """本游戏的阅读节奏覆盖；没有即用通用缺省（由使用方定义，G2）。不是标定项。"""
     signatures: tuple[Signature, ...] = ()
     dialogue_boxes: tuple[DialogueBox, ...] = ()
     notes: tuple[NoteSection, ...] = ()
@@ -516,20 +521,20 @@ class Adapter(_Model):
         yield from self._dialogue_box_problems()
 
     def _dialogue_box_problems(self) -> Iterator[str]:
-        """对白框：画面是对话类，至多一项；引用的 ROI 与签名已声明（可以尚未标定）。"""
-        yield from _duplicates("dialogue_boxes", (box.screen for box in self.dialogue_boxes))
-        types = {screen.id: screen.type for screen in self.screens}
-        bases = {ext.name: ext.base.value for ext in self.screen_types}
+        """对白框：写了画面的，画面是对话类，每个画面至多一项；不写画面的至多一项；引用的 ROI 与
+        签名已声明（可以尚未标定）。"""
+        boxes = self.dialogue_boxes
+        yield from _duplicates(
+            "dialogue_boxes", (box.screen for box in boxes if box.screen is not None)
+        )
+        if sum(1 for box in boxes if box.screen is None) > 1:
+            yield "dialogue_boxes：不写 screen 的对白框至多一项"
         signatures = {signature.id: signature for signature in self.signatures}
-        for index, box in enumerate(self.dialogue_boxes):
+        for index, box in enumerate(boxes):
             where = f"dialogue_boxes[{index}]"
-            screen_type = types.get(box.screen)
-            if (
-                screen_type is not None
-                and bases.get(screen_type, screen_type) != ScreenType.DIALOGUE
-            ):
+            if box.screen is not None and not self._is_dialogue(box.screen):
                 yield (
-                    f"{where}.screen：画面 {box.screen} 的类型是 {screen_type}，"
+                    f"{where}.screen：画面 {box.screen} 的类型是 {self._type_of(box.screen)}，"
                     f"对白框只能在{ScreenType.DIALOGUE}类的画面上"
                 )
             for field, name in (("speaker", box.speaker), ("text", box.text)):
@@ -539,11 +544,28 @@ class Adapter(_Model):
                 signature = signatures.get(box.continue_signature)
                 if signature is None:
                     yield f"{where}.continue_signature：没有声明签名 {box.continue_signature}"
-                elif signature.screen != box.screen:
+                elif box.screen is not None and signature.screen != box.screen:
                     yield (
                         f"{where}.continue_signature：签名 {signature.id} 指向画面 "
                         f"{signature.screen}，不是对白框所在的 {box.screen}"
                     )
+                elif box.screen is None and not self._is_dialogue(signature.screen):
+                    yield (
+                        f"{where}.continue_signature：签名 {signature.id} 指向画面 "
+                        f"{signature.screen}，类型是 {self._type_of(signature.screen)}，"
+                        f"不是{ScreenType.DIALOGUE}类的画面"
+                    )
+
+    def _type_of(self, screen: str) -> str | None:
+        return next((item.type for item in self.screens if item.id == screen), None)
+
+    def _is_dialogue(self, screen: str) -> bool:
+        """画面 `screen` 的类型是“对话”或以它为 base 的扩展；没有声明的画面另行报错，这里算是。"""
+        screen_type = self._type_of(screen)
+        if screen_type is None:
+            return True
+        bases = {ext.name: ext.base.value for ext in self.screen_types}
+        return bases.get(screen_type, screen_type) == ScreenType.DIALOGUE
 
     def _screen_refs(self) -> Iterator[tuple[str, str]]:
         for index, item in enumerate(self.language.fixed_texts):
@@ -551,7 +573,8 @@ class Adapter(_Model):
         for index, signature in enumerate(self.signatures):
             yield f"signatures[{index}].screen", signature.screen
         for index, box in enumerate(self.dialogue_boxes):
-            yield f"dialogue_boxes[{index}].screen", box.screen
+            if box.screen is not None:
+                yield f"dialogue_boxes[{index}].screen", box.screen
 
     def _roi_refs(self) -> Iterator[tuple[str, str]]:
         for index, name in enumerate(self.whitelist.click_regions):
@@ -579,18 +602,6 @@ class Adapter(_Model):
         if roi.rect is None:
             raise NotCalibratedError(self.id, f"ROI {name}（{roi.title}）")
         return roi.rect
-
-    def require_pacing(self) -> Pacing:
-        """阅读节奏；没有写即 NotCalibratedError。"""
-        if self.pacing is None:
-            raise NotCalibratedError(self.id, "阅读节奏")
-        return self.pacing
-
-    def language_check(self) -> tuple[FixedText, ...]:
-        """语言核对的固定文字；为空即 NotCalibratedError，核对不能通过。"""
-        if not self.language.fixed_texts:
-            raise NotCalibratedError(self.id, "语言核对的固定文字")
-        return self.language.fixed_texts
 
     def require_dialogue_boxes(self) -> tuple[DialogueBox, ...]:
         """对白框。没有声明即 LookupError；任一对白框引用的 ROI 或继续标记的签名尚未标定即
@@ -622,15 +633,12 @@ class Adapter(_Model):
         raise LookupError(f"适配包 {self.id} 没有声明画面 {screen}")
 
     def uncalibrated(self) -> tuple[str, ...]:
-        """尚未标定的项，给人读。"""
+        """尚未标定的项，给人读：没有 `rect` 的 ROI 与没有组成项的签名。空的固定文字与没写的阅读
+        节奏不是标定项，不列。"""
         items = [
             f"ROI {name}（{roi.title}）" for name, roi in self.rois.items() if roi.rect is None
         ]
         items += [f"签名 {s.id}" for s in self.signatures if not s.calibrated]
-        if not self.language.fixed_texts:
-            items.append("语言核对的固定文字")
-        if self.pacing is None:
-            items.append("阅读节奏")
         return tuple(items)
 
 

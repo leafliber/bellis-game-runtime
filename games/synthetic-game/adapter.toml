@@ -20,7 +20,8 @@ height = 720
 [language]
 tag = "zh-Hans"
 
-# 标题菜单三个按钮的文字（story.py 的 Ui）。
+# 语言核对的固定文字一层（可选）：标题菜单三个按钮的文字（story.py 的 Ui）。文字系统一层按剧情记录
+# 的句子自动进行，不用写。
 [[language.fixed_texts]]
 screen = "title-menu"
 roi = "menu-start"
@@ -196,11 +197,13 @@ speaker = "speaker"
 text = "dialogue"
 continue_signature = "dialogue-continue"
 
+# 阅读节奏是可选的覆盖（docs/modules/game-adapter.md 的“阅读节奏”），这里作为格式的样例写全。
 [pacing]
 min_action_interval = 0.2
 read_base = 0.5
 read_per_char = 0.02
 voice_unknown_wait = 2.0
+voice_busy_wait = 8.0
 
 [[notes]]
 id = "characters"

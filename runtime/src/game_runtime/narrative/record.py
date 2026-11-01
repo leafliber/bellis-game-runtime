@@ -42,8 +42,8 @@ class NarrativeRecord:
     """出现编号：本次运行内按出现的顺序从 1 起。"""
     scope: int
     """剧情范围号。"""
-    screen: str
-    """对白框所在的画面。"""
+    screen: str | None
+    """对白框所在的画面；对白框没写画面（通用缺省）时为 None。"""
     speaker: str | None
     """说话人：这一句第一次读到的非空名字；没有名字栏或一直读不到时为 None。"""
     text: str

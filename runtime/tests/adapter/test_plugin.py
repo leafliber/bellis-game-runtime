@@ -200,7 +200,7 @@ def test_uncalibrated_items_are_logged_on_activation(caplog: pytest.LogCaptureFi
 
     messages = [record.getMessage() for record in caplog.records]
     assert "适配包 witch-trial 的ROI speaker（名字栏）尚未标定" in messages
-    assert "适配包 witch-trial 的阅读节奏尚未标定" in messages
+    assert not any("阅读节奏" in message or "固定文字" in message for message in messages)
 
 
 def test_stopping_the_package_stops_its_dependents_first() -> None:

@@ -1,7 +1,8 @@
-"""`ocr@1` 的服务：对给定帧的 ROI 识别文字、执行语言核对，并为画面签名提供 `read_lines`。
+"""`ocr@1` 的服务：对给定帧的 ROI 识别文字、执行语言核对的两层，并为画面签名提供 `read_lines`。
 
 识别在服务自己的一个工作线程里串行进行，不阻塞事件循环。设计见 `docs/modules/perception.md`
-的“OCR”；固定文字的比较按 `RoiText.matches`（`docs/modules/game-adapter.md` 的“语言核对”）。
+的“OCR”；固定文字的比较按 `RoiText.matches`，文字系统按 `game_runtime.ocr.script`
+（`docs/modules/game-adapter.md` 的“语言核对”）。
 """
 
 import asyncio
@@ -16,8 +17,19 @@ import numpy as np
 from game_runtime._threads import in_thread
 from game_runtime.adapter import Adapter, FixedText, PixelRect
 from game_runtime.ocr.engine import Image, Recognizer
+from game_runtime.ocr.script import (
+    Script,
+    ScriptCheck,
+    count_letters,
+    script_of,
+    supported_languages,
+)
 
 BYTES_PER_PIXEL = 4
+
+
+class UnsupportedLanguageError(Exception):
+    """适配包声明的语言版本不受支持：不在模型组核对过的语言里，或它的文字系统不受支持。"""
 
 
 class FrameLike(Protocol):
@@ -156,8 +168,17 @@ class OcrService:
     """
 
     def __init__(self, adapter: Adapter, recognizer: Recognizer, *, model: str) -> None:
+        """适配包语言的文字系统不受支持即 `UnsupportedLanguageError`。"""
+        tag = adapter.language.tag
+        script = script_of(tag)
+        if script is None:
+            raise UnsupportedLanguageError(
+                f"适配包 {adapter.id} 的语言 {tag} 的文字系统不受支持；支持 {supported_languages()}"
+            )
         self.adapter = adapter
-        """当前适配包，ROI 与语言核对的固定文字取自它。"""
+        """当前适配包，ROI、语言与语言核对的固定文字取自它。"""
+        self.script: Script = script
+        """适配包语言的文字系统。"""
         self.model = model
         """所用模型组的名字。"""
         self._recognizer = recognizer
@@ -181,12 +202,11 @@ class OcrService:
         return await self._run(functools.partial(recognize_frame, self._recognizer, frame, rect))
 
     async def check_language(self, frame: FrameLike, screen: str) -> LanguageCheck:
-        """语言核对：`frame` 是画面 `screen` 的稳定帧，对这个画面声明的每一项的 ROI 做 OCR 比较。
-
-        固定文字为空即 `NotCalibratedError`；这个画面没有声明任何一项即 `LookupError`。
+        """语言核对的固定文字一层：`frame` 是画面 `screen` 的稳定帧，对这个画面声明的每一项的 ROI
+        做 OCR 比较。这个画面没有声明任何一项（含固定文字为空）即 `LookupError`。
         """
         adapter = self.adapter
-        items = tuple(item for item in adapter.language_check() if item.screen == screen)
+        items = tuple(item for item in adapter.language.fixed_texts if item.screen == screen)
         if not items:
             raise LookupError(f"适配包 {adapter.id} 的画面 {screen} 没有语言核对的固定文字")
         outcomes: list[FixedTextOutcome] = []
@@ -194,6 +214,12 @@ class OcrService:
             result = await self.recognize(frame, item.roi)
             outcomes.append(FixedTextOutcome(item, result, item.matches(result.texts)))
         return LanguageCheck(adapter.id, adapter.language.tag, screen, tuple(outcomes))
+
+    def check_script(self, text: str) -> ScriptCheck:
+        """语言核对的文字系统一层：`text`（剧情记录里完整的句子）的字母里属于适配包语言的文字系统
+        的比例与是否相符。纯计算，不做 OCR，同步；可以在事件循环里调用，停用后也可以。"""
+        letters, matching = count_letters(text, self.script)
+        return ScriptCheck(self.adapter.language.tag, self.script, text, letters, matching)
 
     def read_lines(self, frame: FrameLike, rect: PixelRect) -> list[str]:
         """同步地识别 `rect`（客户区物理像素）内的文字，按阅读顺序返回各行。

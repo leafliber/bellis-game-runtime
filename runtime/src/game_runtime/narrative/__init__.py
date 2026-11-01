@@ -46,6 +46,7 @@ from game_runtime.narrative.tracker import (
     SentenceTracker,
     TrackerParams,
     Unjudged,
+    Unread,
 )
 
 __all__ = [
@@ -76,6 +77,7 @@ __all__ = [
     "SentenceTracker",
     "TrackerParams",
     "Unjudged",
+    "Unread",
     "compare_key",
     "continues",
     "crop_roi",
