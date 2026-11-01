@@ -125,7 +125,7 @@
 
 - **清单**：普通插件 `narrative`，提供 `narrative@1`；依赖 `game-adapter@1`、`scene@1` 与 `ocr@1`，都是必需的：没有 OCR 就读不到文字，缺 OCR 时停在 WAITING（`service-missing`），而不是激活后什么也记不下；权限 `narrative.write`。
 - **配置**：`complete_frames`（至少 1）、`complete_after`（秒，不小于 0）、`ocr_interval`（秒，不小于 0）、`low_confidence`（[0, 1]）、`max_backlog`（至少 2）、`keep_sessions`（至少 1）、`max_records`（至少 1），以及 `data_dir`：本地数据目录，绝对路径，缺省按[术语](../architecture.md#术语)中的位置与 `BELLIS_GAME_RUNTIME_DATA`。
-- **激活**：取适配包的对白框（`require_dialogue_boxes`）：没有声明即 `LookupError`，引用的 ROI 或继续标记的签名尚未标定即 `NotCalibratedError`，一次列出全部未标定的项，激活失败，不猜坐标（《魔女审判》在第 9 步标定前就是这样）；在线程里打开存储、新开运行并清理；订阅 `scene@1`，提供 `narrative@1`。
+- **激活**：取适配包的对白框（`require_dialogue_boxes`）：没有声明即 `LookupError`，引用的 ROI 或继续标记的签名尚未标定即 `NotCalibratedError`，一次列出全部未标定的项，激活失败，不猜坐标；在线程里打开存储、新开运行并清理；订阅 `scene@1`，提供 `narrative@1`。
 - **运行**：OCR 出错时这一帧按上表最后一行处理，记告警，恢复前不重复记录；写库出错记 ERROR 日志，内存里的记录照常更新。
 - **停用**：取消订阅，取消处理任务（见上文），关闭存储。
 
