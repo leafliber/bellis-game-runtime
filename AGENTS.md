@@ -60,15 +60,16 @@
 | 用本地数据目录里的真实模型跑 OCR 的识别测试（模型不在时跳过并写明原因） | `uv run pytest -m ocr_model` |
 | 只跑 `narrative@1` 的测试（一句的边界与完整度、按采集时刻的 OCR 节流、不写画面的对白框、存储与留存、合成剧情按真值逐句核对、积压与中断、插件在内核中；没有 OCR 模型时真实推理的那一项跳过） | `uv run pytest runtime/tests/narrative` |
 | 用真实 OCR 模型跑一遍合成剧情的剧情记录，打印逐句的核对结果（模型不在时跳过） | `uv run pytest -m ocr_model runtime/tests/narrative -s` |
-| GS-04：渲染合成游戏的样本与真值，用来验证评测工具 | `uv run gs04 synth <目录>` |
-| GS-04：评测一个样本目录，报告写入 `reports/gs04/`（引擎 `ppocrv5-mobile`、`ppocrv5-server`） | `uv run gs04 eval <样本目录> --engine <引擎>` |
+| GS-04：渲染样本与真值：合成游戏的（验证评测工具）与按字体、字号、底色、描边与阴影变化的泛化样本（字体取本机系统自带的，没有时或加 `--no-system-fonts` 时用合成游戏的字体子集，见[GS-04 的评测工具](docs/modules/perception.md#gs-04-的评测工具)） | `uv run gs04 synth <目录>` |
+| GS-04：评测一个样本目录，按类别与标签（字体、字号、底色、字形）分组，报告写入 `reports/gs04/`（引擎 `ppocrv5-mobile`、`ppocrv5-server`） | `uv run gs04 eval <样本目录> --engine <引擎>` |
 | GS-04：以 Windows 自带 OCR 作对照基线（只在 Windows 上） | `uv run --extra windows-ocr gs04 eval <样本目录> --engine windows` |
 | 只跑配音检测的测试（状态与迟滞、预处理、核心、插件在内核中；本地数据目录里没有模型时真实推理的那部分跳过） | `uv run pytest runtime/tests/voice_activity` |
 | 只跑 `voice-activity@1` 经假音频源、实时核与音频环的联调测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link/test_voice_activity.py` |
 | 用本地数据目录里的真实模型跑语音检测的测试（模型不在时跳过并写明原因；SAPI 合成的语音只在 Windows 上） | `uv run pytest -m vad_model` |
-| GS-06：用 Windows 自带的语音合成与合成的背景生成评测用的合成样本（只在 Windows 上，见[GS-06 的评测](docs/modules/perception.md#gs-06-的评测)） | `uv run gs06 synth <目录>` |
+| GS-06：用 Windows 自带的语音合成（几把语音、几种语速）与合成的背景（音乐样、音效样、噪声、带人声的背景）生成整组合成样本与清单 `suite.toml`（只在 Windows 上；`--max-voices`、`--rates` 缩小，见[GS-06 的评测](docs/modules/perception.md#gs-06-的评测)） | `uv run gs06 synth <目录>` |
 | GS-06：打印纯配音录音按能量得出的配音段 | `uv run gs06 truth <纯配音.wav>` |
-| GS-06：评测一组录音，报告写入 `reports/gs06/`（背景可给多段；负的增益写成 `--gains=-12,-6,0,6`） | `uv run gs06 eval --voice <纯配音.wav> --background <名字>=<背景.wav> --mix <正常混音.wav>` |
+| GS-06：整组评测 `gs06 synth` 写出的目录：全部情形、每个情形是否达标、占用与按语音和语速的分组，报告写入 `reports/gs06/` | `uv run gs06 eval --suite <目录>` |
+| GS-06：评测逐个给出的录音（背景可给多段，带人声的背景用 `--vocal-background`；负的增益写成 `--gains=-12,-6,0,6`） | `uv run gs06 eval --voice <纯配音.wav> --background <名字>=<背景.wav> --mix <正常混音.wav>` |
 
 探测程序另有 `--class <类名>`、`--keep-border`（保留黄色边框作对照）、`--min-update-interval-ms <N>`（会话的最小帧间隔）、`--borderless` 与 `--dpi-unaware`（图案窗口的样式）；`--help` 列出全部选项。
 
