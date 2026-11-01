@@ -183,3 +183,80 @@ def test_an_unknown_schema_version_is_refused(data_dir: Path) -> None:
 
     with pytest.raises(NarrativeStoreError, match="版本 99"):
         open_store(data_dir)
+
+
+VERSION_1: str = """
+PRAGMA journal_mode = WAL;
+BEGIN;
+CREATE TABLE sessions (
+    session INTEGER PRIMARY KEY AUTOINCREMENT,
+    adapter_version TEXT NOT NULL
+);
+CREATE TABLE scopes (
+    session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
+    scope INTEGER NOT NULL,
+    after_screen TEXT,
+    first_frame INTEGER NOT NULL,
+    PRIMARY KEY (session, scope)
+);
+CREATE TABLE records (
+    session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
+    occurrence INTEGER NOT NULL,
+    scope INTEGER NOT NULL,
+    screen TEXT NOT NULL,
+    speaker TEXT,
+    text TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    completeness TEXT NOT NULL,
+    first_frame INTEGER NOT NULL,
+    first_ns INTEGER NOT NULL,
+    last_frame INTEGER NOT NULL,
+    last_ns INTEGER NOT NULL,
+    revision_frame INTEGER NOT NULL,
+    complete_frame INTEGER,
+    closed_frame INTEGER,
+    low_confidence TEXT NOT NULL,
+    PRIMARY KEY (session, occurrence)
+);
+CREATE TABLE discontinuities (
+    session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
+    first_frame INTEGER NOT NULL,
+    last_frame INTEGER NOT NULL,
+    count INTEGER NOT NULL,
+    PRIMARY KEY (session, first_frame)
+);
+INSERT INTO sessions (adapter_version) VALUES ('0.0.9');
+INSERT INTO scopes VALUES (1, 1, NULL, 10);
+INSERT INTO records VALUES (1, 1, 1, 'dialogue', '阿遥', '你听见了吗？', 3, 'partial', 10, 1000, 12,
+    3000, 12, NULL, NULL, '[]');
+PRAGMA user_version = 1;
+COMMIT;
+"""
+"""版本 1 的存储文件（`records.screen` 不能为空），里面有一个运行的一句。"""
+
+
+def test_a_version_1_file_is_upgraded_in_place(data_dir: Path) -> None:
+    """旧版本的文件打开时就地升级：记录照留，此后可以写 screen 为空的记录（对白框没写画面）。"""
+    path = store_path(data_dir, "synthetic-game")
+    path.parent.mkdir(parents=True)
+    connection = sqlite3.connect(path)
+    connection.executescript(VERSION_1)
+    connection.close()
+
+    store = open_store(data_dir)
+    generic = record(store.session, 1, screen=None, text="门后也许有路。")
+    store.write([generic])
+    store.close()
+
+    assert [s for s, _ in read_sessions(path)] == [1, store.session]
+    assert read_records(path, 1) == [record(1, 1)]
+    assert read_scopes(path, 1) == [Scope(1, 1, None, 10)]
+    assert read_records(path, store.session) == [generic]
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    finally:
+        connection.close()
+    # 再打开不再升级，照常新开运行。
+    open_store(data_dir).close()
+    assert len(read_sessions(path)) == 3

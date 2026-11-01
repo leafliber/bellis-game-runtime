@@ -1,8 +1,9 @@
-"""普通插件 `narrative`：按顺序处理 `scene@1` 的每个更新，在对白框画面上以 `ocr@1` 读文字，
+"""普通插件 `narrative`：按顺序处理 `scene@1` 的每个更新，按适配包的对白框以 `ocr@1` 读文字，
 逐句记录剧情，存本机 SQLite，提供 `narrative@1`。
 
 设计见 `docs/modules/narrative-planner.md` 的“剧情记录”。记录只取决于依次处理的 scene 更新与
-OCR 结果，不读墙钟；不调用 VLM 或其它模型，不外发，完整日志不出本机。
+OCR 结果，不读墙钟（读不读、节流都按帧的采集时刻）；不调用 VLM 或其它模型，不外发，完整日志
+不出本机。
 """
 
 import asyncio
@@ -36,9 +37,10 @@ from game_runtime.narrative.tracker import (
     SentenceTracker,
     TrackerParams,
     Unjudged,
+    Unread,
 )
 from game_runtime.ocr import OCR, OcrService
-from game_runtime.scene import SCENE, Outcome, SceneUpdate, Verdict
+from game_runtime.scene import SCENE, Outcome, SceneUpdate, Stability, Verdict
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +106,16 @@ NARRATIVE: Final = ServiceToken[NarrativeService]("narrative", 1)
 
 
 class NarrativeConfig(BaseModel):
-    """参数的含义见模块文档的“完整度”“处理顺序与积压”与“存储”。"""
+    """参数的含义见模块文档的“数据来源”“完整度”“处理顺序与积压”与“存储”。都是插件的缺省，
+    不按游戏调。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     complete_frames: Annotated[int, Field(ge=1)] = 3
     complete_after: Annotated[float, Field(ge=0.0, allow_inf_nan=False)] = 0.5
     """秒。"""
+    ocr_interval: Annotated[float, Field(ge=0.0, allow_inf_nan=False)] = 0.25
+    """秒：同一 ROI 两次读之间的采集时刻至少相隔这么久，相隔不够的帧跳过；0 即不节流。"""
     low_confidence: Annotated[float, Field(ge=0.0, le=1.0)] = 0.8
     max_backlog: Annotated[int, Field(ge=2)] = 600
     keep_sessions: Annotated[int, Field(ge=1)] = 20
@@ -123,6 +128,10 @@ class NarrativeConfig(BaseModel):
         if self.data_dir is not None and not self.data_dir.is_absolute():
             raise ValueError("data_dir 须为绝对路径")
         return self
+
+    @property
+    def ocr_interval_ns(self) -> int:
+        return round(self.ocr_interval * 1e9)
 
     def tracker_params(self) -> TrackerParams:
         return TrackerParams(
@@ -154,13 +163,16 @@ class _BoxItem:
 
     frame_number: int
     capture_ns: int
-    screen: str
+    screen: str | None
+    """对白框所在的画面；对白框没写画面时为 None。"""
     text: RoiPixels
     speaker: RoiPixels | None
     marker: bool
+    scope_screen: str | None
+    """本帧判出的坏结局或存读档类的画面。"""
 
 
-type _Item = _BoxItem | OtherScreen | Unjudged | Gap
+type _Item = _BoxItem | OtherScreen | Unjudged | Unread | Gap
 
 
 def _frame_number(item: _Item) -> int:
@@ -200,9 +212,16 @@ class Recorder:
         *,
         params: TrackerParams,
         max_backlog: int,
+        ocr_interval_ns: int = 0,
     ) -> None:
         self._adapter = adapter
-        self._boxes = {box.screen: box for box in boxes}
+        self._boxes = {box.screen: box for box in boxes if box.screen is not None}
+        """写了画面的对白框，按画面。"""
+        self._generic = next((box for box in boxes if box.screen is None), None)
+        """没写画面的对白框（通用缺省），至多一项。"""
+        self._ocr_interval = ocr_interval_ns
+        self._read_ns: dict[str, int] = {}
+        """每个 ROI 最近一次读的帧的采集时刻（节流）。"""
         self._scope_screens = frozenset(
             screen.id
             for screen in adapter.screens
@@ -337,26 +356,49 @@ class Recorder:
         self._wake.set()
 
     def _item(self, update: SceneUpdate) -> _Item:
+        """按对白框决定这一帧读不读：判为写了画面的对白框的画面即按它读；否则有没写画面的对白框、
+        且不是过场即按它读；节流（按采集时刻）跳过相隔不够的帧。"""
         state = update.state
-        if state.verdict is not Verdict.SCREEN or state.screen is None:
-            return Unjudged(state.frame_number)
-        box = self._boxes.get(state.screen)
+        judged = state.screen if state.verdict is Verdict.SCREEN else None
+        scope = judged if judged in self._scope_screens else None
+        box = None if judged is None else self._boxes.get(judged)
         if box is None:
-            return OtherScreen(
-                state.frame_number, state.screen, state.screen in self._scope_screens
-            )
+            if self._generic is None:
+                if judged is None:
+                    return Unjudged(state.frame_number)
+                return OtherScreen(state.frame_number, judged, scope is not None)
+            if state.stability is Stability.TRANSITION:
+                return Unread(state.frame_number, scope)
+            box = self._generic
+        if not self._due(box, state.capture_ns):
+            return Unread(state.frame_number, scope)
         frame = update.frame
         try:
             text = self._crop(frame, box.text)
             speaker = None if box.speaker is None else self._crop(frame, box.speaker)
         except ValueError as error:
             logger.warning("帧 %d 的对白框 ROI 拷不出来：%s", state.frame_number, error)
-            return Unjudged(state.frame_number)
+            return Unread(state.frame_number, scope)
+        for roi in box.rois:
+            self._read_ns[roi] = state.capture_ns
         marker = box.continue_signature is not None and any(
             result.id == box.continue_signature and result.outcome is Outcome.MATCH
             for result in state.signatures
         )
-        return _BoxItem(state.frame_number, state.capture_ns, box.screen, text, speaker, marker)
+        return _BoxItem(
+            state.frame_number, state.capture_ns, box.screen, text, speaker, marker, scope
+        )
+
+    def _due(self, box: DialogueBox, capture_ns: int) -> bool:
+        """节流：对白框的每个 ROI 距上次读都已不短于 `ocr_interval`（按采集时刻）。"""
+        interval = self._ocr_interval
+        if interval <= 0:
+            return True
+        for roi in box.rois:
+            last = self._read_ns.get(roi)
+            if last is not None and capture_ns - last < interval:
+                return False
+        return True
 
     def _crop(self, frame: RingFrame, roi: str) -> RoiPixels:
         rect = self._adapter.roi(roi).to_pixels(frame.width, frame.height)
@@ -396,11 +438,19 @@ class Recorder:
             if not self._ocr_failing:
                 logger.warning("帧 %d 的 OCR 出错，这一帧不改变记录：%s", item.frame_number, error)
                 self._ocr_failing = True
-            return Unjudged(item.frame_number)
+            return Unread(item.frame_number, item.scope_screen)
         if self._ocr_failing:
             logger.info("剧情记录的 OCR 已恢复")
             self._ocr_failing = False
-        return BoxFrame(item.frame_number, item.capture_ns, item.screen, text, speaker, item.marker)
+        return BoxFrame(
+            item.frame_number,
+            item.capture_ns,
+            item.screen,
+            text,
+            speaker,
+            item.marker,
+            item.scope_screen,
+        )
 
     async def _read(self, pixels: RoiPixels) -> Reading:
         """识别一个 ROI；像素与识别过的相同时沿用那次的结果。"""
@@ -503,6 +553,7 @@ class NarrativePlugin(Plugin[NarrativeConfig]):
             db,
             params=config.tracker_params(),
             max_backlog=config.max_backlog,
+            ocr_interval_ns=config.ocr_interval_ns,
         )
         recorder.start(f"{ctx.instance_id} 剧情记录")
         ctx.register(recorder.stop)

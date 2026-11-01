@@ -13,7 +13,14 @@ from typing import ClassVar
 
 import pytest
 
-from game_runtime.adapter import GAME_ADAPTER, GAMES_DIR, Adapter, GameAdapterPlugin, load_adapter
+from game_runtime.adapter import (
+    GAME_ADAPTER,
+    GAMES_DIR,
+    Adapter,
+    GameAdapterPlugin,
+    Language,
+    load_adapter,
+)
 from game_runtime.frame_ring import RingFrame
 from game_runtime.kernel import (
     EntryStatus,
@@ -52,6 +59,9 @@ from game_runtime.observe import (
     ObserveHub,
     PluginEvent,
     SceneEvent,
+    ScriptEvent,
+    ScriptResult,
+    ScriptWatch,
     VoiceEvent,
     banner,
     clock,
@@ -59,7 +69,7 @@ from game_runtime.observe import (
     summary,
 )
 from game_runtime.observe.display import Recording
-from game_runtime.ocr import OCR, OcrService
+from game_runtime.ocr import OCR, OcrService, Script, check_script
 from game_runtime.ocr.fake import ScriptedRecognizer, scripted_line
 from game_runtime.recording import NoControl, ResultsHub, narrative_problem
 from game_runtime.scene import (
@@ -137,12 +147,13 @@ def record(
     closed: int | None = None,
     low: tuple[LowConfidenceLine, ...] = (),
     at: int = 0,
+    screen: str | None = "dialogue",
 ) -> NarrativeRecord:
     return NarrativeRecord(
         session=1,
         occurrence=occurrence,
         scope=1,
-        screen="dialogue",
+        screen=screen,
         speaker=speaker,
         text=text,
         revision=revision,
@@ -180,14 +191,112 @@ def test_clock() -> None:
     assert clock(-500_000_000) == "-00:00.5"
 
 
-# 语言核对的时机
+# 语言核对：文字系统一层
+
+CHINESE = ["雨停了，钟楼的指针停在七点。", "你听见了吗？地下传来敲门声。", "门后也许有路。"]
+"""合成的中文句子。"""
+OTHERS = {
+    "japanese": "これはテストです。",
+    "korean": "안녕하세요, 반갑습니다.",
+    "latin": "The rain has stopped.",
+}
+"""合成的其它文字系统的句子。"""
+
+
+def closed(
+    occurrence: int, text: str, completeness: Completeness = Completeness.COMPLETE
+) -> NarrativeRecord:
+    return record(occurrence, text, completeness, closed=occurrence + 1, at=occurrence * SECOND)
+
+
+def feed_script(watch: ScriptWatch, records: list[NarrativeRecord]) -> list[ScriptEvent]:
+    """像 `observer` 那样：要核对的句子以 `check_script` 核对，收集结论。"""
+    events: list[ScriptEvent] = []
+    for item in records:
+        if watch.wants(item):
+            event = watch.add(item, check_script(item.text, watch.tag))
+            if event is not None:
+                events.append(event)
+    return events
+
+
+def test_three_chinese_sentences_match_the_chinese_version(synthetic: Adapter) -> None:
+    watch = ScriptWatch(synthetic)
+    assert (watch.tag, watch.script, watch.problem) == ("zh-Hans", Script.HAN, None)
+    records = [
+        record(1, "雨停", at=SECOND),  # 还在显示：不核对
+        closed(1, CHINESE[0]),
+        closed(2, "……"),  # 没有可数的字母：无从判断，不计
+        closed(3, "门后", Completeness.GAP),  # 缺口：不核对
+        closed(4, CHINESE[1]),
+        closed(5, CHINESE[2]),
+        closed(6, OTHERS["latin"]),  # 有了结论之后不再核对
+    ]
+
+    [event] = feed_script(watch, records)
+
+    assert event.result is ScriptResult.MATCH
+    assert [r.occurrence for r, _ in event.checks] == [1, 4, 5]
+    assert all(check.matches for _, check in event.checks)
+    assert (watch.result, watch.undecided, len(watch.checks)) == (ScriptResult.MATCH, 1, 3)
+    assert event.at_ns == 5 * SECOND
+
+
+@pytest.mark.parametrize("script", sorted(OTHERS))
+def test_another_script_does_not_match_the_chinese_version(synthetic: Adapter, script: str) -> None:
+    """合成的日文、韩文与拉丁字母的句子：任一句不符即不符，不等满 3 句。"""
+    watch = ScriptWatch(synthetic)
+
+    [event] = feed_script(
+        watch, [closed(1, CHINESE[0]), closed(2, OTHERS[script]), closed(3, CHINESE[1])]
+    )
+
+    assert event.result is ScriptResult.MISMATCH
+    mismatch, check = event.checks[-1]
+    assert (mismatch.occurrence, mismatch.text, check.matches) == (2, OTHERS[script], False)
+    assert watch.checks == list(event.checks)
+
+
+def test_an_unsupported_script_is_not_checked(synthetic: Adapter) -> None:
+    adapter = synthetic.model_copy(update={"language": Language(tag="ru", fixed_texts=())})
+    watch = ScriptWatch(adapter)
+
+    assert watch.script is None
+    assert watch.problem is not None
+    assert "语言 ru 的文字系统不受支持" in watch.problem
+    assert not watch.wants(closed(1, CHINESE[0]))
+
+
+def test_script_results_are_shown_and_logged(
+    synthetic: Adapter, caplog: pytest.LogCaptureFixture
+) -> None:
+    hub, collected, formatter = make_hub(synthetic)
+    caplog.set_level(logging.INFO, logger="game_runtime.observe")
+    match = ScriptWatch(synthetic)
+    mismatch = ScriptWatch(synthetic)
+    for event in feed_script(match, [closed(n + 1, text) for n, text in enumerate(CHINESE)]):
+        hub.on_script(event)
+    for event in feed_script(mismatch, [closed(1, CHINESE[0]), closed(2, OTHERS["japanese"])]):
+        hub.on_script(event)
+
+    assert [formatter.event(e) for e in collected.events] == [
+        "[00:03.0] 语言核对 文字系统相符（zh-Hans，汉字）：#1 100%、#2 100%、#3 100%",
+        "[00:02.0] 语言核对 文字系统不符（zh-Hans，汉字）：#2「これはテストです。」汉字占 0%",
+    ]
+    levels = [(r.levelno, r.getMessage()) for r in caplog.records if "文字系统" in r.getMessage()]
+    assert levels == [
+        (logging.INFO, "语言核对 文字系统：相符（3 句）"),
+        (logging.WARNING, "语言核对 文字系统：不符：#2“これはテストです。”汉字占 0%"),
+    ]
+
+
+# 语言核对：固定文字一层的时机
 
 
 def test_language_is_checked_on_the_first_stable_frame_of_each_appearance(
     synthetic: Adapter,
 ) -> None:
     watch = LanguageWatch(synthetic)
-    assert watch.problem is None
     assert watch.screens == ("title-menu",)
     assert len(watch.items) == 3
     menu, dialogue = "title-menu", "dialogue"
@@ -206,12 +315,15 @@ def test_language_is_checked_on_the_first_stable_frame_of_each_appearance(
         assert watch.observe(scene) == expected, scene.frame_number
 
 
-def test_language_check_of_the_witch_trial_is_not_calibrated(witch_trial: Adapter) -> None:
+def test_the_witch_trial_checks_only_the_script(witch_trial: Adapter) -> None:
+    """《魔女审判》没有声明固定文字：不做固定文字一层，文字系统一层照常（不用标定）。"""
     watch = LanguageWatch(witch_trial)
-    assert watch.problem is not None
-    assert "语言核对的固定文字尚未标定" in watch.problem
+    assert watch.items == ()
     assert watch.screens == ()
     assert watch.observe(state(1, Verdict.SCREEN, "dialogue")) is None
+    script = ScriptWatch(witch_trial)
+    assert (script.script, script.problem) == (Script.HAN, None)
+    assert script.wants(closed(1, CHINESE[0]))
 
 
 # 画面
@@ -408,8 +520,32 @@ def test_summary_counts_sentences_and_shares_of_time(synthetic: Adapter) -> None
         "  剧情记录：4 句，完整 2、部分 1、缺口 1；剧情范围 2，中断 1",
         "  画面判别（4 帧，4.0 秒）：对话（dialogue） 75%（3 帧）、不命中 25%（1 帧）",
         "  配音（10.0 秒）：忙 20%、闲 30%、未知（stalled） 40%、未知（starting） 10%",
-        "  语言核对：标题菜单（title-menu） 1 次，出错 1",
+        "  语言核对（文字系统）：没有完整的句子",
+        "  语言核对（固定文字）：标题菜单（title-menu） 1 次，出错 1",
     ]
+
+
+@pytest.mark.parametrize(
+    ("records", "expected"),
+    [
+        ([], "没有完整的句子"),
+        (["……"], "没有判断了的完整句子；另有 1 句无从判断，不计"),
+        (CHINESE[:2], "判断了 2 句，都相符，不到 3 句"),
+        ([*CHINESE[:1], "……", *CHINESE[1:]], "相符（#1、#3、#4）；另有 1 句无从判断，不计"),
+        ([CHINESE[0], OTHERS["korean"]], "不符（#2「안녕하세요, 반갑습니다.」汉字占 0%）"),
+    ],
+)
+def test_the_summary_gives_the_script_result(
+    synthetic: Adapter, records: list[str], expected: str
+) -> None:
+    hub, _, formatter = make_hub(synthetic)
+    assert hub.script is not None
+    feed_script(hub.script, [closed(n + 1, text) for n, text in enumerate(records)])
+    hub.end_ns = SECOND
+
+    lines = summary(formatter, narrative_problem=None)
+
+    assert f"  语言核对（文字系统）：{expected}" in lines
 
 
 def test_summary_without_narrative_voice_or_checks(witch_trial: Adapter) -> None:
@@ -419,7 +555,8 @@ def test_summary_without_narrative_voice_or_checks(witch_trial: Adapter) -> None
     assert lines[1].startswith("  剧情记录：不运行，适配包 witch-trial 的")
     assert lines[2] == "  画面判别：没有处理过任何帧"
     assert lines[3] == "  配音：voice-activity@1 没有激活"
-    assert lines[4] == "  语言核对：尚未标定，没有核对"
+    assert lines[4] == "  语言核对（文字系统）：不核对，不运行剧情记录"
+    assert lines[5] == "  语言核对（固定文字）：适配包没有声明，没有核对"
 
 
 def test_banner_lists_plugins_and_what_is_not_calibrated(witch_trial: Adapter) -> None:
@@ -452,7 +589,10 @@ def test_banner_lists_plugins_and_what_is_not_calibrated(witch_trial: Adapter) -
     assert lines[3] == "  ocr failed（activation-failed：模型制品不在）"
     assert lines[4].startswith("剧情记录：不运行，适配包 witch-trial 的")
     assert lines[5].startswith("尚未标定：ROI speaker（名字栏）")
-    assert lines[6].startswith("语言核对：尚未标定，不核对（适配包 witch-trial 的语言核对")
+    assert "固定文字" not in lines[5]
+    assert "阅读节奏" not in lines[5]
+    assert lines[6] == "语言核对（文字系统）：不核对，不运行剧情记录"
+    assert lines[7] == "语言核对（固定文字）：适配包没有声明，不核对"
     assert lines[-1] == "按回车或 Ctrl+C 停止。"
     recording = Recording(GAMES_DIR / "x", 50 * 10**9, 1_200_000)
     with_recording = banner(
@@ -467,6 +607,7 @@ def test_banner_lists_plugins_and_what_is_not_calibrated(witch_trial: Adapter) -
         with_recording[1]
         == f"帧环 2560×1440；录制到 {recording.path}（配额 50.00 GB，已用 1.2 MB）"
     )
+    assert "语言核对（文字系统）：zh-Hans 按汉字，核对剧情记录里前 3 句完整的句子" in with_recording
 
 
 def test_plugin_changes_are_shown_without_loading(synthetic: Adapter) -> None:
@@ -665,6 +806,9 @@ def test_observer_follows_services_and_checks_the_language() -> None:
         assert hub.voice_status is not None
         assert hub.voice_status.state is VoiceState.BUSY
         narrative.publish(record(1, "雨停了。", Completeness.COMPLETE))
+        # 结束的完整句子经 ocr@1 的 check_script 核对文字系统：3 句中文即相符。
+        for occurrence, text in enumerate(CHINESE, start=2):
+            narrative.publish(closed(occurrence, text))
         # 标题菜单的第一个已稳定帧：做一次语言核对。
         scene = Shared.scene
         assert scene is not None
@@ -676,13 +820,16 @@ def test_observer_follows_services_and_checks_the_language() -> None:
 
     asyncio.run(main())
     kinds = [type(e) for e in collected.events if not isinstance(e, PluginEvent)]
-    assert kinds == [VoiceEvent, LineEvent, SceneEvent, LanguageEvent]
+    # 第一句出现；之后三句各出现、结束一次，第三句结束时文字系统相符。
+    assert kinds == [VoiceEvent, *[LineEvent] * 7, ScriptEvent, SceneEvent, LanguageEvent]
+    [script] = [e for e in collected.events if isinstance(e, ScriptEvent)]
+    assert script.result is ScriptResult.MATCH
     [language] = [e for e in collected.events if isinstance(e, LanguageEvent)]
     assert language.result is LanguageResult.MATCH
     assert language.frame_number == 2
     # 停用时记下了剧情记录此刻的各句，退订后不再跟随。
     assert hub.final is not None
-    assert [r.text for r in hub.final.records] == ["雨停了。"]
+    assert [r.text for r in hub.final.records] == ["雨停了。", *CHINESE]
     assert hub.end_ns is not None
     assert hub.voice is None
     assert hub.narrative is None

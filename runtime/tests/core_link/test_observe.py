@@ -3,8 +3,8 @@
 序列、语言核对、停止的顺序与摘要；加 `--record` 时录制完整。
 
 OCR 用按真值作答的识别器（`TruthOcr`：合成游戏每显示一帧，就记下各 ROI 裁出的图像应读出的文字），
-配音检测用按音量判断的假模型，都不要模型文件；Windows 上跑命名文件映射，Linux 容器里跑 POSIX
-共享内存。真机经 WGC 的只读运行见 `test_observe_window.py`（手动）。
+配音检测用按音量判断的假模型，都不要模型文件；剧情记录按缺省的节流读对白框；Windows 上跑命名文件
+映射，Linux 容器里跑 POSIX 共享内存。真机经 WGC 的只读运行见 `test_observe_window.py`（手动）。
 """
 
 import asyncio
@@ -33,6 +33,8 @@ from game_runtime.observe import (
     LineEvent,
     LineKind,
     SceneEvent,
+    ScriptEvent,
+    ScriptResult,
     VoiceEvent,
 )
 from game_runtime.observe.cli import ObserveMonitor, observe
@@ -262,6 +264,10 @@ def languages(monitor: ObserveMonitor) -> list[LanguageEvent]:
     return [e for e in monitor.events if isinstance(e, LanguageEvent)]
 
 
+def scripts(monitor: ObserveMonitor) -> list[ScriptEvent]:
+    return [e for e in monitor.events if isinstance(e, ScriptEvent)]
+
+
 async def play(
     live: LiveOptions,
     player: Player,
@@ -270,8 +276,8 @@ async def play(
     quota: int | None = None,
     dialogue: bool = True,
 ) -> int:
-    """显示标题菜单直到做完语言核对；`dialogue` 时再进入开场对话，读完两句（其间发出 0.4 秒的
-    声音），推进到第三句；然后像 Ctrl+C 那样取消主任务，返回退出码。"""
+    """显示标题菜单直到做完固定文字的核对；`dialogue` 时再进入开场对话，读完三句（其间发出 0.4 秒
+    的声音），推进到选项，文字系统一层随之相符；然后像 Ctrl+C 那样取消主任务，返回退出码。"""
     showing = asyncio.create_task(player.show())
     observing = asyncio.create_task(
         observe(live, quota=quota, status_interval=0.5, monitor=monitor)
@@ -286,6 +292,9 @@ async def play(
             player.advance()
             await until(lambda: complete(monitor, 2))
             player.advance()
+            await until(lambda: complete(monitor, 3))
+            player.advance()
+            await until(lambda: scripts(monitor) or None)
             await sound
         await asyncio.sleep(0.3)
         observing.cancel()
@@ -350,7 +359,8 @@ def test_observing_the_synthetic_game_shows_its_events_and_a_summary(
         "插件：game active、ocr active、scene active、voice active、narrative active、"
         "observer active"
     )
-    assert "语言核对：标题菜单（title-menu）每次出现时核对，共 3 项" in lines
+    assert "语言核对（文字系统）：zh-Hans 按汉字，核对剧情记录里前 3 句完整的句子" in lines
+    assert "语言核对（固定文字）：标题菜单（title-menu）每次出现时核对，共 3 项" in lines
     # 事件的顺序：标题菜单 → 语言核对相符 → 对话 → 第一句出现、完整、结束 → 第二句 ……
     scenes = [e for e in monitor.events if isinstance(e, SceneEvent)]
     screens = [e.screen for e in scenes if e.verdict is Verdict.SCREEN]
@@ -369,14 +379,26 @@ def test_observing_the_synthetic_game_shows_its_events_and_a_summary(
     assert isinstance(order[0], LanguageEvent)
     assert isinstance(order[1], SceneEvent)
     sentences = [(e.record.occurrence, e.kind) for e in order[2:] if isinstance(e, LineEvent)]
-    assert sentences[:6] == [
+    assert sentences[:9] == [
         (1, LineKind.APPEAR),
         (1, LineKind.COMPLETE),
         (1, LineKind.CLOSE),
         (2, LineKind.APPEAR),
         (2, LineKind.COMPLETE),
         (2, LineKind.CLOSE),
+        (3, LineKind.APPEAR),
+        (3, LineKind.COMPLETE),
+        (3, LineKind.CLOSE),
     ]
+    # 文字系统一层：前三句完整的中文句子都相符，在第三句结束之后显示。
+    [script] = scripts(monitor)
+    assert script.result is ScriptResult.MATCH
+    assert [(r.occurrence, r.text) for r, _ in script.checks] == [
+        (n, line.text) for n, line in enumerate(INTRO.lines, start=1)
+    ]
+    shown = monitor.formatter.event(script)
+    assert shown.endswith("语言核对 文字系统相符（zh-Hans，汉字）：#1 100%、#2 100%、#3 100%")
+    assert shown in lines
     first, second = (complete(monitor, n) for n in (1, 2))
     assert first is not None
     assert second is not None
@@ -408,13 +430,14 @@ def test_observing_the_synthetic_game_shows_its_events_and_a_summary(
         f"部分 {counts[Completeness.PARTIAL]}、缺口 {counts[Completeness.GAP]}；剧情范围 1，中断 0"
     )
     assert len(records) >= 3
-    assert counts[Completeness.COMPLETE] >= 2
+    assert counts[Completeness.COMPLETE] >= 3
     assert summary[2].startswith("  画面判别（")
     assert "标题菜单（title-menu）" in summary[2]
     assert "对话（dialogue）" in summary[2]
     assert summary[3].startswith("  配音（")
     assert "忙 " in summary[3]
-    assert summary[4] == "  语言核对：标题菜单（title-menu） 1 次，相符 1"
+    assert summary[4] == "  语言核对（文字系统）：相符（#1、#2、#3）"
+    assert summary[5] == "  语言核对（固定文字）：标题菜单（title-menu） 1 次，相符 1"
     assert "已停止（interrupt）" in out
     assert "实时核：shutdown，退出码 0" in out
     # 不录制：不建录制目录；剧情记录写进本地数据目录，就是实时运行的剧情记录。
@@ -462,7 +485,8 @@ def test_a_changed_fixed_text_is_reported_as_a_mismatch(
         )
         for line in lines
     )
-    assert "  语言核对：标题菜单（title-menu） 1 次，不符 1" in lines
+    assert "  语言核对（固定文字）：标题菜单（title-menu） 1 次，不符 1" in lines
+    assert "  语言核对（文字系统）：没有完整的句子" in lines
 
 
 def test_observing_with_record_finishes_the_recording(
@@ -501,4 +525,5 @@ def test_observing_with_record_finishes_the_recording(
     stored = read_records(store_path(live, "synthetic-game"), records[0].session)
     assert [r.text for r in stored] == [r.text for r in records]
     assert not store_path(data_dir, "synthetic-game").exists()
-    assert "  语言核对：标题菜单（title-menu） 1 次，相符 1" in lines
+    assert "  语言核对（文字系统）：相符（#1、#2、#3）" in lines
+    assert "  语言核对（固定文字）：标题菜单（title-menu） 1 次，相符 1" in lines

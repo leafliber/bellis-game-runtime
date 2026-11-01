@@ -68,8 +68,10 @@ def test_a_valid_package_passes_and_its_uncalibrated_items_are_listed(
     out = capsys.readouterr().out
     assert "ok   sample：样例 1" in out
     assert "尚未标定：ROI speaker（名字栏）" in out
-    assert "尚未标定：语言核对的固定文字" in out
-    assert "尚未标定：阅读节奏" in out
+    # 空的固定文字与没写的阅读节奏不是标定项。
+    assert "固定文字" not in out
+    assert "阅读节奏" not in out
+    assert out.count("尚未标定") == 1
 
 
 def test_an_invalid_package_fails_with_every_problem(

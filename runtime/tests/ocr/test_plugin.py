@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import dataclasses
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,15 @@ from game_runtime.kernel import (
     catalog,
 )
 from game_runtime.local_data import DATA_DIR_ENV
-from game_runtime.ocr import OCR, OcrClosedError, OcrPlugin, OcrService, Recognizer
+from game_runtime.ocr import (
+    DEFAULT_MODEL_SET,
+    MODEL_SETS,
+    OCR,
+    OcrClosedError,
+    OcrPlugin,
+    OcrService,
+    Recognizer,
+)
 from game_runtime.ocr import plugin as ocr_plugin
 from game_runtime.ocr.engine import EngineOptions
 from game_runtime.ocr.fake import ScriptedRecognizer, scripted_line
@@ -227,6 +236,37 @@ def test_a_language_the_models_were_not_checked_on_fails_activation(
         assert "语言 ja 不在模型组 ppocrv5-mobile 核对过的语言（zh-Hans）里" in (
             status.reasons[0].message
         )
+        await k.shutdown()
+
+    asyncio.run(scenario())
+    assert loaded == []
+
+
+def test_a_language_whose_script_is_not_supported_fails_activation(
+    tmp_path: Path, loaded: list[tuple[ModelSet, EngineOptions]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """模型组核对过这个语言，但它的文字系统不受支持（`zh-Latn`）：同样激活失败，不加载模型。"""
+    mobile = MODEL_SETS[DEFAULT_MODEL_SET]
+    monkeypatch.setattr(
+        ocr_plugin,
+        "MODEL_SETS",
+        {DEFAULT_MODEL_SET: dataclasses.replace(mobile, languages=frozenset({"zh"}))},
+    )
+    source = (GAMES_DIR / "synthetic-game" / ADAPTER_FILE).read_text(encoding="utf-8")
+    package = tmp_path / "synthetic-game"
+    package.mkdir()
+    (package / ADAPTER_FILE).write_text(
+        source.replace('tag = "zh-Hans"', 'tag = "zh-Latn"'), encoding="utf-8"
+    )
+
+    async def scenario() -> None:
+        k = kernel()
+        k.add([game(tmp_path), entry("ocr", "ocr")])
+        await k.settled()
+
+        status = k.status("ocr")
+        assert status.state is State.FAILED
+        assert "语言 zh-Latn 的文字系统不受支持" in status.reasons[0].message
         await k.shutdown()
 
     asyncio.run(scenario())

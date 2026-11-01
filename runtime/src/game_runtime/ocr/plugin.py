@@ -16,14 +16,11 @@ from game_runtime.kernel import Manifest, Plugin, PluginContext, ServiceToken, T
 from game_runtime.local_data import local_data_dir
 from game_runtime.ocr.engine import EngineOptions, OcrEngine, Recognizer
 from game_runtime.ocr.models import DEFAULT_MODEL_SET, MODEL_SETS, ModelSet, ModelSetName
-from game_runtime.ocr.service import OcrService
+from game_runtime.ocr.script import script_of, supported_languages
+from game_runtime.ocr.service import OcrService, UnsupportedLanguageError
 
 OCR = ServiceToken[OcrService]("ocr", 1)
 """对给定帧的 ROI 识别文字、执行语言核对。`scene@1` 以 `TextReader` 取用同一个服务。"""
-
-
-class UnsupportedLanguageError(Exception):
-    """适配包声明的语言版本不在模型组核对过的语言里。"""
 
 
 class OcrConfig(BaseModel):
@@ -71,6 +68,10 @@ class OcrPlugin(Plugin[OcrConfig]):
             raise UnsupportedLanguageError(
                 f"适配包 {adapter.id} 的语言 {tag} 不在模型组 {model_set.name} 核对过的语言"
                 f"（{supported}）里"
+            )
+        if script_of(tag) is None:
+            raise UnsupportedLanguageError(
+                f"适配包 {adapter.id} 的语言 {tag} 的文字系统不受支持；支持 {supported_languages()}"
             )
         options = EngineOptions(
             threads=ctx.config.threads, min_confidence=ctx.config.min_confidence

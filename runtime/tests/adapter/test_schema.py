@@ -89,6 +89,7 @@ min_action_interval = 0.5
 read_base = 1
 read_per_char = 0.05
 voice_unknown_wait = 6
+voice_busy_wait = 12
 
 [[signatures]]
 id = "menu"
@@ -152,7 +153,9 @@ def test_minimal_declaration_is_valid() -> None:
     assert not adapter.whitelist.allows_hold
     assert adapter.roi("start") == NormalizedRect(0.25, 0.5, 0.75, 0.75)
     assert isinstance(adapter.roi("client").right, float)
-    assert adapter.uncalibrated() == ("阅读节奏",)
+    # 阅读节奏是可选的覆盖，没写即用通用缺省，不是尚未标定。
+    assert adapter.pacing is None
+    assert adapter.uncalibrated() == ()
 
 
 def test_full_declaration_with_extension_signature_pacing_and_notes_is_valid() -> None:
@@ -163,9 +166,11 @@ def test_full_declaration_with_extension_signature_pacing_and_notes_is_valid() -
     signature = adapter.signatures[0]
     assert signature.calibrated
     assert signature.pixels[0].at == (0.5, 0.25)
-    pacing = adapter.require_pacing()
+    pacing = adapter.pacing
+    assert pacing is not None
     # 重读的阅读时间缺省与首读相同。
     assert (pacing.reread_base, pacing.reread_per_char) == (1.0, 0.05)
+    assert (pacing.voice_unknown_wait, pacing.voice_busy_wait) == (6.0, 12.0)
     assert adapter.notes[0].title == "人物"
     assert adapter.uncalibrated() == ()
 
@@ -189,6 +194,7 @@ def test_roi_converts_to_client_pixels() -> None:
 
 
 def test_uncalibrated_items_are_listed_and_using_them_raises() -> None:
+    """尚未标定的只有没有 `rect` 的 ROI 与没有组成项的签名；空的固定文字与没写的阅读节奏不算。"""
     data = declaration()
     data["rois"]["speaker"] = {"title": "名字栏"}
     data["language"]["fixed_texts"] = []
@@ -196,22 +202,14 @@ def test_uncalibrated_items_are_listed_and_using_them_raises() -> None:
 
     adapter = Adapter.model_validate(data)
 
-    assert adapter.uncalibrated() == (
-        "ROI speaker（名字栏）",
-        "签名 menu",
-        "语言核对的固定文字",
-        "阅读节奏",
-    )
+    assert adapter.uncalibrated() == ("ROI speaker（名字栏）", "签名 menu")
     assert not adapter.signatures[0].calibrated
-    for use, item in (
-        (lambda: adapter.roi("speaker"), "ROI speaker（名字栏）"),
-        (adapter.require_pacing, "阅读节奏"),
-        (adapter.language_check, "语言核对的固定文字"),
-    ):
-        with pytest.raises(NotCalibratedError) as caught:
-            use()
-        assert (caught.value.game, caught.value.item) == ("sample", item)
-        assert str(caught.value) == f"适配包 sample 的{item}尚未标定"
+    assert adapter.language.fixed_texts == ()
+    assert adapter.pacing is None
+    with pytest.raises(NotCalibratedError) as caught:
+        adapter.roi("speaker")
+    assert (caught.value.game, caught.value.item) == ("sample", "ROI speaker（名字栏）")
+    assert str(caught.value) == "适配包 sample 的ROI speaker（名字栏）尚未标定"
     with pytest.raises(LookupError, match="没有声明 ROI missing"):
         adapter.roi("missing")
 
@@ -477,6 +475,7 @@ REJECTED: list[tuple[str, Mutation, str]] = [
                 "read_per_char": 0.05,
                 "reread_base": 2,
                 "voice_unknown_wait": 6,
+                "voice_busy_wait": 12,
             },
         ),
         "pacing：reread_base 不能比 read_base 长",
@@ -490,9 +489,37 @@ REJECTED: list[tuple[str, Mutation, str]] = [
                 "read_base": 1,
                 "read_per_char": 0.05,
                 "voice_unknown_wait": 0,
+                "voice_busy_wait": 12,
             },
         ),
         "pacing.voice_unknown_wait：Input should be greater",
+    ),
+    (
+        "zero busy wait",
+        put(
+            "pacing",
+            {
+                "min_action_interval": 0.5,
+                "read_base": 1,
+                "read_per_char": 0.05,
+                "voice_unknown_wait": 6,
+                "voice_busy_wait": 0,
+            },
+        ),
+        "pacing.voice_busy_wait：Input should be greater",
+    ),
+    (
+        "pacing without the busy wait",
+        put(
+            "pacing",
+            {
+                "min_action_interval": 0.5,
+                "read_base": 1,
+                "read_per_char": 0.05,
+                "voice_unknown_wait": 6,
+            },
+        ),
+        "pacing.voice_busy_wait：Field required",
     ),
 ]
 
@@ -663,6 +690,24 @@ def test_dialogue_boxes_may_reference_uncalibrated_items() -> None:
     assert caught.value.item == "对白框的ROI speaker（名字栏）、继续标记的签名 talk-continue"
 
 
+def test_a_dialogue_box_without_a_screen_is_the_generic_default() -> None:
+    """不写 `screen` 的对白框至多一项，可与写了的并存；它的继续标记指向对话类的画面。"""
+    data = dialogue_declaration()
+    data["dialogue_boxes"][1] = {"speaker": "speaker", "text": "line"}
+    data["signatures"].append(
+        {"id": "any-continue", "screen": "narration", "pixels": data["signatures"][0]["pixels"]}
+    )
+
+    adapter = Adapter.model_validate(data)
+    talk, generic = adapter.require_dialogue_boxes()
+    assert (talk.screen, generic.screen) == ("talk", None)
+    assert generic.rois == ("speaker", "line")
+
+    data["dialogue_boxes"] = [{"text": "line", "continue_signature": "any-continue"}]
+    [only] = Adapter.model_validate(data).require_dialogue_boxes()
+    assert (only.screen, only.continue_signature) == (None, "any-continue")
+
+
 def test_without_dialogue_boxes_requiring_them_is_a_lookup_error() -> None:
     adapter = Adapter.model_validate(declaration())
 
@@ -700,6 +745,19 @@ DIALOGUE_REJECTED: list[tuple[str, Mutation, str]] = [
     ),
     ("two boxes on one screen", box(screen="narration"), "dialogue_boxes：narration 重复"),
     ("unknown field", box(name_plate="speaker"), "Extra inputs are not permitted"),
+    (
+        "two boxes without a screen",
+        put("dialogue_boxes", [{"text": "line"}, {"text": "speaker"}]),
+        "dialogue_boxes：不写 screen 的对白框至多一项",
+    ),
+    (
+        "generic box with a continue signature on a menu",
+        put(
+            "dialogue_boxes",
+            [{"text": "line", "continue_signature": "menu-continue"}],
+        ),
+        "签名 menu-continue 指向画面 menu，类型是 菜单，不是对话类的画面",
+    ),
 ]
 
 
@@ -709,6 +767,7 @@ DIALOGUE_REJECTED: list[tuple[str, Mutation, str]] = [
 )
 def test_invalid_dialogue_box_is_rejected(mutate: Mutation, expected: str) -> None:
     data = dialogue_declaration()
+    data["signatures"].append({"id": "menu-continue", "screen": "menu"})
     mutate(data)
 
     found = problems(data)

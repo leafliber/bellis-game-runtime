@@ -2,14 +2,16 @@
 合成游戏渲染、经帧源逐帧交给 `scene@1`。
 
 真值来自合成游戏的状态机：哪一句（测试自己按推进记下）、说话人、已显示的文字与是否显示完。`Play`
-按模块文档的规则从真值算出应有的记录，与 `narrative@1` 的记录逐句比较；名字栏与对白文字的 OCR 用
-按真值作答的识别器（`TruthRecognizer`），标 `ocr_model` 的一项用真实模型。
+按模块文档的规则从真值算出应有的记录（含按采集时刻的 OCR 节流），与 `narrative@1` 的记录逐句比较；
+名字栏与对白文字的 OCR 用按真值作答的识别器（`TruthRecognizer`），标 `ocr_model` 的一项用真实模型。
+除专门测节流的一项外都关掉节流（`ocr_interval` 为 0），每个对白框帧都读。
 """
 
 import asyncio
 import collections
 import dataclasses
 import hashlib
+import itertools
 import logging
 import threading
 import time
@@ -84,12 +86,15 @@ from game_runtime.scene import (
     SCENE,
     ScenePlugin,
     SceneService,
+    SceneState,
+    SceneUpdate,
     SignatureJudge,
+    Stability,
     bgra_view,
 )
 from game_runtime.scene import Outcome as SignatureOutcome
 from synthetic_game import Click, GameConfig, ManualClock, SceneType, SyntheticGame, Truth
-from synthetic_game.story import NODES, Dialogue, Line
+from synthetic_game.story import NODES, UI, Dialogue, Line
 
 FRAME: Final = 1 / 30
 WAIT: Final = 30.0
@@ -302,13 +307,20 @@ class Play:
         *,
         marker: bool = True,
         params: TrackerParams = PARAMS,
+        interval_ns: int = 0,
         size: tuple[int, int] = (1280, 720),
+        elsewhere: Callable[[Truth], dict[str, str]] | None = None,
     ) -> None:
         self.frames = frames
         self.adapter = adapter
         self.recognizer = recognizer
         self.marker = marker
         self.params = params
+        self.interval_ns = interval_ns
+        """节流：两次读至少相隔这么久（采集时刻）。"""
+        self.last_read: int | None = None
+        self.elsewhere = elsewhere
+        """不是对话（或有弹窗）的帧上，对白框的两个 ROI 应读出的文字；不写即不教。"""
         self.clock = ManualClock()
         self.game = SyntheticGame(GameConfig(*size), self.clock)
         self.number = 0
@@ -351,6 +363,9 @@ class Play:
             self.recognizer.teach(frame, self.adapter.roi("speaker").to_pixels(*size), speaker)
             text_rect = self.adapter.roi("dialogue").to_pixels(*size)
             self.recognizer.teach(frame, text_rect, truth.visible_text)
+        elif self.elsewhere is not None:
+            for roi, text in self.elsewhere(truth).items():
+                self.recognizer.teach(frame, self.adapter.roi(roi).to_pixels(*size), text)
         # 画面签名的固定文字项（标题菜单的“开始”、坏结局的“重来”）：ROI 里的按钮文字。
         for signature in self.adapter.signatures:
             for item in signature.texts:
@@ -373,6 +388,13 @@ class Play:
             if truth.scene is SceneType.BAD_ENDING:
                 self.scope_pending = True
             return
+        if (
+            self.interval_ns
+            and self.last_read is not None
+            and capture_ns - self.last_read < self.interval_ns
+        ):
+            return  # 节流：相隔不够，这一帧不读
+        self.last_read = capture_ns
         current = self.current
         if current is not None and current.serial != self.serial:
             self._close(number)
@@ -534,8 +556,11 @@ class Rig:
     games_dir: Path = GAMES_DIR
     real_ocr: bool = False
     marker: bool = True
+    ocr_interval: float = 0.0
+    """`narrative@1` 的节流；除专门测它的一项外关掉。"""
     narrative: dict[str, Any] = field(default_factory=dict[str, Any])
     pace_narrative: bool = False
+    elsewhere: Callable[[Truth], dict[str, str]] | None = None
 
     @property
     def adapter(self) -> Adapter:
@@ -548,11 +573,13 @@ class Rig:
             entry("game", "game-adapter", game),
             entry("ocr", "ocr" if self.real_ocr else "fake-ocr"),
             entry("scene", "scene", {"data_dir": data}, [FRAMES_READ]),
-            entry(
-                "narrative", "narrative", {"data_dir": data, **self.narrative}, [NARRATIVE_WRITE]
-            ),
+            entry("narrative", "narrative", {"data_dir": data, **self.config}, [NARRATIVE_WRITE]),
             entry("probe", "probe"),
         ]
+
+    @property
+    def config(self) -> dict[str, Any]:
+        return {"ocr_interval": self.ocr_interval, **self.narrative}
 
     async def run(self, script: Script) -> RunResult:
         frames = FeedSource()
@@ -571,13 +598,15 @@ class Rig:
         assert scene is not None
         assert narrative is not None
         recognizer = Shared.recognizer
-        params = NarrativeConfig.model_validate(self.narrative).tracker_params()
+        config = NarrativeConfig.model_validate(self.config)
         play = Play(
             frames,
             self.adapter,
             None if self.real_ocr or not isinstance(recognizer, TruthRecognizer) else recognizer,
             marker=self.marker,
-            params=params,
+            params=config.tracker_params(),
+            interval_ns=config.ocr_interval_ns,
+            elsewhere=self.elsewhere,
         )
 
         async def pace(number: int) -> None:
@@ -686,6 +715,125 @@ def test_the_same_frames_give_the_same_records(data_dir: Path) -> None:
     assert [dataclasses.replace(s, session=0) for s in first.scopes] == [
         dataclasses.replace(s, session=0) for s in second.scopes
     ]
+
+
+def test_reading_is_throttled_by_capture_time(data_dir: Path) -> None:
+    """缺省的节流：同一 ROI 两次读至少相隔 0.25 秒（采集时刻），其间的帧跳过、不计入连续帧数。记录
+    与按同样规则从真值算出的逐句相同，识别少得多；同样的帧跑两次得到同样的记录（回放）。"""
+    unthrottled = asyncio.run(Rig(data_dir).run(full_story))
+    every_frame = Shared.recognizer
+    assert isinstance(every_frame, TruthRecognizer)
+
+    Shared.recognizer = TruthRecognizer()
+    rig = Rig(data_dir, ocr_interval=NarrativeConfig().ocr_interval)
+    throttled = asyncio.run(rig.run(full_story))
+    recognizer = Shared.recognizer
+    assert isinstance(recognizer, TruthRecognizer)
+
+    check(throttled)
+    assert recognizer.misses == 0
+    assert recognizer.calls * 3 < every_frame.calls
+    assert sum(r.revision for r in throttled.records) < sum(r.revision for r in unthrottled.records)
+    # 读过的帧（每句的首帧、最近一次变化的帧与最后出现的帧）的采集时刻都相隔不短于 0.25 秒。
+    read = sorted(
+        {e.first_ns for e in throttled.expected}
+        | {e.changed_ns for e in throttled.expected}
+        | {e.last_ns for e in throttled.expected}
+    )
+    assert all(b - a >= 250_000_000 for a, b in itertools.pairwise(read))
+
+    Shared.recognizer = TruthRecognizer()
+    again = asyncio.run(rig.run(full_story))
+    assert [dataclasses.replace(r, session=0) for r in again.records] == [
+        dataclasses.replace(r, session=0) for r in throttled.records
+    ]
+
+
+def _without_screen(root: Path, *, keep: bool = False) -> Path:
+    """合成游戏的适配包，对白框不写 `screen`（通用缺省）；`keep` 时另留着写了 `screen` 的一项。"""
+    games = root / "games" / "synthetic-game"
+    games.mkdir(parents=True)
+    source = (GAMES_DIR / "synthetic-game" / ADAPTER_FILE).read_text(encoding="utf-8")
+    box = (
+        '[[dialogue_boxes]]\nscreen = "dialogue"\nspeaker = "speaker"\ntext = "dialogue"\n'
+        'continue_signature = "dialogue-continue"\n'
+    )
+    assert source.count(box) == 1
+    generic = box.replace('screen = "dialogue"\n', "")
+    (games / ADAPTER_FILE).write_text(
+        source.replace(box, (box + "\n" if keep else "") + generic), encoding="utf-8"
+    )
+    return root / "games"
+
+
+def _menu_help_in_the_box(truth: Truth) -> dict[str, str]:
+    """标题菜单上，对白文字的 ROI 盖住了“说明”按钮的下半：假定 OCR 读出它；别处读不出文字。"""
+    if truth.scene is SceneType.MENU and truth.overlay is None:
+        return {"speaker": "", "dialogue": UI.menu_help}
+    return {"speaker": "", "dialogue": ""}
+
+
+@pytest.mark.parametrize("keep", [False, True], ids=["generic only", "with a dialogue box"])
+def test_a_box_without_a_screen_reads_every_frame_that_is_not_a_transition(
+    data_dir: Path, root: Path, keep: bool
+) -> None:
+    """不写 `screen` 的对白框：在每个不是过场的帧上读，判别结果不限。对白照样逐句记下；别的画面
+    落在 ROI 里的文字也记成句子（标题菜单的“说明”）；离开对白时由读到的空文字结束这一句，过场的帧
+    不读；坏结局照样开始新的范围。与写了 `screen` 的一项并存时，对话画面按那一项读。"""
+    states: dict[int, SceneState] = {}
+    marks: dict[str, int] = {}
+
+    async def script(play: Play) -> None:
+        scene = Shared.scene
+        assert scene is not None
+
+        def remember(update: SceneUpdate) -> None:
+            states[update.state.frame_number] = update.state
+
+        scene.subscribe(remember)
+        await play.watch(3)
+        await play.click("menu.start")
+        await play.read()
+        await play.read()
+        await play.watch(3)
+        await play.skip()  # 第三句没显示完就被推进，进入选项
+        marks["choice"] = play.number
+        await play.watch(4)
+        await play.click("choice.2")  # 回去睡觉：坏结局
+        await play.watch(3)
+        await play.click("ending.retry")
+        await play.watch(1, 1.0)
+        await play.watch(2)
+
+    games = _without_screen(root, keep=keep)
+    rig = Rig(data_dir, games_dir=games, elsewhere=_menu_help_in_the_box)
+    outcome = asyncio.run(rig.run(script))
+
+    intro = NODES["intro"]
+    assert isinstance(intro, Dialogue)
+    records = outcome.records
+    assert [r.text for r in records[:3]] == [UI.menu_help, intro.lines[0].text, intro.lines[1].text]
+    assert intro.lines[2].text.startswith(records[3].text)
+    assert [r.completeness for r in records[:4]] == [
+        Completeness.GAP,  # 菜单上的“说明”：没等到完整就进了对话
+        Completeness.COMPLETE,
+        Completeness.COMPLETE,
+        Completeness.GAP,
+    ]
+    dialogue_screen = "dialogue" if keep else None
+    assert [r.screen for r in records[:4]] == [None, *[dialogue_screen] * 3]
+    # 第三句由选项画面上第一个不是过场的帧结束：过场的帧不读，不结束它。
+    closed = records[3].closed_frame
+    assert closed is not None
+    first = marks["choice"]
+    assert closed == min(
+        n for n, s in states.items() if n >= first and s.stability is not Stability.TRANSITION
+    )
+    # 重来之后的一句在新的范围里。
+    assert [(s.scope, s.after_screen) for s in outcome.scopes] == [(1, None), (2, "bad-ending")]
+    assert records[-1].scope == 2
+    assert records[-1].text == intro.lines[0].text
+    assert outcome.stored == list(records)
 
 
 def test_the_same_text_after_the_box_clears_is_a_new_sentence(

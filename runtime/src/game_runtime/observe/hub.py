@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from game_runtime.adapter import Adapter, NotCalibratedError
+from game_runtime.adapter import Adapter
 from game_runtime.kernel import Reason, State, Transition
 from game_runtime.narrative import (
     Completeness,
@@ -21,7 +21,8 @@ from game_runtime.narrative import (
     NarrativeService,
     Scope,
 )
-from game_runtime.ocr import LanguageCheck
+from game_runtime.ocr import SCRIPT_SENTENCES, LanguageCheck, Script, ScriptCheck, script_of
+from game_runtime.ocr.script import supported_languages
 from game_runtime.scene import SceneState, Stability, Verdict
 from game_runtime.voice_activity import (
     INITIAL_STATUS,
@@ -95,7 +96,7 @@ class LanguageResult(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class LanguageEvent:
-    """一次语言核对的结果。"""
+    """固定文字一层的一次核对的结果。"""
 
     at_ns: int
     frame_number: int
@@ -104,6 +105,26 @@ class LanguageEvent:
     check: LanguageCheck | None
     """核对的各项；出错时为 None。"""
     error: str | None = None
+
+
+class ScriptResult(StrEnum):
+    MATCH = "match"
+    """前几句判断了的完整句子都相符。"""
+    MISMATCH = "mismatch"
+    """有一句不符。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptEvent:
+    """文字系统一层的结论：相符或不符。"""
+
+    result: ScriptResult
+    checks: tuple[tuple[NarrativeRecord, ScriptCheck], ...]
+    """判断了的各句与核对，按结束的顺序；不符时最后一项是不符的那一句。"""
+
+    @property
+    def at_ns(self) -> int:
+        return self.checks[-1][0].last_ns
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,29 +136,68 @@ class PluginEvent:
     reasons: tuple[Reason, ...]
 
 
-type Event = SceneEvent | VoiceEvent | LineEvent | LanguageEvent | PluginEvent
+type Event = SceneEvent | VoiceEvent | LineEvent | LanguageEvent | ScriptEvent | PluginEvent
 type EventSink = Callable[[Event], None]
 
 
 # 语言核对的时机
 
 
+class ScriptWatch:
+    """文字系统一层：剧情记录每结束一句完整的句子，核对它的文字；无从判断的句子不计。前
+    `SCRIPT_SENTENCES` 句判断了的都相符即相符，任一句不符即不符；有了结论之后不再核对。"""
+
+    def __init__(self, adapter: Adapter) -> None:
+        self.tag = adapter.language.tag
+        self.script: Script | None = script_of(self.tag)
+        self.problem: str | None = (
+            None
+            if self.script is not None
+            else f"语言 {self.tag} 的文字系统不受支持（支持 {supported_languages()}）"
+        )
+        """文字系统不受支持时的原因；否则为 None。"""
+        self.checks: list[tuple[NarrativeRecord, ScriptCheck]] = []
+        """判断了的各句与核对。"""
+        self.undecided = 0
+        """无从判断（没有可数的字母）而不计的句数。"""
+        self.result: ScriptResult | None = None
+
+    def wants(self, record: NarrativeRecord) -> bool:
+        """这一次变化是不是要核对的：结束了的完整的句子，还没有结论。"""
+        return (
+            self.script is not None
+            and self.result is None
+            and record.closed
+            and record.completeness is Completeness.COMPLETE
+        )
+
+    def add(self, record: NarrativeRecord, check: ScriptCheck) -> ScriptEvent | None:
+        """记下一句的核对；有了结论时返回它。"""
+        if self.result is not None:
+            return None
+        if check.matches is None:
+            self.undecided += 1
+            return None
+        self.checks.append((record, check))
+        if not check.matches:
+            self.result = ScriptResult.MISMATCH
+        elif len(self.checks) >= SCRIPT_SENTENCES:
+            self.result = ScriptResult.MATCH
+        else:
+            return None
+        return ScriptEvent(self.result, tuple(self.checks))
+
+
 class LanguageWatch:
-    """决定何时做语言核对：声明了固定文字的画面每次出现，在它的第一个已稳定帧上核对一次。
+    """固定文字一层何时核对：声明了固定文字的画面每次出现，在它的第一个已稳定帧上核对一次。
 
     一次出现从判出这个画面起，到判出另一个画面止；其间的不命中、不可判、歧义与停用不算离开。
+    固定文字为空时不核对。
     """
 
     def __init__(self, adapter: Adapter) -> None:
-        self.problem: str | None = None
-        """固定文字为空即尚未标定：原因；否则为 None。"""
-        try:
-            items = adapter.language_check()
-        except NotCalibratedError as error:
-            items = ()
-            self.problem = str(error)
-        self.items = items
-        self.screens: tuple[str, ...] = tuple(dict.fromkeys(item.screen for item in items))
+        self.items = adapter.language.fixed_texts
+        self.screens: tuple[str, ...] = tuple(dict.fromkeys(item.screen for item in self.items))
         """声明了固定文字的画面，按声明的顺序。"""
         self._appearance: str | None = None
         self._checked = False
@@ -226,6 +286,9 @@ class ObserveHub:
         """显示的时刻从这里起算：命令开始的一刻（采集时钟）。"""
         self.adapter: Adapter | None = None
         self.language: LanguageWatch | None = None
+        """固定文字一层；`observer` 激活之前为 None。"""
+        self.script: ScriptWatch | None = None
+        """文字系统一层；`observer` 激活之前为 None。"""
         self.scene_problems: tuple[str, ...] = ()
         self.scene: SceneState | None = None
         """最近一帧的判别结果。"""
@@ -248,14 +311,19 @@ class ObserveHub:
 
     # 插件一侧
 
-    def attach(self, adapter: Adapter, *, scene_problems: tuple[str, ...]) -> LanguageWatch:
-        """`observer` 激活时调用；返回这次运行的语言核对时机。"""
+    def attach(
+        self, adapter: Adapter, *, scene_problems: tuple[str, ...]
+    ) -> tuple[LanguageWatch, ScriptWatch]:
+        """`observer` 激活时调用；返回这次运行的固定文字一层的时机与文字系统一层。"""
         self.adapter = adapter
         self.scene_problems = scene_problems
         self.language = LanguageWatch(adapter)
-        if self.language.problem is not None:
-            logger.warning("语言核对：%s，不核对", self.language.problem)
-        return self.language
+        self.script = ScriptWatch(adapter)
+        if self.script.problem is not None:
+            logger.warning("语言核对的文字系统一层：%s，不核对", self.script.problem)
+        if not self.language.items:
+            logger.info("语言核对：适配包没有声明固定文字，只做文字系统一层")
+        return self.language, self.script
 
     def on_scene(self, state: SceneState) -> None:
         previous = self.scene
@@ -327,6 +395,21 @@ class ObserveHub:
             logger.warning("语言核对 %s：不符：%s", event.screen, items)
         else:
             logger.warning("语言核对 %s：出错：%s", event.screen, event.error)
+        self.sink(event)
+
+    def on_script(self, event: ScriptEvent) -> None:
+        if event.result is ScriptResult.MATCH:
+            logger.info("语言核对 文字系统：相符（%d 句）", len(event.checks))
+        else:
+            record, check = event.checks[-1]
+            ratio = 0.0 if check.ratio is None else check.ratio
+            logger.warning(
+                "语言核对 文字系统：不符：#%d“%s”%s占 %.0f%%",
+                record.occurrence,
+                record.text,
+                check.script.label,
+                ratio * 100,
+            )
         self.sink(event)
 
     def follow_voice(self, voice: VoiceActivityService | None) -> None:

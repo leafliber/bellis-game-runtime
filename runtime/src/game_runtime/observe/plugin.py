@@ -1,4 +1,5 @@
-"""普通插件 `observer`：只读运行把感知插件的结果交给宿主（`ObserveHub`）显示与统计，并做语言核对。
+"""普通插件 `observer`：只读运行把感知插件的结果交给宿主（`ObserveHub`）显示与统计，并做语言核对的
+两层（文字系统、固定文字）。
 
 设计见 `docs/modules/offline-tools.md` 的“observer 插件”与“只读运行的语言核对”。只读：不提供服务，
 不申请权限，不写任何文件。
@@ -23,12 +24,13 @@ from game_runtime.kernel import (
     Tier,
     catalog,
 )
-from game_runtime.narrative import NARRATIVE, NarrativeService
+from game_runtime.narrative import NARRATIVE, NarrativeRecord, NarrativeService
 from game_runtime.observe.hub import (
     LanguageEvent,
     LanguageResult,
     NarrativeFinal,
     ObserveHub,
+    ScriptWatch,
 )
 from game_runtime.ocr import OCR
 from game_runtime.recording import CatalogFactory, ResultsHub, perception_catalog
@@ -42,9 +44,9 @@ FOLLOW_INTERVAL: Final = 0.5
 
 
 class ObserverPlugin(Plugin[NoConfig]):
-    """订阅 `scene@1`，跟随可选的 `voice-activity@1` 与 `narrative@1`，把结果交给 `hub`；在声明了
-    固定文字的画面上以 `ocr@1` 做语言核对。宿主用 `observer_plugin` 得到绑定了 `ObserveHub` 的
-    子类。"""
+    """订阅 `scene@1`，跟随可选的 `voice-activity@1` 与 `narrative@1`，把结果交给 `hub`；以 `ocr@1`
+    核对剧情记录里完整的句子的文字系统，在声明了固定文字的画面上核对固定文字。宿主用
+    `observer_plugin` 得到绑定了 `ObserveHub` 的子类。"""
 
     manifest = Manifest(
         id="observer",
@@ -67,10 +69,15 @@ class ObserverPlugin(Plugin[NoConfig]):
             raise RuntimeError("observer 没有绑定 ObserveHub，宿主须用 observer_plugin")
         adapter = ctx.service(GAME_ADAPTER)
         scene = ctx.service(SCENE)
-        watch = hub.attach(adapter, scene_problems=scene.problems)
+        watch, script = hub.attach(adapter, scene_problems=scene.problems)
         checker = _LanguageChecker(ctx, hub)
         ctx.register(checker.close)
-        follower = _Follower(ctx, hub, type(self).results)
+
+        def on_record(record: NarrativeRecord) -> None:
+            hub.on_record(record)
+            _check_script(ctx, hub, script, record)
+
+        follower = _Follower(ctx, hub, type(self).results, on_record)
         follower.probe()
         task = asyncio.get_running_loop().create_task(
             follower.run(), name=f"{ctx.instance_id} 探测"
@@ -110,11 +117,16 @@ class _Follower:
     就退订。"""
 
     def __init__(
-        self, ctx: PluginContext[NoConfig], hub: ObserveHub, results: ResultsHub | None
+        self,
+        ctx: PluginContext[NoConfig],
+        hub: ObserveHub,
+        results: ResultsHub | None,
+        on_record: Callable[[NarrativeRecord], None],
     ) -> None:
         self._ctx = ctx
         self._hub = hub
         self._results = results
+        self._on_record = on_record
         self.voice: VoiceActivityService | None = None
         self.narrative: NarrativeService | None = None
         self._unsubscribe_voice: Callable[[], None] | None = None
@@ -136,7 +148,7 @@ class _Follower:
                 release()
             self._unsubscribe_narrative = []
             if narrative is not None:
-                self._unsubscribe_narrative.append(narrative.subscribe(self._hub.on_record))
+                self._unsubscribe_narrative.append(narrative.subscribe(self._on_record))
                 if self._results is not None:
                     # 不录制时没有 results：由这里交给宿主，停内核之前等剧情记录处理完。
                     self._unsubscribe_narrative.append(self._results.track(narrative))
@@ -160,8 +172,23 @@ class _Follower:
         self._hub.follow_narrative(None)
 
 
+def _check_script(
+    ctx: PluginContext[NoConfig], hub: ObserveHub, watch: ScriptWatch, record: NarrativeRecord
+) -> None:
+    """文字系统一层：结束了的完整的句子以 `ocr@1` 的 `check_script` 核对（同步的纯计算）；此刻没有
+    `ocr@1` 时这一句不核对、不计。"""
+    if not watch.wants(record):
+        return
+    ocr = ctx.optional(OCR)
+    if ocr is None:
+        return
+    event = watch.add(record, ocr.check_script(record.text))
+    if event is not None:
+        hub.on_script(event)
+
+
 class _LanguageChecker:
-    """语言核对：同一时刻至多一次在途，后来的排队。"""
+    """固定文字一层：同一时刻至多一次在途，后来的排队。"""
 
     def __init__(self, ctx: PluginContext[NoConfig], hub: ObserveHub) -> None:
         self._ctx = ctx
