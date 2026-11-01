@@ -105,7 +105,7 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 | 操作员许可连接 | 实时核，角色 `game-runtime.core` | 只有输入许可的授予、续约、吊销与输入已释放，见[核协议](core-protocol.md#操作员许可连接) |
 
 - 每种角色同时只接受一个连接，同角色的第二个连接与其它角色的连接都被拒绝；前一个断开后可以再连（实时核重启后的新实例）。
-- **连接信息**：启动时新生成通道地址与密钥，写入 SecretStore 的 `operator-session` 条目（服务名 `bellis-game-runtime`），格式同 Bellis 的 `SessionInfo`（`v`、`sessionId`、`channelPath`、`channelKey`、`launcherPid`、`startedAt`，`launcherPid` 是控制台的进程号），退出时删除。主进程读取它，连上操作员连接，再把同一地址与密钥经环境变量交给实时核。SecretStore 在 Windows 上是凭据管理器，命名与编码同 Bellis 的 `SecretStore`；其它平台只有测试用的内存实现，真实存储 unsupported。
+- **连接信息**：启动时新生成通道地址与密钥，写入 SecretStore 的 `operator-session` 条目（服务名 `bellis-game-runtime`），格式同 Bellis 的 `SessionInfo`（`v`、`sessionId`、`channelPath`、`channelKey`、`launcherPid`、`startedAt`，`launcherPid` 是控制台的进程号），已有的覆盖；退出时只在条目仍是自己写的（`sessionId` 相同）时删除，已被后开的控制台覆盖的不动。主进程读取它，连上操作员连接，再把同一地址与密钥经环境变量交给实时核。SecretStore 在 Windows 上是凭据管理器，命名与编码同 Bellis 的 `SecretStore`；其它平台只有测试用的内存实现，真实存储 unsupported。
 - 控制台用终端交互，按行读命令，不加界面依赖：
 
 | 命令 | 作用 |
@@ -117,7 +117,7 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 | `<序号>` | 给出当前决策点（最近打开、还没关闭的那个）的选择：选项的 `index`，每个决策点只给一次 |
 | `end`、`q` | 结束会话并退出；Ctrl+C 与 stdin 读到 EOF 同样 |
 
-会话不论怎样结束（命令、确认项答 `n`、到时），控制台都随即退出：吊销令牌、断开两条连接、删除 SecretStore 里的连接信息。
+会话不论怎样结束（命令、确认项答 `n`、到时），控制台都随即退出：吊销令牌、断开两条连接、删除 SecretStore 里自己的连接信息。
 
 ### 许可
 
