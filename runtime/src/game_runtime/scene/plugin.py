@@ -127,6 +127,12 @@ class SceneConfig(BaseModel):
     stable_after: Annotated[float, Field(gt=0.0, allow_inf_nan=False)] = 0.25
     """秒。"""
     transition_fraction: Annotated[float, Field(gt=0.0, le=1.0)] = 0.5
+    motion_fraction: Annotated[float, Field(gt=0.0, le=1.0)] = 0.1
+    playing_after: Annotated[float, Field(gt=0.0, allow_inf_nan=False)] = 2.0
+    """秒。"""
+    playing_ratio: Annotated[float, Field(gt=0.0, le=1.0)] = 0.8
+    playing_end: Annotated[float, Field(gt=0.0, allow_inf_nan=False)] = 1.5
+    """秒。"""
     data_dir: Path | None = None
     """本地数据目录，绝对路径；缺省按 `BELLIS_GAME_RUNTIME_DATA` 与平台约定。"""
 
@@ -140,9 +146,18 @@ class SceneConfig(BaseModel):
         return ChangeParams(
             grid_width=self.grid_width,
             cell_threshold=self.cell_threshold,
-            stable_after_ns=max(1, round(self.stable_after * 1e9)),
+            stable_after_ns=_ns(self.stable_after),
             transition_fraction=self.transition_fraction,
+            motion_fraction=self.motion_fraction,
+            playing_after_ns=_ns(self.playing_after),
+            playing_ratio=self.playing_ratio,
+            playing_end_ns=_ns(self.playing_end),
         )
+
+
+def _ns(seconds: float) -> int:
+    """秒换成纳秒，至少 1。"""
+    return max(1, round(seconds * 1e9))
 
 
 class ScenePlugin(Plugin[SceneConfig]):
