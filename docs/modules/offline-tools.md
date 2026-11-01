@@ -264,7 +264,7 @@ JSON 一律 UTF-8、LF 换行。以 `_ns` 结尾的时刻都是采集时钟（[�
 - **帧**：回放帧源 `ReplayFrameSource` 按帧索引的顺序逐帧解码给出，帧号、采集时刻、变换版本与像素都与实时运行时读者拿到的相同（行跨度为宽 × 4），读完即结束；解码时校验 `crc32`，不符即报错。
 - **声音**：回放音频源 `ReplayAudio` 满足 `RecordedAudio`：`next_blocks` 按块号给出录下的块（每次至多 100 块），读完即结束；`voice_marks` 给出 `live/voice-feed.jsonl` 里的喂入标记，`voice-activity@1` 据此按录制喂入（[确定性与回放](perception.md#确定性与回放)）。`read_recent` 没有“现在”，回放中不支持。
 - 两者都不读墙钟，读者要多快就给多快；插件全部激活之后才开始给（`start`），先激活的读者不会在订阅结果的插件激活之前就把帧读走。
-- **插件**（`perception_entries`，录制时相同）：`game-adapter@1`、`ocr@1`、`scene@1`、`voice-activity@1`、`narrative@1` 与把结果写成文件的 `results`。适配包的对白框没有声明或尚未标定时不运行 `narrative@1`，记一条告警（《魔女审判》标定之前就是这样）。模型制品与锚点模板取自本地数据目录；剧情记录的 SQLite 写进输出目录，与实时运行的剧情记录分开（[存储](narrative-planner.md#存储)）。没有实时核：内核的 `CoreControl` 拒绝一切提交。
+- **插件**（`perception_entries`，录制时相同）：`game-adapter@1`、`ocr@1`、`scene@1`、`voice-activity@1`、`narrative@1` 与把结果写成文件的 `results`。适配包的对白框没有声明或尚未标定时不运行 `narrative@1`，记一条告警。模型制品与锚点模板取自本地数据目录；剧情记录的 SQLite 写进输出目录，与实时运行的剧情记录分开（[存储](narrative-planner.md#存储)）。没有实时核：内核的 `CoreControl` 拒绝一切提交。
 - **跟上**：回放给帧比实时快。剧情记录积压超过 32 个更新时，回放帧源先等它处理完再给下一帧（`ResultsHub.pace`），不让它积压超限而丢弃，那会与实时不同。
 - **结束**：每个申请了 `frames.read` 或 `audio.read` 的条目都读到结束、剧情记录处理完积压的更新（`wait_idle`）之后停内核；60 秒没有进展即报错退出。
 - **输出**（`results` 插件，录制时写进 `live/`，回放时写进 `replay/`；回放每次先清空 `replay/`，`--out` 可改到别处）：
