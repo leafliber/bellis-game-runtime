@@ -128,7 +128,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - 结构体拒绝未知字段，缺少必需字段即拒绝；可以为空的字段显式写 `null`。整数的范围按其 Rust 类型（`u16`、`u32`、`u64`、`i32`），越界即拒绝。
 - 联合类型统一以 `type` 字段为内部标签，每个分支是一个具名结构体，Rust 与 Python 用同一名字。
 - 以 `_ns` 结尾的时刻字段是实时核单调时钟的纳秒读数，与帧环的采集时刻同一时钟；`offset_ns` 是相对起始时刻的纳秒数。主进程以 `time.perf_counter_ns()` 读同一时钟（Windows 上是 QPC，Linux 上是 `CLOCK_MONOTONIC`），已在 Windows 与 Linux 上实测核对，见[时钟](realtime-core.md#时钟)。
-- 方法名到 params 与 result 类型的对应只有一处源：Rust 的 `core_protocol::methods`。它导出到 Schema 的 `x-methods`（每个方法的方向与 params、result 的 `$ref`，通知的 `result` 为 `null`），再生成为 Python 的 `core_protocol.methods`（`METHODS`）。测试设备连接上的方法单独成组：`x-test-device-methods`，Python 的 `TEST_DEVICE_METHODS`。
+- 方法名到 params 与 result 类型的对应只有一处源：Rust 的 `core_protocol::methods`。它导出到 Schema 的 `x-methods`（每个方法的方向与 params、result 的 `$ref`，通知的 `result` 为 `null`），再生成为 Python 的 `core_protocol.methods`（`METHODS`）。测试设备连接与操作员许可连接上的方法各自成组：`x-test-device-methods`、`x-operator-methods`，Python 的 `TEST_DEVICE_METHODS`、`OPERATOR_METHODS`。
 - 错误用 JSON-RPC 2.0 的标准错误码（解析失败、无效请求、方法不存在、参数无效），另有以下自定义错误码：
 
 | 错误码 | 名字 | 含义 |
@@ -136,7 +136,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | -32001 | `protocol_version_mismatch` | `core.hello` 的协议版本与主进程的不相等 |
 | -32002 | `frame_ring_mismatch` | `frame_ring.attach` 打不开共享内存，或帧环头部与参数不符；`capture.set_target` 的假显示面同样 |
 | -32003 | `capture_unsupported` | `capture.set_target` 或 `audio.set_target` 的目标在这个平台或系统上不支持：非 Windows 上的 `window`，或系统不支持 WGC |
-| -32004 | `lease_refused` | 只用于测试：`test_lease.grant` 不被接受，见[输入许可](#输入许可) |
+| -32004 | `lease_refused` | `operator_lease.grant` 或只用于测试的 `test_lease.grant` 不被接受，见[输入许可](#输入许可) |
 | -32005 | `audio_ring_mismatch` | `audio_ring.attach` 打不开共享内存，或音频环头部与参数不符；`audio.set_target` 的假音频输出同样 |
 
 ### 会话
@@ -237,7 +237,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `executed`（`Executed`） | `id`、`at_ns` | 已交给输入后端及其时刻；不代表游戏中的效果已发生 |
 | `dropped`（`Dropped`） | `id`、`reason` | 没有执行：`superseded`（新的动作块已取代本块未执行的部分）、`duplicate`（同一身份在本代次已执行过）、`released`（到时实时核已释放输入，原因见 `input.released`）、`geometry_changed`（带坐标的动作：基准帧之后客户区的尺寸或 DPI 变了，或基准帧的几何已查不到，见[坐标与几何](#坐标与几何)） |
 
-**`input.released`**：实时核每次释放全部输入后发出，不论释放前是否持有输入。核连接断开时已无法发出，只记日志（以假后端运行时测试设备也能看到，见[测试设备连接](#测试设备连接)）；stdin 读到 EOF 时连接若还在就发出，随即以 0 退出（[生命线与 panic](realtime-core.md#生命线与-panic)）。
+**`input.released`**：实时核每次释放全部输入后发出，不论释放前是否持有输入。有操作员许可连接时也在那条连接上发出（[操作员许可连接](#操作员许可连接)）。核连接断开时已无法发出，只记日志（以假后端运行时测试设备也能看到，见[测试设备连接](#测试设备连接)）；stdin 读到 EOF 时连接若还在就发出，随即以 0 退出（[生命线与 panic](realtime-core.md#生命线与-panic)）。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -255,7 +255,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `frame_stale` | 最新写入帧的帧龄超过动作允许的年龄，或本实例还没有写过帧 |
 | `lease_expired` | 输入许可过了到期时刻，没有续约 |
 | `lease_revoked` | 输入许可被吊销，或许可源换发了更大的令牌 |
-| `lease_source_lost` | 与许可源的连接断开（G0 是测试设备连接） |
+| `lease_source_lost` | 与许可源的连接断开：测试设备连接或操作员许可连接 |
 | `no_lease` | 没有输入许可：从未授予，或没有许可源（没有输入后端时即如此） |
 | `stop` | 收到 `core.stop` |
 | `core_connection_lost` | 生命线：核连接断开。主进程收不到，见日志与测试设备 |
@@ -322,7 +322,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | 许可源 | 阶段 | 连接 |
 | --- | --- | --- |
 | 测试许可源，只用于测试 | G0 | [测试设备连接](#测试设备连接)，只能与假输入后端一起启用 |
-| 操作员控制台的测试会话（GR-36） | G2 | 操作员许可连接（[独立运行](game-bridge.md#独立运行)），消息名自有，不冒用 `lease.renew`；消息在实现时写在本节 |
+| 操作员控制台的测试会话（GR-36） | G2 | [操作员许可连接](#操作员许可连接)，可与假输入后端或真实后端一起启用 |
 | Bellis 安全核的 `game.input` 许可 | G3 | 控制连接（[游戏桥](game-bridge.md#连接)），消息是 Bellis 的 `lease.renew`，契约的源在 Bellis |
 
 实时核持有的许可是一个状态机：
@@ -337,6 +337,26 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | 与许可源的连接断开 | 此后没有许可，释放全部输入（`lease_source_lost`） |
 | 没有许可源（没有输入后端） | 从无许可（`no_lease`），不发任何输入 |
 
+许可源只有一个：给了操作员许可连接时，测试许可源不构造（[测试设备连接](#测试设备连接)的门禁）。
+
+## 操作员许可连接
+
+独立运行中（GR-36），实时核另作为 `bellis-channel/1` 客户端连到操作员控制台，由它授予、续约与吊销输入许可。控制台、会话与命令见[独立运行](game-bridge.md#独立运行)。
+
+- **为什么不经主进程**：同[测试设备连接](#测试设备连接)，主进程只能让输入停下，不能让输入继续；拓扑与 G3 的控制连接相同，G3 换成 Bellis 宿主时只换连接信息与消息。
+- **凭据**：主进程从 SecretStore 读取控制台本次会话的地址与密钥，经环境变量交给实时核：`GAME_RUNTIME_OPERATOR_PATH`（地址）、`GAME_RUNTIME_OPERATOR_KEY`（base64url 密钥）；角色为 `game-runtime.core`。主进程一侧由 `CoreLinkOptions.operator` 给出。
+- **顺序**：同测试设备连接。实时核先连上控制台并开始处理它的请求；有测试设备连接时接着连它；再释放全部输入（`core_start`，控制台随即收到 `input.released(core_start)`），再连接主进程。连不上控制台即以 1 退出。断开后不重连：此后没有许可，不发任何输入（`lease_source_lost`）。
+- **门禁**：操作员许可连接须与一个输入后端一起给出，否则以参数不合法（2）退出。与假后端一起时，测试设备连接只承载 `fake_input.event`，`test_lease.*` 回“方法不存在”（-32601）。真实后端（G2 第 2 步）只能与操作员许可连接（或 G3 的控制连接）一起选出。
+- 消息名是本仓库自有的，不冒用游戏桥控制连接的 `lease.renew`（那份契约的源在 Bellis，GD-03）。
+
+| 方法 | 方向 | 类型 | params → result | 用途 |
+| --- | --- | --- | --- | --- |
+| `operator_lease.grant` | 控制台 → 实时核 | 请求 | `LeaseGrantParams` → `Empty` | 授予或续约许可：`token`、`expires_ns`（与帧环同一时钟）。不被接受时回 -32004 |
+| `operator_lease.revoke` | 控制台 → 实时核 | 请求 | `LeaseRevokeParams` → `Empty` | 吊销 `token` 及更早的令牌；释放完成后才回应 |
+| `input.released` | 实时核 → 控制台 | 通知 | `InputReleasedParams` | 每次释放全部输入后发出，同核连接的 [`input.released`](#消息集) |
+
+`LeaseGrantParams`、`LeaseRevokeParams` 也是 `test_lease.grant`、`test_lease.revoke` 的 params。
+
 ## 测试设备连接
 
 只用于测试。实时核以假输入后端（`--input-backend fake`）启动时，另作为 `bellis-channel/1` 客户端连到测试一方的服务端；生产中没有这条连接。实现见[假输入后端与测试设备连接](realtime-core.md#假输入后端与测试设备连接)，测试一方是 `game_runtime.core_link.fake_device.FakeDevice`。
@@ -344,13 +364,13 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - **为什么不经主进程**：主进程只能让输入停下，不能让输入继续，许可不能来自主进程；主进程崩溃时测试一方仍能看到实时核是否发出了抬起与释放全部，这是“主进程崩溃即释放”唯一可观察的办法；拓扑与生产时“许可来自另一方（Bellis 控制连接）”一致。
 - **凭据**：像核连接一样由环境变量交付，另用一组名字：`GAME_RUNTIME_TEST_DEVICE_PATH`（地址）、`GAME_RUNTIME_TEST_DEVICE_KEY`（base64url 密钥）；角色与核连接相同，为 `game-runtime.core`。主进程一侧由 `CoreLinkOptions.test_device` 给出（只用于测试）。
 - **顺序**：实时核先连上测试设备并开始处理它的请求，再释放全部输入（`core_start`，测试设备随即收到 `release_all(core_start)`），再连接主进程。连不上测试设备即以 1 退出。连接断开后不重连：此后没有许可，不发任何输入。
-- **门禁**：`--input-backend` 在 G0 只有 `fake` 一个取值，其它取值（真实后端）unsupported；给了测试设备的凭据却没有 `--input-backend fake`、或 `--input-backend fake` 却没有凭据，都以参数不合法（2）退出。测试许可源只在假后端的代码里构造，没有路径能让它与其它后端一起出现。
+- **门禁**：`--input-backend` 现在只有 `fake` 一个取值，其它取值（真实后端）unsupported；给了测试设备的凭据却没有 `--input-backend fake`、或 `--input-backend fake` 却没有凭据，都以参数不合法（2）退出。测试许可源只在假后端的代码里构造，且只在没有[操作员许可连接](#操作员许可连接)时构造，没有路径能让它与其它后端或其它许可源一起出现。
 - 这些消息不是游戏桥控制连接的契约，也不冒用它的消息名（那份契约的源在 Bellis，GD-03）。
 
 | 方法 | 方向 | 类型 | params → result | 用途 |
 | --- | --- | --- | --- | --- |
-| `test_lease.grant` | 测试一方 → 实时核 | 请求 | `FakeLeaseGrantParams` → `Empty` | 授予或续约许可：`token`、`expires_ns`（与帧环同一时钟）。不被接受时回 -32004 |
-| `test_lease.revoke` | 测试一方 → 实时核 | 请求 | `FakeLeaseRevokeParams` → `Empty` | 吊销 `token` 及更早的令牌；释放完成后才回应 |
+| `test_lease.grant` | 测试一方 → 实时核 | 请求 | `LeaseGrantParams` → `Empty` | 授予或续约许可：`token`、`expires_ns`（与帧环同一时钟）。不被接受时回 -32004 |
+| `test_lease.revoke` | 测试一方 → 实时核 | 请求 | `LeaseRevokeParams` → `Empty` | 吊销 `token` 及更早的令牌；释放完成后才回应 |
 | `fake_input.event` | 实时核 → 测试一方 | 通知 | `FakeInputEventParams` | 假输入后端的一个事件：`seq`（实例内从 1 起逐个加一）、`at_ns`（交给假后端的时刻）、`event` |
 
 `event` 是联合类型 `FakeInputEvent`：

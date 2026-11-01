@@ -14,7 +14,7 @@ Rust 写的独立进程，是游戏侧的安全核：采集画面与声音，并
 
 - **决策。** 动作由主进程的控制产出者决定。
 - **识别画面。** 按画面类型的规则（危险画面、风险等级）只在主进程执行，见[动作风险](step-control.md#动作风险)；实时核不识别画面，这是剩余风险。
-- **签发许可。** 许可来自 Bellis 的控制连接（[游戏桥](game-bridge.md#连接)）或独立运行的操作员控制台（G2，[独立运行](game-bridge.md#独立运行)）；G0 只有只用于测试的测试许可源（[输入许可](core-protocol.md#输入许可)）。
+- **签发许可。** 许可来自 Bellis 的控制连接（[游戏桥](game-bridge.md#连接)）或独立运行的操作员控制台（[操作员许可连接](core-protocol.md#操作员许可连接)）；G0 只有只用于测试的测试许可源（[输入许可](core-protocol.md#输入许可)）。
 
 ## 启动与生命线
 
@@ -31,7 +31,7 @@ Rust 写的独立进程，是游戏侧的安全核：采集画面与声音，并
 
 1. 以 `session_credentials` 生成本实例的会话地址与密钥，在 `bellis-channel/1` 上开服务端监听。每个实例的凭据都是新的，被杀或已退出的旧实例连不上。
 2. 以 `subprocess.Popen` 和参数列表拉起 `realtime-core`：不经 shell，不用 `DETACHED_PROCESS`、`CREATE_BREAKAWAY_FROM_JOB` 或 `start_new_session`；stdin 是管道，stdout 与 stderr 继承主进程。
-3. 环境变量按 Bellis 的 `baseEnvironment` 只取系统必需的（Windows 的 `SYSTEMROOT`、`PATH` 等，POSIX 的 `HOME`、`PATH` 等），其余不继承；凭据按 Bellis 的 `ChildEnv` 放在 `BELLIS_CHANNEL_PATH`（地址）、`BELLIS_CHANNEL_KEY`（base64url 密钥）与 `BELLIS_ROLE`（角色，固定为 `game-runtime.core`）里。时限经命令行参数 `--heartbeat-timeout-ms`、`--health-interval-ms`、`--max-frame-age-ms` 给出。只用于测试：`CoreLinkOptions.test_device` 给出时另加 `--input-backend fake`，测试设备的地址与密钥放在 `GAME_RUNTIME_TEST_DEVICE_PATH`、`GAME_RUNTIME_TEST_DEVICE_KEY` 里（[测试设备连接](core-protocol.md#测试设备连接)）。
+3. 环境变量按 Bellis 的 `baseEnvironment` 只取系统必需的（Windows 的 `SYSTEMROOT`、`PATH` 等，POSIX 的 `HOME`、`PATH` 等），其余不继承；凭据按 Bellis 的 `ChildEnv` 放在 `BELLIS_CHANNEL_PATH`（地址）、`BELLIS_CHANNEL_KEY`（base64url 密钥）与 `BELLIS_ROLE`（角色，固定为 `game-runtime.core`）里。时限经命令行参数 `--heartbeat-timeout-ms`、`--health-interval-ms`、`--max-frame-age-ms` 给出。只用于测试：`CoreLinkOptions.test_device` 给出时另加 `--input-backend fake`，测试设备的地址与密钥放在 `GAME_RUNTIME_TEST_DEVICE_PATH`、`GAME_RUNTIME_TEST_DEVICE_KEY` 里（[测试设备连接](core-protocol.md#测试设备连接)）。`CoreLinkOptions.operator` 给出时，操作员控制台的地址与密钥放在 `GAME_RUNTIME_OPERATOR_PATH`、`GAME_RUNTIME_OPERATOR_KEY` 里（[操作员许可连接](core-protocol.md#操作员许可连接)）。
 4. Windows 上以 `CREATE_SUSPENDED` 创建，放进 Job Object 并交出 job 句柄之后才恢复运行，见下文。同时以 `CREATE_NEW_PROCESS_GROUP` 放进自己的进程组：控制台里按 Ctrl+C 只到主进程，由主进程按[停止](#停止)的顺序停实时核，实时核不会被控制台直接终止、来不及释放输入。它仍在同一个控制台里，stdout、stderr 照常继承；关闭控制台窗口时照样收到关闭事件。其它平台不另设进程组（只在测试中运行，没有交互终端）。
 5. 实时核连上后发 `core.hello`；主进程只接受角色为 `game-runtime.core` 的第一个连接，核对协议版本，不相等即以 -32001 回错并断开。收到 `input.released(core_start)` 才算就绪。从拉起到就绪超过 `start_timeout` 或实例在就绪前退出，即按停止顺序终止它并报 `CoreStartError`。
 6. 配置了采集（`CoreLinkOptions.capture`）时先挂接帧环、再设定采集目标；配置了音频（`CoreLinkOptions.audio`）时接着挂接音频环、设定音频目标；任一被拒绝即按停止顺序终止它并报 `CoreStartError`（[帧环的挂接](core-protocol.md#读写规则)、[音频环的挂接](core-protocol.md#音频环的读写规则)）。之后开始发心跳。
@@ -471,7 +471,7 @@ WASAPI 给出包里第一个采样点的 QPC 时刻（`GetBuffer` 的 `pu64QPCPo
 | 后端 | `--input-backend` | 状态 |
 | --- | --- | --- |
 | 没有后端 | 不给 | G0 生产中的配置：动作块照常校验与调度，但没有许可源，权威检查从不通过，不发任何输入（`no_lease`） |
-| 假输入后端，只用于测试 | `fake` | G0 实现，见下文 |
+| 假输入后端，只用于测试 | `fake` | G0 实现，见下文；许可来自测试设备连接，或来自操作员许可连接 |
 | 真实后端（SendInput） | 无 | unsupported，G2 实现；给出其它取值以参数不合法（2）退出 |
 
 ### 假输入后端与测试设备连接
@@ -479,7 +479,8 @@ WASAPI 给出包里第一个采样点的 QPC 时刻（`GetBuffer` 的 `pu64QPCPo
 只用于测试（`fake.rs`），协议与门禁见[测试设备连接](core-protocol.md#测试设备连接)：
 
 - 假后端把每个按下、抬起、一次性动作与释放全部作为 `fake_input.event` 放进发送队列就返回，由测试设备连接的发送线程写给测试一方。测试一方（`FakeDevice`）独立记下“当前按住了什么”，可以把事件转给合成游戏的状态机（[合成游戏](offline-tools.md#合成游戏)）。
-- 同一条连接上的测试许可源授予、续约与吊销许可；连接断开即没有许可（`lease_source_lost`）。测试许可源只在假后端的代码里构造：`InputSetup::select` 只在 `--input-backend fake` 与测试设备的凭据同时给出时才选出它，二者缺一即以 2 退出（`config.rs`）；没有后端时许可没有来源。
+- 同一条连接上的测试许可源授予、续约与吊销许可；连接断开即没有许可（`lease_source_lost`）。测试许可源只在假后端的代码里构造：`InputSetup::select` 只在 `--input-backend fake` 与测试设备的凭据同时给出、且没有操作员许可连接的凭据时才选出它，二者缺一即以 2 退出（`config.rs`）；没有后端时许可没有来源。
+- 同时给了操作员许可连接的凭据时，许可改由操作员控制台给出，测试设备连接只收假输入事件（[操作员许可连接](core-protocol.md#操作员许可连接)）。这是控制台在假后端与合成游戏上测通的组合。
 - 假后端上测得的时序（定时精度、释放时延）不代表真实输入，真实输入在 G2 实测。
 
 ### 注入

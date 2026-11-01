@@ -85,7 +85,7 @@ Game Runtime 为 Bellis 提供游戏能力：采集画面与声音、读懂画�
 | 核连接 | 主进程 ← 实时核 | 动作块、控制产出者心跳与回执等，见[核协议](modules/core-protocol.md#核协议) |
 | 帧环、音频环 | 共享内存，主进程创建 | 帧或 PCM、采集时刻（同一单调时钟）、窗口与 DPI 变换版本 |
 
-不接 Bellis 时以[独立运行](modules/game-bridge.md#独立运行)开发与测试。
+不接 Bellis 时以[独立运行](modules/game-bridge.md#独立运行)开发与测试：操作员控制台代替 Bellis 宿主作两条连接的服务端，主进程连它的操作员连接，实时核连它的操作员许可连接。
 
 ### 失效与释放
 
