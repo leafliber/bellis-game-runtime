@@ -88,11 +88,11 @@ class CredentialManagerStore:
     """Windows 凭据管理器。其它平台上构造即抛 `SecretStoreUnsupportedError`。"""
 
     def __init__(self, service: str = SERVICE_NAME) -> None:
+        self.service = service
         if sys.platform != "win32":
             raise SecretStoreUnsupportedError(
                 "凭据管理器只在 Windows 上可用；这个平台的真实存储 unsupported"
             )
-        self.service = service
 
     def get(self, name: str) -> str | None:
         return _read(target_name(self.service, name))
