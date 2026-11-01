@@ -91,6 +91,9 @@ ENV_ROLE = "BELLIS_ROLE"
 ENV_TEST_DEVICE_PATH = "GAME_RUNTIME_TEST_DEVICE_PATH"
 ENV_TEST_DEVICE_KEY = "GAME_RUNTIME_TEST_DEVICE_KEY"
 """只用于测试：测试设备连接的地址与密钥经这两个环境变量交给以假输入后端启动的实时核。"""
+ENV_OPERATOR_PATH = "GAME_RUNTIME_OPERATOR_PATH"
+ENV_OPERATOR_KEY = "GAME_RUNTIME_OPERATOR_KEY"
+"""操作员许可连接：操作员控制台的地址与密钥经这两个环境变量交给实时核。"""
 
 
 class CoreStartError(RuntimeError):
@@ -125,8 +128,12 @@ class CoreLinkOptions:
     """音频环与音频目标；`None` 时不建音频环，也不设定音频目标。"""
     test_device: ChannelCredentials | None = None
     """只用于测试：测试设备（`game_runtime.core_link.fake_device.FakeDevice`）的地址与密钥。给出时以
-    假输入后端（`--input-backend fake`）拉起实时核，许可来自测试设备。生产中为 None：G0 没有真实的
-    输入后端与许可源，实时核从不发出输入。"""
+    假输入后端（`--input-backend fake`）拉起实时核；没有 `operator` 时许可来自测试设备。生产中为
+    None。"""
+    operator: ChannelCredentials | None = None
+    """操作员控制台本次会话的地址与密钥（`game_runtime.operator.OperatorClient.credentials`）。给出
+    时实时核连到控制台，许可只来自它。实时核须有输入后端，否则以参数不合法退出：真实后端在 G2 第 2
+    步，现在只能与 `test_device` 一起用。"""
 
     def __post_init__(self) -> None:
         timeouts = (
@@ -161,13 +168,16 @@ class CoreLinkOptions:
         return argv
 
     def child_env(self) -> dict[str, str]:
-        """除系统必需的变量与核连接的凭据外，交给实时核的环境变量：只有测试设备的地址与密钥。"""
-        if self.test_device is None:
-            return {}
-        return {
-            ENV_TEST_DEVICE_PATH: self.test_device.path,
-            ENV_TEST_DEVICE_KEY: self.test_device.encoded_key,
-        }
+        """除系统必需的变量与核连接的凭据外，交给实时核的环境变量：测试设备与操作员控制台的地址与
+        密钥。"""
+        env: dict[str, str] = {}
+        if self.test_device is not None:
+            env[ENV_TEST_DEVICE_PATH] = self.test_device.path
+            env[ENV_TEST_DEVICE_KEY] = self.test_device.encoded_key
+        if self.operator is not None:
+            env[ENV_OPERATOR_PATH] = self.operator.path
+            env[ENV_OPERATOR_KEY] = self.operator.encoded_key
+        return env
 
 
 def _millis(seconds: float) -> int:
