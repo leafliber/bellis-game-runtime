@@ -31,6 +31,12 @@ class SceneState:
     """稳定时长，纳秒。"""
     changed_fraction: float
     """与上一处理帧相比变化的格子比例。"""
+    playing: bool
+    """是否在播片中。"""
+    playing_since_ns: int | None
+    """在播片中时，这段播片的开始时刻。"""
+    playing_ended_ns: int | None
+    """本帧起不再在播片中时，刚结束的这段播片的结束时刻。"""
     verdict: Verdict
     screen: str | None
     """`verdict` 为 `SCREEN` 时的画面 `id`。"""
@@ -64,6 +70,9 @@ class SceneAnalyzer:
             stability=change.stability,
             stable_ns=change.stable_ns,
             changed_fraction=change.changed_fraction,
+            playing=change.playing,
+            playing_since_ns=change.playing_since_ns,
+            playing_ended_ns=change.playing_ended_ns,
             verdict=judgement.verdict,
             screen=judgement.screen,
             matched=judgement.matched,

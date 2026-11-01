@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from pydantic import ValidationError
 
 from core_protocol import models
 from game_runtime.adapter import GameAdapterPlugin, PixelRect
@@ -216,6 +217,36 @@ def test_manifest() -> None:
     assert manifest.inject == ("game-adapter@1", "ocr@1?")
     assert manifest.permissions == (FRAMES_READ,)
     assert SceneConfig().change_params().stable_after_ns == 250_000_000
+
+
+def test_config_is_checked_and_given_in_seconds() -> None:
+    params = SceneConfig().change_params()
+    assert (
+        params.motion_fraction,
+        params.playing_after_ns,
+        params.playing_ratio,
+        params.playing_end_ns,
+    ) == (0.1, 2_000_000_000, 0.8, 1_500_000_000)
+    custom = SceneConfig(
+        motion_fraction=0.2, playing_after=3.5, playing_ratio=1.0, playing_end=0.25
+    ).change_params()
+    assert (custom.motion_fraction, custom.playing_after_ns, custom.playing_end_ns) == (
+        0.2,
+        3_500_000_000,
+        250_000_000,
+    )
+    for field, value in (
+        ("motion_fraction", 0.0),
+        ("motion_fraction", 1.5),
+        ("playing_after", 0.0),
+        ("playing_after", float("inf")),
+        ("playing_ratio", 0.0),
+        ("playing_ratio", 1.01),
+        ("playing_end", -1.0),
+        ("playing_end", float("nan")),
+    ):
+        with pytest.raises(ValidationError, match=field):
+            SceneConfig.model_validate({field: value})
 
 
 def test_scene_waits_for_the_adapter_and_the_frames_permission(data_dir: Path) -> None:
