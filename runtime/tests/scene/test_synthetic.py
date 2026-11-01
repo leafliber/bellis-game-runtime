@@ -127,14 +127,17 @@ class Walk:
         assert self.wait(0.3).stability is Stability.STABLE
 
     def watch_cutscene(self) -> None:
-        """刚进入播片：逐帧看完，回到选项后再看 2 秒。约 2 秒后判出播片，开始时刻是播片的第一帧；
-        回到选项的那一帧是最后一个动帧，1.5 秒后不再在播片中，结束时刻是它的下一帧。"""
+        """刚进入播片：逐帧看完，回到选项后再看 2 秒。每帧都是动帧，连成一段；从播片的第一帧起覆盖
+        2 秒时判出播片，开始时刻是这第一帧。回到选项的那一帧是最后一个动帧，1.5 秒后不再在播片中，
+        结束时刻是它的下一帧。"""
         start = len(self.history) - 1
         (cutscene, entered), (_, before) = self.history[start], self.history[start - 1]
         assert cutscene.scene is SceneType.CUTSCENE
         assert before.stability is Stability.STABLE
         while self.game.truth().scene is SceneType.CUTSCENE:
-            assert self.wait(FRAME_INTERVAL).stability is not Stability.STABLE
+            change = self.wait(FRAME_INTERVAL)
+            assert change.changed_fraction >= 0.1
+            assert change.stability is not Stability.STABLE
         switch = len(self.history) - 1
         assert self.history[switch][0].scene is SceneType.CHOICE
         for _ in range(60):
@@ -144,10 +147,10 @@ class Walk:
         first, last = playing[0], playing[-1]
         assert playing == list(range(first, last + 1))
         self.playing += playing
-        # 最近 2 秒不再含播片之前那个已稳定的帧时判出；之后的帧都在播片中。
+        # 距播片的第一帧不短于 2 秒的第一帧起在播片中，之后的帧都在播片中。
         second = 2_000_000_000
-        assert states[first].capture_ns - second >= before.capture_ns
-        assert states[first - 1].capture_ns - second < before.capture_ns
+        assert states[first].capture_ns - entered.capture_ns >= second
+        assert states[first - 1].capture_ns - entered.capture_ns < second
         assert first < switch
         assert {states[n].playing_since_ns for n in playing} == {entered.capture_ns}
         switched = states[switch].capture_ns

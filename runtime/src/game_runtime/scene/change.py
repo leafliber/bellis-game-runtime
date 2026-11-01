@@ -3,7 +3,6 @@
 规则见 `docs/modules/perception.md` 的“变化与稳定”。
 """
 
-import collections
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -46,10 +45,10 @@ class ChangeParams:
     """未稳定时变化比例不低于它即过场。"""
     motion_fraction: float = 0.1
     """变化比例不低于它的帧为动帧。"""
+    playing_gap_ns: int = 500_000_000
+    """相邻两个动帧相隔不超过它即连成一段，隔得更远即另起一段。"""
     playing_after_ns: int = 2_000_000_000
-    """最近这么久内处理的帧覆盖了整段、其中没有已稳定的帧、动帧占比够了，即在播片中。"""
-    playing_ratio: float = 0.8
-    """在播片中所需的动帧占比（按帧数）。"""
+    """当前一段动帧从第一个到最近一个覆盖不短于它，即在播片中。"""
     playing_end_ns: int = 1_500_000_000
     """在播片中时连续这么久没有动帧，即不再在播片中。"""
 
@@ -64,10 +63,10 @@ class ChangeParams:
             raise ValueError(f"transition_fraction 须在 (0, 1] 内：{self.transition_fraction}")
         if not 0 < self.motion_fraction <= 1:
             raise ValueError(f"motion_fraction 须在 (0, 1] 内：{self.motion_fraction}")
+        if self.playing_gap_ns < 1:
+            raise ValueError(f"playing_gap_ns 须为正数：{self.playing_gap_ns}")
         if self.playing_after_ns < 1:
             raise ValueError(f"playing_after_ns 须为正数：{self.playing_after_ns}")
-        if not 0 < self.playing_ratio <= 1:
-            raise ValueError(f"playing_ratio 须在 (0, 1] 内：{self.playing_ratio}")
         if self.playing_end_ns < 1:
             raise ValueError(f"playing_end_ns 须为正数：{self.playing_end_ns}")
 
@@ -82,7 +81,7 @@ class Change:
     playing: bool
     """本帧在播片中。"""
     playing_since_ns: int | None
-    """在播片中时，这段播片的开始时刻：判出时那一段里第一个动帧的采集时刻。"""
+    """在播片中时，这段播片的开始时刻：这一段动帧的第一个动帧的采集时刻。"""
     playing_ended_ns: int | None
     """本帧起不再在播片中时，刚结束的播片的结束时刻：最后一个动帧之后那一帧的采集时刻。"""
 
@@ -117,9 +116,7 @@ class ChangeDetector:
             stability = Stability.TRANSITION
         else:
             stability = Stability.CHANGING
-        since, ended = self._playing.update(
-            capture_ns, changed >= self.params.motion_fraction, stability is Stability.STABLE
-        )
+        since, ended = self._playing.update(capture_ns, changed >= self.params.motion_fraction)
         return Change(stability, stable_ns, changed, since is not None, since, ended)
 
     def _grid(self, bgra: Bgra) -> NDArray[np.int16]:
@@ -132,57 +129,41 @@ class ChangeDetector:
 
 
 class _PlayingDetector:
-    """播片：最近 `playing_after_ns` 内的帧覆盖了整段、没有已稳定的帧、动帧占比不低于
-    `playing_ratio` 时进入；此后连续 `playing_end_ns` 没有动帧即结束。只按采集时刻。"""
+    """播片：相邻相隔不超过 `playing_gap_ns` 的动帧连成一段，当前这一段从第一个到最近一个动帧覆盖
+    不短于 `playing_after_ns` 时进入；此后连续 `playing_end_ns` 没有动帧即结束，之后的动帧另起
+    一段。只按采集时刻。"""
 
     def __init__(self, params: ChangeParams) -> None:
         self.params = params
-        self._window: collections.deque[tuple[int, bool, bool]] = collections.deque()
-        """最近 `playing_after_ns` 内（采集时刻晚于本帧减它）的各帧：采集时刻、动帧、已稳定。"""
-        self._motions = 0
-        self._stables = 0
-        self._covered = False
-        """窗口之前还处理过帧：窗口覆盖了整段。"""
-        self._since: int | None = None
-        """在播片中时这段播片的开始时刻。"""
-        self._last_motion = 0
-        """在播片中时最后一个动帧的采集时刻。"""
-        self._after_motion: int | None = None
+        self._running = False
+        """有当前这一段：处理过动帧，播片结束之后还没有新的动帧。"""
+        self._first = 0
+        """当前这一段的第一个动帧的采集时刻；在播片中时即开始时刻。"""
+        self._last = 0
+        """当前这一段最近一个动帧的采集时刻。"""
+        self._playing = False
+        self._after_last: int | None = None
         """在播片中时最后一个动帧之后那一帧的采集时刻；最后一帧就是动帧时为 None。"""
 
-    def update(self, capture_ns: int, motion: bool, stable: bool) -> tuple[int | None, int | None]:
+    def update(self, capture_ns: int, motion: bool) -> tuple[int | None, int | None]:
         """处理一帧，返回（在播片中时的开始时刻，本帧结束了播片时的结束时刻）。"""
-        self._slide(capture_ns, motion, stable)
         params = self.params
-        if self._since is not None:
+        if self._playing:
             if motion:
-                self._last_motion, self._after_motion = capture_ns, None
-                return self._since, None
-            if self._after_motion is None:
-                self._after_motion = capture_ns
-            if capture_ns - self._last_motion < params.playing_end_ns:
-                return self._since, None
-            self._since = None
-            return None, self._after_motion
-        window = self._window
-        if not self._covered or self._stables or self._motions / len(window) < params.playing_ratio:
+                self._last, self._after_last = capture_ns, None
+                return self._first, None
+            if self._after_last is None:
+                self._after_last = capture_ns
+            if capture_ns - self._last < params.playing_end_ns:
+                return self._first, None
+            self._playing = self._running = False  # 结束之后的动帧另起一段
+            return None, self._after_last
+        if not motion:
             return None, None
-        last = max(index for index, (_, moving, _) in enumerate(window) if moving)
-        if capture_ns - window[last][0] >= params.playing_end_ns:
-            return None, None  # 动帧都在一段的开头，此刻已该结束：不进入
-        self._since = next(at for at, moving, _ in window if moving)
-        self._last_motion = window[last][0]
-        self._after_motion = window[last + 1][0] if last + 1 < len(window) else None
-        return self._since, None
-
-    def _slide(self, capture_ns: int, motion: bool, stable: bool) -> None:
-        window = self._window
-        window.append((capture_ns, motion, stable))
-        self._motions += motion
-        self._stables += stable
-        start = capture_ns - self.params.playing_after_ns
-        while window[0][0] <= start:
-            _, moving, settled = window.popleft()
-            self._motions -= moving
-            self._stables -= settled
-            self._covered = True
+        if not self._running or capture_ns - self._last > params.playing_gap_ns:
+            self._running, self._first = True, capture_ns
+        self._last = capture_ns
+        if capture_ns - self._first < params.playing_after_ns:
+            return None, None
+        self._playing, self._after_last = True, None
+        return self._first, None
