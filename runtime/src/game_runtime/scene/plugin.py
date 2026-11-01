@@ -128,9 +128,10 @@ class SceneConfig(BaseModel):
     """秒。"""
     transition_fraction: Annotated[float, Field(gt=0.0, le=1.0)] = 0.5
     motion_fraction: Annotated[float, Field(gt=0.0, le=1.0)] = 0.1
+    playing_gap: Annotated[float, Field(gt=0.0, allow_inf_nan=False)] = 0.5
+    """秒。"""
     playing_after: Annotated[float, Field(gt=0.0, allow_inf_nan=False)] = 2.0
     """秒。"""
-    playing_ratio: Annotated[float, Field(gt=0.0, le=1.0)] = 0.8
     playing_end: Annotated[float, Field(gt=0.0, allow_inf_nan=False)] = 1.5
     """秒。"""
     data_dir: Path | None = None
@@ -149,8 +150,8 @@ class SceneConfig(BaseModel):
             stable_after_ns=_ns(self.stable_after),
             transition_fraction=self.transition_fraction,
             motion_fraction=self.motion_fraction,
+            playing_gap_ns=_ns(self.playing_gap),
             playing_after_ns=_ns(self.playing_after),
-            playing_ratio=self.playing_ratio,
             playing_end_ns=_ns(self.playing_end),
         )
 

@@ -141,9 +141,8 @@ def test_params_are_checked() -> None:
         ("transition_fraction", 1.5),
         ("motion_fraction", 0.0),
         ("motion_fraction", 1.5),
+        ("playing_gap_ns", 0),
         ("playing_after_ns", 0),
-        ("playing_ratio", 0.0),
-        ("playing_ratio", 1.5),
         ("playing_end_ns", 0),
     ):
         with pytest.raises(ValueError, match=field):
@@ -152,35 +151,41 @@ def test_params_are_checked() -> None:
 
 # 播片
 
-type Kind = Literal["motion", "spot", "still"]
+type Kind = Literal["motion", "band", "spot", "still"]
 
 
 class Reel:
-    """每隔 `step` 毫秒交给检测一帧合成的帧：`motion` 整屏换色（变化比例 1，动帧），`spot` 只换
-    一小块（变化中，不是动帧），`still` 与上一帧相同。第 0 帧在 0 毫秒，没有可比的上一帧，也是
-    动帧。"""
+    """依次交给检测合成的帧，缺省每隔 `step` 毫秒一帧：`motion` 整屏换色（变化比例 1，动帧），
+    `band` 只换最上面 `rows` 行格子（格子图 64×36，变化比例为 rows/36），`spot` 只换一小块（变化中，
+    不是动帧），`still` 与上一帧相同。第 0 帧在 0 毫秒，没有可比的上一帧，也是动帧。"""
 
     def __init__(self, params: ChangeParams | None = None, *, step: int = 33) -> None:
         self.detector = ChangeDetector(params)
         self.step = step
-        self.number = -1
         self.image = canvas()
+        self.times: list[int] = []
+        """各帧的采集时刻（毫秒）。"""
         self.changes: list[Change] = []
 
     def at(self, number: int) -> int:
-        """第 `number` 帧的采集时刻。"""
-        return number * self.step * MS
+        """第 `number` 帧的采集时刻（纳秒）。"""
+        return self.times[number] * MS
 
-    def show(self, kind: Kind, count: int = 1) -> Change:
+    def show(
+        self, kind: Kind, count: int = 1, *, rows: int = 36, step: int | None = None
+    ) -> Change:
         for _ in range(count):
-            self.number += 1
+            now = 0 if not self.times else self.times[-1] + (step or self.step)
+            self.times.append(now)
+            self.image = self.image.copy()
             if kind == "motion":
-                self.image = self.image.copy()
                 self.image[:, :, :3] = 255 - self.image[:, :, :3]
+            elif kind == "band":
+                band = self.image[: rows * 5, :, :3]
+                band[:] = 255 - band
             elif kind == "spot":
-                self.image = self.image.copy()
-                self.image[0:10, 0:10, :3] = 255 - self.image[0:10, 0:10, :3]
-            self.changes.append(self.detector.update(self.image, self.at(self.number)))
+                self.image[0:4, 0:4, :3] = 255 - self.image[0:4, 0:4, :3]
+            self.changes.append(self.detector.update(self.image, now * MS))
         return self.changes[-1]
 
     def playing(self) -> list[int]:
@@ -194,10 +199,10 @@ def test_two_seconds_of_full_screen_motion_is_playing_until_it_stops_for_a_while
     assert reel.changes[29].stability is Stability.STABLE
     reel.show("motion", 121)  # 帧 30–150 每帧整屏换色
     reel.show("still", 50)  # 帧 151–200
-    # 帧 29（957 ms）是已稳定的帧；最近 2 秒内的帧不含它时（帧 90，2970 ms）起在播片中，开始时刻是
-    # 这一段里第一个动帧（帧 30）。
-    assert not reel.changes[89].playing
-    entered = reel.changes[90]
+    # 这一段动帧从帧 30（990 ms）起（帧 0 也是动帧，但隔得太远，另算一段）；到帧 91（3003 ms）覆盖
+    # 不短于 2 秒，起在播片中，开始时刻是帧 30。
+    assert not reel.changes[90].playing
+    entered = reel.changes[91]
     assert (entered.playing, entered.playing_since_ns, entered.playing_ended_ns) == (
         True,
         reel.at(30),
@@ -205,8 +210,8 @@ def test_two_seconds_of_full_screen_motion_is_playing_until_it_stops_for_a_while
     )
     # 最后一个动帧是帧 150（4950 ms）；采集时刻距它不短于 1.5 秒的第一帧（帧 196）起不再在播片中，
     # 结束时刻是它之后的那一帧（帧 151）。其间停住的帧照样在播片中，已稳定也不打断。
-    assert reel.playing() == list(range(90, 196))
-    assert {c.playing_since_ns for c in reel.changes[90:196]} == {reel.at(30)}
+    assert reel.playing() == list(range(91, 196))
+    assert {c.playing_since_ns for c in reel.changes[91:196]} == {reel.at(30)}
     assert reel.changes[190].stability is Stability.STABLE
     left = reel.changes[196]
     assert (left.playing, left.playing_since_ns, left.playing_ended_ns) == (
@@ -218,11 +223,9 @@ def test_two_seconds_of_full_screen_motion_is_playing_until_it_stops_for_a_while
 
 
 def test_a_transition_shorter_than_playing_after_is_not_playing() -> None:
-    """约 1.5 秒的整屏转场（《魔女审判》录制里转场最长 1.43 秒）：停下 0.25 秒后已稳定，在它离开
-    最近 2 秒之前，那一段里总有已稳定的帧。"""
     reel = Reel()
     reel.show("still", 30)
-    reel.show("motion", 45)  # 帧 30–74
+    reel.show("motion", 45)  # 帧 30–74：约 1.5 秒的整屏转场
     reel.show("still", 60)
     reel.show("motion", 3)  # 换画面的转场
     reel.show("still", 30)
@@ -231,19 +234,77 @@ def test_a_transition_shorter_than_playing_after_is_not_playing() -> None:
     assert all(c.playing_ended_ns is None for c in reel.changes)
 
 
+@pytest.mark.parametrize(("fade_ms", "playing"), [(1_430, False), (2_000, True)])
+def test_a_fade_out_to_black_and_in_again_is_not_playing(fade_ms: int, playing: bool) -> None:
+    """《魔女审判》录制里被误判过的转场：之前几帧只变 0.02（变化中、不是动帧），淡出 1.43 秒（每帧
+    变化比例 0.1–0.2），黑屏 0.85 秒（不变），淡入 1.1 秒（0.1–0.15）。淡出与淡入隔着黑屏，各算
+    一段，都不到 2 秒。淡出持续 2 秒时就是播片。每 10 毫秒一帧。"""
+    reel = Reel(step=10)
+    reel.show("still", 100)  # 第一帧（动帧）离淡出远于 0.5 秒
+    reel.show("band", 20, rows=1)  # 0.028
+    fade_out = len(reel.times)
+    for n in range(fade_ms // 10 + 1):  # 第一帧到最后一帧相隔 fade_ms
+        reel.show("band", rows=4 + n % 4)  # 4–7 行：0.11–0.19
+    last_out = len(reel.times) - 1
+    reel.show("still", 84)  # 黑屏
+    for n in range(111):  # 淡入 1.1 秒
+        reel.show("band", rows=4 + n % 2)  # 4–5 行：0.11–0.14
+    reel.show("still", 200)
+
+    fractions = [c.changed_fraction for c in reel.changes]
+    assert all(0.1 <= f <= 0.2 for f in fractions[fade_out : last_out + 1])
+    assert reel.times[last_out] - reel.times[fade_out] == fade_ms
+    assert reel.times[last_out + 85] - reel.times[last_out] == 850
+    if playing:
+        assert reel.playing()[0] == last_out
+        assert reel.changes[last_out].playing_since_ns == reel.at(fade_out)
+    else:
+        assert reel.playing() == []
+
+
+def test_a_short_freeze_keeps_the_run_of_motion() -> None:
+    """动帧之间定格 0.4 秒（其间已稳定）：相隔不超过 0.5 秒，仍连成一段，从第一个动帧起计时。"""
+    reel = Reel()
+    reel.show("still", 30)
+    reel.show("motion", 30)  # 帧 30–59：990–1947 ms
+    reel.show("still", 12)  # 帧 60–71：定格
+    reel.show("motion", 40)  # 帧 72–111：2376 ms 起，与帧 59 相隔 429 ms
+    reel.show("still", 60)
+
+    assert reel.changes[70].stability is Stability.STABLE
+    playing = reel.playing()
+    assert playing[0] == 91  # 3003 ms：距帧 30 不短于 2 秒
+    assert reel.changes[91].playing_since_ns == reel.at(30)
+
+
+def test_a_longer_freeze_starts_a_new_run() -> None:
+    """动帧之间定格 0.6 秒：相隔超过 0.5 秒，另起一段，从新的第一个动帧重新计时。"""
+    reel = Reel()
+    reel.show("still", 30)
+    reel.show("motion", 30)  # 帧 30–59：990–1947 ms
+    reel.show("still", 18)  # 帧 60–77：定格
+    reel.show("motion", 70)  # 帧 78–147：2574 ms 起，与帧 59 相隔 627 ms
+    reel.show("still", 60)
+
+    playing = reel.playing()
+    assert not reel.changes[91].playing  # 从帧 30 算已覆盖 2 秒，但那一段被打断了
+    assert playing[0] == 139  # 4587 ms：距帧 78 不短于 2 秒
+    assert reel.changes[139].playing_since_ns == reel.at(78)
+
+
 def test_a_frozen_shot_does_not_interrupt_the_playing() -> None:
     reel = Reel()
     reel.show("still", 30)
-    reel.show("motion", 70)  # 帧 30–99，帧 90 起在播片中
+    reel.show("motion", 70)  # 帧 30–99，帧 91 起在播片中
     reel.show("still", 40)  # 帧 100–139：定格 1.3 秒，其间已稳定
     reel.show("motion", 30)  # 帧 140–169
     reel.show("still", 60)
 
     playing = reel.playing()
-    assert playing[0] == 90
+    assert playing[0] == 91
     assert reel.changes[130].stability is Stability.STABLE
-    # 定格不到 1.5 秒，播片一直延续到最后一个动帧（帧 169）之后 1.5 秒。
-    assert playing == list(range(90, playing[-1] + 1))
+    # 在播片中时定格不到 1.5 秒不结束，播片一直延续到最后一个动帧（帧 169）之后 1.5 秒。
+    assert playing == list(range(91, playing[-1] + 1))
     assert (
         reel.at(playing[-1] + 1) - reel.at(169) >= 1_500 * MS > reel.at(playing[-1]) - reel.at(169)
     )
@@ -263,50 +324,26 @@ def test_a_freeze_of_playing_end_ends_the_playing_and_a_new_one_starts_later() -
     assert (first.playing, first.playing_ended_ns) == (False, reel.at(100))
     assert reel.changes[144].playing
     second = [n for n in reel.playing() if n > 145]
-    assert second[0] == 210  # 帧 149（已稳定，4917 ms）离开最近 2 秒
+    assert second[0] == 211  # 另起的一段从帧 150（4950 ms）起，到 6963 ms 覆盖 2 秒
     assert {reel.changes[n].playing_since_ns for n in second} == {reel.at(150)}
 
 
-@pytest.mark.parametrize(("motions", "playing"), [(3, False), (9, True)])
-def test_motion_must_be_most_of_the_frames(motions: int, playing: bool) -> None:
-    """动帧之间夹着只变一小块的帧（变化中、不是动帧）：动帧占 3/4 时不够 0.8，占 9/10 时够。"""
-    reel = Reel()
-    reel.show("still", 30)
-    for _ in range(120 // (motions + 1)):  # 帧 30–149
-        reel.show("motion", motions)
-        reel.show("spot")
-    assert bool(reel.playing()) is playing
-    assert all(c.stability is not Stability.STABLE for c in reel.changes[31:])
-
-
-def test_playing_needs_a_window_that_is_covered() -> None:
-    """一开始就整屏地动：这之前没有处理过帧，最近 2 秒要到整整覆盖了才算。"""
+def test_motion_from_the_very_first_frame_counts() -> None:
+    """一开始就整屏地动：第一帧没有可比的上一帧，也是动帧，这一段从它起计。"""
     reel = Reel(step=100)
     reel.show("motion", 25)
 
-    # 帧 20（2000 ms）时帧 0 落到最近 2 秒之外：这一段之前处理过帧，覆盖了整段。
-    assert reel.playing() == list(range(20, 25))
-    assert reel.changes[20].playing_since_ns == reel.at(1)
+    assert reel.playing() == list(range(20, 25))  # 帧 20：2000 ms
+    assert reel.changes[20].playing_since_ns == reel.at(0)
 
 
-@pytest.mark.parametrize(("end_ms", "playing"), [(1_500, False), (3_000, True)])
-def test_playing_does_not_start_when_the_motion_is_already_over(end_ms: int, playing: bool) -> None:
-    """动帧密集地挤在一段的开头、随后是稀疏的只变一小块的帧：按帧数够了（`playing_ratio` 取 0.5），
-    但此刻距最后一个动帧已不短于 `playing_end`，不进入；`playing_end` 更长时进入。"""
-    detector = ChangeDetector(ChangeParams(playing_ratio=0.5, playing_end_ns=end_ms * MS))
-    image = canvas()
-    detector.update(image, 0)
-    assert detector.update(image, 300 * MS).stability is Stability.STABLE
-    changes: list[Change] = []
-    for step in range(1, 21):  # 305–400 ms：20 个动帧
-        image = image.copy()
-        image[:, :, :3] = 255 - image[:, :, :3]
-        changes.append(detector.update(image, (300 + 5 * step) * MS))
-    for at in (700, 1_000, 1_300, 1_600, 1_900, 2_200, 2_310):
-        image = image.copy()
-        image[0:10, 0:10, :3] = 255 - image[0:10, 0:10, :3]
-        changes.append(detector.update(image, at * MS))
+def test_motion_with_small_changes_in_between_is_one_run() -> None:
+    """动帧之间夹着只变一小块的帧（变化中、不是动帧）：相隔不超过 0.5 秒，照样连成一段。"""
+    reel = Reel()
+    reel.show("still", 30)
+    for _ in range(30):  # 帧 30–149
+        reel.show("motion", 3)
+        reel.show("spot")
 
-    # 2310 ms 时帧 300 ms（已稳定）落到最近 2 秒之外：19 个动帧、7 个变化中的帧。
-    assert not any(c.playing for c in changes[:-1])
-    assert changes[-1].playing is playing
+    assert all(c.changed_fraction < 0.1 for c in reel.changes[33:150:4])
+    assert reel.playing()[0] == 91
