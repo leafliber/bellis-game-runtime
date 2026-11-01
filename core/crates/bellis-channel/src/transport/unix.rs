@@ -42,27 +42,27 @@ impl Transport for UnixTransport {
             .read_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.closed.load(Ordering::Acquire) {
-            return Err(shut_down());
-        }
-        let timeout = match remaining(deadline) {
-            Some(left) if left.is_zero() => return Err(timed_out()),
-            // set_read_timeout 不接受 0。
-            Some(left) => Some(left.max(Duration::from_millis(1))),
-            None => None,
-        };
-        self.stream.set_read_timeout(timeout)?;
-        match (&self.stream).read(buf) {
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                Err(timed_out())
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(shut_down());
             }
-            Ok(0) if self.closed.load(Ordering::Acquire) => Err(shut_down()),
-            result => result,
+            let timeout = match remaining(deadline) {
+                Some(left) if left.is_zero() => return Err(timed_out()),
+                // set_read_timeout 不接受 0。
+                Some(left) => Some(left.max(Duration::from_millis(1))),
+                None => None,
+            };
+            self.stream.set_read_timeout(timeout)?;
+            match (&self.stream).read(buf) {
+                // 套接字的读超时可能比截止时间早一点返回；没到截止时间就接着等。
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Ok(0) if self.closed.load(Ordering::Acquire) => return Err(shut_down()),
+                result => return result,
+            }
         }
     }
 
