@@ -66,7 +66,7 @@
 | 只跑配音检测的测试（状态与迟滞、预处理、核心、插件在内核中；本地数据目录里没有模型时真实推理的那部分跳过） | `uv run pytest runtime/tests/voice_activity` |
 | 只跑 `voice-activity@1` 经假音频源、实时核与音频环的联调测试（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link/test_voice_activity.py` |
 | 用本地数据目录里的真实模型跑语音检测的测试（模型不在时跳过并写明原因；SAPI 合成的语音只在 Windows 上） | `uv run pytest -m vad_model` |
-| GS-06：用 Windows 自带的语音合成与合成的背景生成自测样本（只在 Windows 上，见[GS-06 的评测](docs/modules/perception.md#gs-06-的评测)） | `uv run gs06 synth <目录>` |
+| GS-06：用 Windows 自带的语音合成与合成的背景生成评测用的合成样本（只在 Windows 上，见[GS-06 的评测](docs/modules/perception.md#gs-06-的评测)） | `uv run gs06 synth <目录>` |
 | GS-06：打印纯配音录音按能量得出的配音段 | `uv run gs06 truth <纯配音.wav>` |
 | GS-06：评测一组录音，报告写入 `reports/gs06/`（背景可给多段；负的增益写成 `--gains=-12,-6,0,6`） | `uv run gs06 eval --voice <纯配音.wav> --background <名字>=<背景.wav> --mix <正常混音.wav>` |
 
