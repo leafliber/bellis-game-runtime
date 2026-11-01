@@ -1,4 +1,4 @@
-"""本仓库的适配包：都通过校验；合成游戏的声明与它的实现一致；《魔女审判》只写了必需部分。
+"""本仓库的适配包：都通过校验；合成游戏的声明与它的实现一致；《魔女审判》写了必需部分与对白框。
 
 合成游戏见 `docs/modules/offline-tools.md` 的“合成游戏”，《魔女审判》见
 `docs/games/witch-trial.md` 的“适配包”。
@@ -218,40 +218,44 @@ def test_witch_trial_whitelist_has_no_long_press_scroll_or_keys(witch_trial: Ada
     assert whitelist.max_hold is None
 
 
-def test_witch_trial_calibration_is_pending_without_guessed_coordinates(
+def test_witch_trial_calibrates_only_what_read_only_perception_needs(
     witch_trial: Adapter,
 ) -> None:
+    """G1 只标定对白框（名字栏、对白文字、继续标记）；其余留到 G2，不写猜测的坐标。"""
     assert witch_trial.roi("client") == NormalizedRect(0.0, 0.0, 1.0, 1.0)
-    assert {name for name, roi in witch_trial.rois.items() if roi.rect is not None} == {"client"}
+    calibrated = {name for name, roi in witch_trial.rois.items() if roi.rect is not None}
+    assert calibrated == {"client", "speaker", "dialogue", "continue-marker", "hud-border"}
     assert witch_trial.uncalibrated() == (
-        "ROI speaker（名字栏）",
-        "ROI dialogue（对白框）",
         "ROI choices（选项）",
         "ROI trial-statement（审判发言区）",
         "签名 dialogue",
-        "签名 dialogue-continue",
         "签名 choice",
         "签名 trial",
         "签名 bad-ending",
     )
     with pytest.raises(NotCalibratedError):
-        witch_trial.roi("dialogue")
+        witch_trial.roi("choices")
     # 固定文字与阅读节奏不是标定项：没有固定文字即只做文字系统一层，没有阅读节奏即用通用缺省。
     assert witch_trial.language.fixed_texts == ()
     assert witch_trial.pacing is None
     assert script_of(witch_trial.language.tag) is Script.HAN
 
 
-def test_witch_trial_dialogue_box_is_declared_but_not_calibrated(witch_trial: Adapter) -> None:
-    [box] = witch_trial.dialogue_boxes
+def test_witch_trial_dialogue_box_reads_without_a_screen(witch_trial: Adapter) -> None:
+    """对白画面没有稳定的签名，对白框不写 screen，按通用缺省读；继续标记的签名两个锚点。"""
+    [box] = witch_trial.require_dialogue_boxes()
     assert (box.screen, box.speaker, box.text, box.continue_signature) == (
-        "dialogue",
+        None,
         "speaker",
         "dialogue",
         "dialogue-continue",
     )
-    with pytest.raises(NotCalibratedError) as caught:
-        witch_trial.require_dialogue_boxes()
-    assert caught.value.item == (
-        "对白框的ROI speaker（名字栏）、ROI dialogue（对白框）、继续标记的签名 dialogue-continue"
-    )
+    [signature] = [s for s in witch_trial.signatures if s.id == "dialogue-continue"]
+    assert signature.screen == "dialogue"
+    assert [(anchor.roi, anchor.min_score) for anchor in signature.anchors] == [
+        ("continue-marker", 0.6),
+        ("hud-border", 0.8),
+    ]
+    # 对白文字的 ROI 止于继续标记之前。
+    dialogue, marker = witch_trial.roi("dialogue"), witch_trial.roi("continue-marker")
+    assert dialogue.right <= marker.left

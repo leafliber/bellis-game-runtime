@@ -368,17 +368,20 @@ def test_a_mismatched_aspect_ratio_disables_signatures(
 
 
 def test_uncalibrated_signatures_take_no_part(data_dir: Path) -> None:
+    """《魔女审判》只标定了继续标记的签名：其余不参与判别。它的模板不在这个本地数据目录里，
+    所以它不可判，结果为不可判，不回退、不当作不命中。"""
     witch_trial = load_adapter(GAMES_DIR / "witch-trial")
     signature_judge = SignatureJudge.load(witch_trial, data_dir)
 
-    assert signature_judge.uncalibrated == (
-        "dialogue",
-        "dialogue-continue",
-        "choice",
-        "trial",
-        "bad-ending",
-    )
-    assert signature_judge.problems == ()
+    assert signature_judge.uncalibrated == ("dialogue", "choice", "trial", "bad-ending")
+    problems = signature_judge.problems
+    assert [problem.split("：")[0] for problem in problems] == [
+        "签名 dialogue-continue 的锚点 [0]",
+        "签名 dialogue-continue 的锚点 [1]",
+    ]
     frame = ring_frame(game_at(2560, 1440))
     judgement = signature_judge.judge(frame, bgra_view(frame), None)
-    assert (judgement.verdict, judgement.signatures) == (Verdict.NONE, ())
+    assert judgement.verdict is Verdict.UNDETERMINED
+    assert [(result.id, result.outcome) for result in judgement.signatures] == [
+        ("dialogue-continue", Outcome.UNDETERMINED)
+    ]
