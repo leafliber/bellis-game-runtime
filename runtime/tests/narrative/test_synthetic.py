@@ -1,10 +1,12 @@
 """在合成游戏上按真值逐句核对剧情记录：`game-adapter`、`scene`、`ocr` 与 `narrative` 在内核中，帧由
 合成游戏渲染、经帧源逐帧交给 `scene@1`。
 
-真值来自合成游戏的状态机：哪一句（测试自己按推进记下）、说话人、已显示的文字与是否显示完。`Play`
-按模块文档的规则从真值算出应有的记录（含按采集时刻的 OCR 节流），与 `narrative@1` 的记录逐句比较；
-名字栏与对白文字的 OCR 用按真值作答的识别器（`TruthRecognizer`），标 `ocr_model` 的一项用真实模型。
-除专门测节流的一项外都关掉节流（`ocr_interval` 为 0），每个对白框帧都读。
+真值来自合成游戏的状态机：哪一句（测试自己按推进记下）、说话人、已显示的文字与是否显示完，播片的
+字幕。`Play` 按模块文档的规则从真值算出应有的记录（含按采集时刻的 OCR 节流），与 `narrative@1` 的
+记录逐句比较；哪些帧在播片中取自 `scene@1` 的输出（它的判定由 `runtime/tests/scene` 按真值核对），
+播片段的开始与结束时刻另与真值核对。名字栏与对白文字的 OCR 用按真值作答的识别器
+（`TruthRecognizer`），标 `ocr_model` 的一项用真实模型。除专门测节流的一项外都关掉节流
+（`ocr_interval` 为 0），每个对白框帧都读。
 """
 
 import asyncio
@@ -54,6 +56,7 @@ from game_runtime.narrative import (
     NARRATIVE,
     NARRATIVE_WRITE,
     Completeness,
+    Cutscene,
     Discontinuity,
     NarrativeConfig,
     NarrativePlugin,
@@ -62,6 +65,7 @@ from game_runtime.narrative import (
     Scope,
     TrackerParams,
     compare_key,
+    read_cutscenes,
     read_discontinuities,
     read_records,
     read_scopes,
@@ -93,7 +97,7 @@ from game_runtime.scene import (
     bgra_view,
 )
 from game_runtime.scene import Outcome as SignatureOutcome
-from synthetic_game import Click, GameConfig, ManualClock, SceneType, SyntheticGame, Truth
+from synthetic_game import Click, GameConfig, ManualClock, SceneType, SyntheticGame, Truth, story
 from synthetic_game.story import NODES, UI, Dialogue, Line
 
 FRAME: Final = 1 / 30
@@ -259,9 +263,11 @@ def speaker_of(node: str, text: str) -> str:
 class Expected:
     """按真值算出的一句：规则同模块文档，只是“哪一句”取自真值而不是 OCR。"""
 
-    serial: int
-    speaker: str
+    identity: tuple[object, ...]
+    """哪一句：对白为推进的序号，字幕另加字幕的文字。"""
+    speaker: str | None
     scope: int
+    cutscene: int | None
     first_frame: int
     first_ns: int
     full: str
@@ -281,6 +287,21 @@ class Expected:
     """记录先后取过的各个文字，按顺序。"""
 
 
+@dataclass
+class ExpectedCutscene:
+    """按 `scene@1` 给出的播片状态算出的一个播片段。"""
+
+    index: int
+    scope: int
+    first_frame: int
+    first_ns: int
+    last_frame: int
+    last_ns: int
+    end_ns: int | None = None
+    closed_frame: int | None = None
+    sentences: list[int] = field(default_factory=list[int])
+
+
 def row(item: Expected | NarrativeRecord) -> tuple[Any, ...]:
     return (
         item.speaker,
@@ -288,6 +309,7 @@ def row(item: Expected | NarrativeRecord) -> tuple[Any, ...]:
         item.revision,
         item.completeness,
         item.scope,
+        item.cutscene,
         item.first_frame,
         item.first_ns,
         item.last_frame,
@@ -298,8 +320,23 @@ def row(item: Expected | NarrativeRecord) -> tuple[Any, ...]:
     )
 
 
+def cutscene_row(item: ExpectedCutscene | Cutscene) -> tuple[Any, ...]:
+    return (
+        item.index,
+        item.scope,
+        item.first_frame,
+        item.first_ns,
+        item.last_frame,
+        item.last_ns,
+        item.end_ns,
+        item.closed_frame,
+        tuple(item.sentences),
+    )
+
+
 class Play:
-    """驱动合成游戏：每次观察渲染一帧、教给识别器、放进帧源，并按真值更新应有的记录。"""
+    """驱动合成游戏：每次观察渲染一帧、教给识别器、放进帧源，等 `scene@1` 判完这一帧，再按真值与它的
+    播片状态更新应有的记录。"""
 
     def __init__(
         self,
@@ -322,16 +359,30 @@ class Play:
         """节流：两次读至少相隔这么久（采集时刻）。"""
         self.last_read: int | None = None
         self.elsewhere = elsewhere
-        """不是对话（或有弹窗）的帧上，对白框的两个 ROI 应读出的文字；不写即不教。"""
+        """不是对话或播片（或有弹窗）的帧上，对白框的两个 ROI 应读出的文字；不写即都读不出文字。"""
         self.clock = ManualClock()
         self.game = SyntheticGame(GameConfig(*size), self.clock)
         self.number = 0
         self.serial = 0
         self.expected: list[Expected] = []
         self.current: Expected | None = None
+        self.cutscenes: list[ExpectedCutscene] = []
+        self.playing: ExpectedCutscene | None = None
         self.scope = 0
         self.scope_pending = False
         self.pace: Callable[[int], Awaitable[None]] | None = None
+        self.states: dict[int, SceneState] = {}
+        """`scene@1` 判过的各帧，按帧号。"""
+        self._judged = asyncio.Event()
+        self.truth_cutscenes: list[tuple[int, int | None]] = []
+        """真值里的各个播片：第一帧的采集时刻，回到别的画面之后第二帧的采集时刻（`scene@1` 应给出
+        的开始与结束时刻：播片的第一帧与回到别的画面的那一帧都是动帧）。"""
+        self._after_cutscene = 0
+
+    def on_scene(self, update: SceneUpdate) -> None:
+        """`scene@1` 的监听者：记下每一帧的判别结果。"""
+        self.states[update.state.frame_number] = update.state
+        self._judged.set()
 
     # 观察
 
@@ -352,8 +403,12 @@ class Play:
         truth = self.game.truth()
         if self.recognizer is not None:
             self._teach(frame, truth)
+        self._follow_truth(truth, capture_ns)
         self.frames.push(frame)
-        self._expect(truth, capture_ns)
+        while self.number not in self.states:
+            self._judged.clear()
+            await asyncio.wait_for(self._judged.wait(), WAIT)
+        self._expect(truth, capture_ns, self.states[self.number])
         if self.pace is not None:
             await self.pace(self.number)
 
@@ -361,13 +416,15 @@ class Play:
         assert self.recognizer is not None
         size = (frame.width, frame.height)
         if truth.scene is SceneType.DIALOGUE and truth.overlay is None:
-            speaker = speaker_of(truth.node, truth.text)
-            self.recognizer.teach(frame, self.adapter.roi("speaker").to_pixels(*size), speaker)
-            text_rect = self.adapter.roi("dialogue").to_pixels(*size)
-            self.recognizer.teach(frame, text_rect, truth.visible_text)
+            texts = {"speaker": speaker_of(truth.node, truth.text), "dialogue": truth.visible_text}
         elif self.elsewhere is not None:
-            for roi, text in self.elsewhere(truth).items():
-                self.recognizer.teach(frame, self.adapter.roi(roi).to_pixels(*size), text)
+            texts = self.elsewhere(truth)
+        else:
+            # 播片里对白文字的位置上是字幕（没有名字）；别的画面上读不出文字。
+            subtitle = truth.text if truth.scene is SceneType.CUTSCENE else ""
+            texts = {"speaker": "", "dialogue": subtitle}
+        for roi, text in texts.items():
+            self.recognizer.teach(frame, self.adapter.roi(roi).to_pixels(*size), text)
         # 画面签名的固定文字项（标题菜单的“开始”、坏结局的“重来”）：ROI 里的按钮文字。
         for signature in self.adapter.signatures:
             for item in signature.texts:
@@ -381,15 +438,32 @@ class Play:
                 ]
                 self.recognizer.teach(frame, rect, "".join(labels))
 
-    def _expect(self, truth: Truth, capture_ns: int) -> None:
+    def _follow_truth(self, truth: Truth, capture_ns: int) -> None:
+        """记下真值里播片的第一帧与回到别的画面之后的第二帧。"""
+        if truth.scene is SceneType.CUTSCENE:
+            if self._after_cutscene == 0:
+                self.truth_cutscenes.append((capture_ns, None))
+            self._after_cutscene = 1
+        elif self._after_cutscene:
+            self._after_cutscene += 1
+            if self._after_cutscene == 3:
+                start, _ = self.truth_cutscenes[-1]
+                self.truth_cutscenes[-1] = (start, capture_ns)
+                self._after_cutscene = 0
+
+    def _expect(self, truth: Truth, capture_ns: int, state: SceneState) -> None:
         number = self.number
-        if truth.overlay is not None:
-            return  # 弹窗压暗画面：不命中签名，不改变记录
-        if truth.scene is not SceneType.DIALOGUE:
-            self._close(number)
-            if truth.scene is SceneType.BAD_ENDING:
-                self.scope_pending = True
-            return
+        self._expect_cutscene(state, number, capture_ns)
+        dialogue = truth.scene is SceneType.DIALOGUE and truth.overlay is None
+        if not state.playing:
+            if truth.overlay is not None or truth.scene is SceneType.CUTSCENE:
+                return  # 弹窗压暗画面、播片还没判出：不命中签名，不改变记录
+            if not dialogue:
+                self._close(number)
+                if truth.scene is SceneType.BAD_ENDING:
+                    self.scope_pending = True
+                return
+        # 对话画面，或播片中的任何一帧（读字幕）。
         if (
             self.interval_ns
             and self.last_read is not None
@@ -397,11 +471,16 @@ class Play:
         ):
             return  # 节流：相隔不够，这一帧不读
         self.last_read = capture_ns
+        if dialogue:
+            visible, identity = truth.visible_text, (self.serial,)
+            speaker: str | None = speaker_of(truth.node, truth.text)
+        else:
+            visible = truth.text if truth.scene is SceneType.CUTSCENE else ""
+            identity, speaker = (self.serial, visible), None
         current = self.current
-        if current is not None and current.serial != self.serial:
+        if current is not None and current.identity != identity:
             self._close(number)
             current = None
-        visible = truth.visible_text
         key = compare_key(visible)
         if not key:
             self._close(number)
@@ -410,10 +489,20 @@ class Play:
             if self.scope == 0 or self.scope_pending:
                 self.scope += 1
                 self.scope_pending = False
-            speaker = speaker_of(truth.node, truth.text)
-            current = Expected(self.serial, speaker, self.scope, number, capture_ns, truth.text)
+            cutscene = self.playing
+            current = Expected(
+                identity,
+                speaker,
+                self.scope,
+                None if cutscene is None else cutscene.index,
+                number,
+                capture_ns,
+                truth.text,
+            )
             self.expected.append(current)
             self.current = current
+            if cutscene is not None:
+                cutscene.sentences.append(len(self.expected))
         if key != current.key:
             current.key = key
             current.text = visible
@@ -433,7 +522,7 @@ class Play:
                 current.revision_frame = number
         current.last_frame, current.last_ns = number, capture_ns
         if current.completeness is not Completeness.COMPLETE:
-            marker = self.marker and visible == truth.text
+            marker = self.marker and dialogue and visible == truth.text
             stable = (
                 current.same >= self.params.complete_frames
                 and capture_ns - current.changed_ns >= self.params.complete_after_ns
@@ -441,6 +530,30 @@ class Play:
             if marker or stable:
                 current.completeness = Completeness.COMPLETE
                 current.complete_frame = number
+
+    def _expect_cutscene(self, state: SceneState, number: int, capture_ns: int) -> None:
+        """播片开始与结束的那一帧先结束当前句；新开的播片段同新开一句，可开始新的剧情范围。"""
+        playing = self.playing
+        if playing is not None:
+            if state.playing and state.playing_since_ns == playing.first_ns:
+                playing.last_frame, playing.last_ns = number, capture_ns
+                return
+            self._close(number)
+            playing.closed_frame = number
+            playing.end_ns = None if state.playing else state.playing_ended_ns
+            self.playing = None
+        if not state.playing:
+            return
+        since = state.playing_since_ns
+        assert since is not None
+        self._close(number)
+        if self.scope == 0 or self.scope_pending:
+            self.scope += 1
+            self.scope_pending = False
+        self.playing = ExpectedCutscene(
+            len(self.cutscenes) + 1, self.scope, number, since, number, capture_ns
+        )
+        self.cutscenes.append(self.playing)
 
     def _close(self, number: int) -> None:
         current = self.current
@@ -481,6 +594,13 @@ class Play:
         await self.type_out()
         await self.click("dialogue.box")
 
+    async def watch_cutscene(self) -> None:
+        """逐帧看完播片，回到选项后再看 2 秒：`scene@1` 在最后一个动帧之后 1.5 秒才判出播片结束。"""
+        assert self.game.truth().scene is SceneType.CUTSCENE
+        while self.game.truth().scene is SceneType.CUTSCENE:
+            await self.observe()
+        await self.watch(60)
+
     async def drain(self) -> None:
         """等 scene 处理完已放进帧源的帧，再等剧情记录处理完它们。"""
         scene, narrative = Shared.scene, Shared.narrative
@@ -500,8 +620,9 @@ type Script = Callable[[Play], Awaitable[None]]
 
 
 async def full_story(play: Play) -> None:
-    """标题菜单；开场三句（看完、补全、未读完被推进）；两次敲门（同一句重复出现）；回去睡觉的坏结局；
-    重来后读到地下与计时选择、等到超时的坏结局；再重来，停在第一句的逐字显示中。"""
+    """标题菜单；开场三句（看完、补全、未读完被推进）；两次敲门（同一句重复出现），每次读完都放一段
+    带两句字幕的播片；回去睡觉的坏结局；重来后读到地下与计时选择、等到超时的坏结局；再重来，停在第一
+    句的逐字显示中。"""
     await play.watch(3)
     await play.click("menu.start")
     await play.type_out()  # 开场第一句：看完，继续标记出现
@@ -513,10 +634,10 @@ async def full_story(play: Play) -> None:
     await play.watch(5)
     await play.skip()  # 第三句：没显示完就被推进，进入选项
     await play.watch(2)
-    for _ in range(2):  # 敲门回应两次：同样的文字，两句
+    for _ in range(2):  # 敲门回应两次：同样的文字，两句；读完放播片，放完回到选项
         await play.click("choice.1")
         await play.read()
-        await play.watch(2)
+        await play.watch_cutscene()
     await play.click("choice.2")  # 回去睡觉：坏结局
     await play.watch(2)
     await play.click("ending.retry")  # 新的剧情范围
@@ -542,11 +663,15 @@ async def full_story(play: Play) -> None:
 class RunResult:
     records: tuple[NarrativeRecord, ...]
     scopes: tuple[Scope, ...]
+    cutscenes: tuple[Cutscene, ...]
     discontinuities: tuple[Discontinuity, ...]
     expected: list[Expected]
+    expected_cutscenes: list[ExpectedCutscene]
+    truth_cutscenes: list[tuple[int, int | None]]
     session: int
     stored: list[NarrativeRecord]
     stored_scopes: list[Scope]
+    stored_cutscenes: list[Cutscene]
 
 
 def entry(
@@ -625,10 +750,13 @@ class Rig:
                 await until(lambda: True if narrative.backlog <= 8 else None)
 
         play.pace = pace
+        unsubscribe = scene.subscribe(play.on_scene)
         await script(play)
         await play.drain()
+        unsubscribe()
         records = narrative.records()
         scopes = narrative.scopes
+        cutscenes = narrative.cutscenes
         discontinuities = narrative.discontinuities
         session = narrative.session
         await kernel.shutdown()
@@ -636,11 +764,15 @@ class Rig:
         return RunResult(
             records,
             scopes,
+            cutscenes,
             discontinuities,
             play.expected,
+            play.cutscenes,
+            play.truth_cutscenes,
             session,
             read_records(path, session),
             read_scopes(path, session),
+            read_cutscenes(path, session),
         )
 
 
@@ -650,12 +782,18 @@ def _processed(scene: SceneService, number: int) -> bool | None:
 
 
 def check(outcome: RunResult) -> None:
-    """记录与按真值算出的逐句相同，存储里的与内存里的相同。"""
+    """记录与播片段与按真值算出的逐个相同，存储里的与内存里的相同；播片段的开始与结束时刻是真值里
+    播片的第一帧与回到别的画面之后的第二帧。"""
     assert [row(r) for r in outcome.records] == [row(e) for e in outcome.expected]
+    assert [cutscene_row(c) for c in outcome.cutscenes] == [
+        cutscene_row(e) for e in outcome.expected_cutscenes
+    ]
     assert outcome.stored == list(outcome.records)
     assert outcome.stored_scopes == list(outcome.scopes)
+    assert outcome.stored_cutscenes == list(outcome.cutscenes)
     assert [r.occurrence for r in outcome.records] == list(range(1, len(outcome.records) + 1))
     assert all(r.session == outcome.session for r in outcome.records)
+    assert [(c.first_ns, c.end_ns) for c in outcome.cutscenes] == outcome.truth_cutscenes
 
 
 # 按真值逐句核对
@@ -671,22 +809,43 @@ def test_the_whole_story_matches_the_truth(data_dir: Path) -> None:
     records = outcome.records
     intro = NODES["intro"]
     knock = NODES["knock"]
+    echo = NODES["echo"]
     assert isinstance(intro, Dialogue)
     assert isinstance(knock, Dialogue)
-    assert [(r.speaker, r.completeness, r.scope) for r in records] == [
-        ("旁白", Completeness.COMPLETE, 1),  # 看完
-        ("阿遥", Completeness.COMPLETE, 1),  # 补全
-        ("阿遥", Completeness.GAP, 1),  # 未读完即被推进
-        ("旁白", Completeness.COMPLETE, 1),  # 敲门回应
-        ("旁白", Completeness.COMPLETE, 1),  # 再一次
-        ("旁白", Completeness.COMPLETE, 2),  # 重来后，一下子显示完
-        ("阿遥", Completeness.GAP, 2),
-        ("阿遥", Completeness.COMPLETE, 2),
-        ("旁白", Completeness.COMPLETE, 2),  # 地下
-        ("阿遥", Completeness.COMPLETE, 2),
-        ("旁白", Completeness.PARTIAL, 3),  # 停在逐字显示中
+    assert isinstance(echo, story.Cutscene)
+    assert [(r.speaker, r.completeness, r.scope, r.cutscene) for r in records] == [
+        ("旁白", Completeness.COMPLETE, 1, None),  # 看完
+        ("阿遥", Completeness.COMPLETE, 1, None),  # 补全
+        ("阿遥", Completeness.GAP, 1, None),  # 未读完即被推进
+        ("旁白", Completeness.COMPLETE, 1, None),  # 敲门回应
+        (None, Completeness.COMPLETE, 1, 1),  # 播片的两句字幕
+        (None, Completeness.COMPLETE, 1, 1),
+        ("旁白", Completeness.COMPLETE, 1, None),  # 再一次
+        (None, Completeness.COMPLETE, 1, 2),
+        (None, Completeness.COMPLETE, 1, 2),
+        ("旁白", Completeness.COMPLETE, 2, None),  # 重来后，一下子显示完
+        ("阿遥", Completeness.GAP, 2, None),
+        ("阿遥", Completeness.COMPLETE, 2, None),
+        ("旁白", Completeness.COMPLETE, 2, None),  # 地下
+        ("阿遥", Completeness.COMPLETE, 2, None),
+        ("旁白", Completeness.PARTIAL, 3, None),  # 停在逐字显示中
     ]
-    first, revealed, skipped, knocked, again, instant, *_, last = records
+    first, revealed, skipped, knocked, *subtitles, again = records[:7]
+    instant, last = records[9], records[-1]
+    # 播片：两个播片段，各有两句字幕，开始与结束时刻同真值（`check`）；播片前的那一句由判出播片的
+    # 那一帧结束，字幕的最后一句由回到选项之后读到的空对白框结束。
+    assert [r.text for r in subtitles] == list(echo.subtitles)
+    assert [(c.index, c.scope, c.sentences) for c in outcome.cutscenes] == [
+        (1, 1, (5, 6)),
+        (2, 1, (8, 9)),
+    ]
+    assert knocked.closed_frame == outcome.cutscenes[0].first_frame
+    assert all(c.closed for c in outcome.cutscenes)
+    for cutscene in outcome.cutscenes:
+        assert 3.9e9 < cutscene.duration_ns < 4.2e9
+        last_subtitle = records[cutscene.sentences[-1] - 1]
+        assert last_subtitle.closed_frame is not None
+        assert last_subtitle.closed_frame < cutscene.last_frame
     # 逐字显示：每多显示一个字修订号加一，多显示的是标点时只换文字；看完的一句文字就是全文。
     assert first.text == intro.lines[0].text
     assert first.revision == outcome.expected[0].revision >= len(compare_key(first.text)) - 2
@@ -724,6 +883,9 @@ def test_the_same_frames_give_the_same_records(data_dir: Path) -> None:
     ]
     assert [dataclasses.replace(s, session=0) for s in first.scopes] == [
         dataclasses.replace(s, session=0) for s in second.scopes
+    ]
+    assert [dataclasses.replace(c, session=0) for c in first.cutscenes] == [
+        dataclasses.replace(c, session=0) for c in second.cutscenes
     ]
 
 
@@ -1057,6 +1219,70 @@ def test_stopping_keeps_the_open_sentence_as_it_was(data_dir: Path) -> None:
     assert record.completeness is Completeness.COMPLETE
     assert record.closed_frame is None
     assert record.last_frame == outcome.expected[0].last_frame > record.complete_frame + 10  # pyright: ignore[reportOptionalOperand]
+
+
+async def to_cutscene(play: Play) -> None:
+    """开场三句读完进入选项，敲门回应，读完插曲进入播片。"""
+    await play.click("menu.start")
+    for _ in range(3):
+        await play.read()
+    await play.click("choice.1")
+    await play.read()
+    assert play.game.truth().scene is SceneType.CUTSCENE
+
+
+def test_cutscene_subscribers_get_the_start_and_the_end_in_order(data_dir: Path) -> None:
+    """播片段的开始与结束按发生的顺序与句子的变化交错：先结束播片前的那一句，再开始播片段，然后是
+    字幕；结束时先结束最后一句字幕，再结束播片段。"""
+    events: list[tuple[str, int, bool]] = []
+
+    async def script(play: Play) -> None:
+        narrative = Shared.narrative
+        assert narrative is not None
+        narrative.subscribe(lambda r: events.append(("record", r.occurrence, r.closed)))
+        narrative.subscribe_cutscenes(lambda c: events.append(("cutscene", c.index, c.closed)))
+        await to_cutscene(play)
+        await play.watch_cutscene()
+
+    outcome = asyncio.run(Rig(data_dir).run(script))
+
+    check(outcome)
+    [cutscene] = outcome.cutscenes
+    assert cutscene.sentences == (5, 6)
+    start = events.index(("cutscene", 1, False))
+    assert events[start - 1] == ("record", 4, True)
+    assert events[start + 1] == ("record", 5, False)
+    end = events.index(("cutscene", 1, True))
+    assert events[end - 1] == ("record", 6, True)
+    assert end == len(events) - 1
+    assert [e for e in events if e[0] == "cutscene"] == [
+        ("cutscene", 1, False),
+        ("cutscene", 1, True),
+    ]
+
+
+def test_stopping_keeps_the_open_cutscene_open(data_dir: Path) -> None:
+    """停用时还在播片中：播片段保持没有结束，最后的帧号与其中的句子写进存储。"""
+
+    echo = NODES["echo"]
+    assert isinstance(echo, story.Cutscene)
+
+    async def script(play: Play) -> None:
+        await to_cutscene(play)
+        while play.game.truth().text != echo.subtitles[1]:
+            await play.observe()
+        await play.watch(5)  # 第二句字幕出现了几帧，播片还没放完
+        assert play.game.truth().scene is SceneType.CUTSCENE
+        assert play.states[play.number].playing
+
+    outcome = asyncio.run(Rig(data_dir).run(script))
+
+    check(outcome)
+    [cutscene] = outcome.stored_cutscenes
+    assert (cutscene.closed_frame, cutscene.end_ns) == (None, None)
+    assert cutscene.last_frame == outcome.expected_cutscenes[0].last_frame
+    assert cutscene.sentences == (5, 6)
+    assert outcome.stored[-1].closed_frame is None
 
 
 # 继续标记的签名

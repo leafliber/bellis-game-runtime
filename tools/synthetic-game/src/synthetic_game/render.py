@@ -87,12 +87,20 @@ class EndingView:
 
 
 @dataclass(frozen=True)
+class CutsceneView:
+    elapsed_ms: int
+    """播片开始以来的毫秒数：动画的每一格都随它变。"""
+    subtitle: str
+    """当前的字幕；没有时为空。"""
+
+
+@dataclass(frozen=True)
 class PopupView:
     text: str
     ok: Button
 
 
-type Screen = MenuView | DialogueView | ChoiceView | ShopView | EndingView
+type Screen = MenuView | DialogueView | ChoiceView | ShopView | EndingView | CutsceneView
 
 
 @dataclass(frozen=True)
@@ -126,6 +134,14 @@ DIALOGUE_BACKGROUNDS: dict[str, Color] = {
 }
 DIALOGUE_BACKGROUND: Color = (50, 50, 60)
 
+# 播片：色块与图形的各通道都在这个范围里，避开各画面签名所看的深色与白色，播片中不命中任何签名。
+CUTSCENE_LOW, CUTSCENE_HIGH = 110, 230
+CUTSCENE_COLUMNS, CUTSCENE_ROWS = 16, 9
+"""整屏的色块：设计稿上每块 80×80。"""
+SUBTITLE_BAND_ALPHA = 200
+"""字幕底下半透明的深色条（盖住名字栏与对白框）的不透明度。"""
+_MASK = (1 << 64) - 1
+
 
 class Renderer:
     def __init__(self, width: int, height: int) -> None:
@@ -147,6 +163,8 @@ class Renderer:
                 self._shop(draw, view.screen)
             case EndingView():
                 self._ending(draw, view.screen)
+            case CutsceneView():
+                self._cutscene(ImageDraw.Draw(image, "RGBA"), view.screen)
         if view.popup is not None:
             shade = Image.new("RGBA", image.size, (0, 0, 0, 150))
             image = Image.alpha_composite(image, shade)
@@ -270,6 +288,26 @@ class Renderer:
         self._wrapped(draw, layout.ending_text(), view.text, 32, center=True)
         self._button(draw, view.retry)
 
+    def _cutscene(self, draw: ImageDraw.ImageDraw, view: CutsceneView) -> None:
+        """整屏的色块每毫秒换一次颜色，两个图形来回移动；字幕在对白文字的位置上，底下是半透明的
+        深色条。`draw` 按 RGBA 混合。动画只用整数运算，同样的毫秒数得到同样的像素。"""
+        layout = self._layout
+        ms = view.elapsed_ms
+        for row in range(CUTSCENE_ROWS):
+            for column in range(CUTSCENE_COLUMNS):
+                block = layout.rect(column * 80, row * 80, (column + 1) * 80, (row + 1) * 80)
+                draw.rectangle(_box(block), fill=_shade(column, row, ms))
+        x, y, r = 120 + _bounce(ms, 2600, 1040), 90 + _bounce(ms, 1700, 300), 90
+        draw.ellipse(_box(layout.rect(x - r, y - r, x + r, y + r)), fill=(228, 196, 120))
+        x, y, r = 1160 - _bounce(ms, 3100, 1040), 150 + _bounce(ms, 2300, 250), 80
+        draw.polygon(
+            [layout.point(x, y - r), layout.point(x + r, y + r), layout.point(x - r, y + r)],
+            fill=(120, 196, 228),
+        )
+        draw.rectangle(_box(layout.subtitle_band()), fill=(*PANEL, SUBTITLE_BAND_ALPHA))
+        if view.subtitle:
+            self._wrapped(draw, layout.dialogue_text(), view.subtitle, 32, center=True)
+
     def _popup(self, draw: ImageDraw.ImageDraw, view: PopupView) -> None:
         layout = self._layout
         panel = layout.popup_panel()
@@ -277,6 +315,31 @@ class Renderer:
         draw.rounded_rectangle(_box(panel), radius=radius, fill=PANEL, outline=WHITE)
         self._wrapped(draw, layout.popup_text(), view.text, 30, center=True)
         self._button(draw, view.ok)
+
+
+def _shade(column: int, row: int, ms: int) -> Color:
+    """色块在第 `ms` 毫秒的颜色：按位置与时刻散列，各通道在 `CUTSCENE_LOW`–`CUTSCENE_HIGH`。"""
+    value = (
+        column * 0x9E3779B97F4A7C15 + row * 0xC2B2AE3D27D4EB4F + ms * 0x165667B19E3779F9
+    ) & _MASK
+    value ^= value >> 30
+    value = (value * 0xBF58476D1CE4E5B9) & _MASK
+    value ^= value >> 27
+    value = (value * 0x94D049BB133111EB) & _MASK
+    value ^= value >> 31
+    span = CUTSCENE_HIGH - CUTSCENE_LOW + 1
+    return (
+        CUTSCENE_LOW + value % span,
+        CUTSCENE_LOW + (value >> 21) % span,
+        CUTSCENE_LOW + (value >> 42) % span,
+    )
+
+
+def _bounce(ms: int, period: int, span: int) -> int:
+    """在 0 与 `span` 之间来回的三角波，周期 `period` 毫秒。"""
+    phase = ms % period
+    half = period // 2
+    return span * phase // half if phase < half else span * (period - phase) // (period - half)
 
 
 def _box(rect: Rect) -> tuple[int, int, int, int]:

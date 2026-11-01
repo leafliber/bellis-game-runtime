@@ -23,7 +23,7 @@ from synthetic_game.render import (
     Renderer,
     View,
 )
-from synthetic_game.story import NODES, UI, Choice, Dialogue, Ending
+from synthetic_game.story import NODES, UI, Choice, Cutscene, Dialogue, Ending
 
 GAME = "synthetic-game"
 IMAGES_DIR = "images"
@@ -73,6 +73,8 @@ def _shots(layout: Layout) -> list[_Shot]:
                 retry = Button(layout.ending_retry(), UI.retry, True)
                 view = View(EndingView(UI.bad_ending, text, retry), None)
                 shots.append(_Shot(view, (("ending", "ending-text", text),)))
+            case Cutscene():
+                pass  # 播片的字幕叠在每毫秒都变的动画上，不作样本
     labels = (UI.menu_start, UI.menu_shop, UI.menu_help)
     menu = View(
         MenuView(

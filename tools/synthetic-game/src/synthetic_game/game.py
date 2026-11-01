@@ -7,6 +7,7 @@
 import math
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from typing import Final
 
 from synthetic_game.clock import Clock, MonotonicClock
 from synthetic_game.inputs import Click, Input, Key, MouseButton, Press, Scroll
@@ -14,6 +15,7 @@ from synthetic_game.layout import SHOP_VISIBLE_ROWS, Layout, Rect
 from synthetic_game.render import (
     Button,
     ChoiceView,
+    CutsceneView,
     DialogueView,
     EndingView,
     Frame,
@@ -33,6 +35,7 @@ from synthetic_game.story import (
     TITLE,
     UI,
     Choice,
+    Cutscene,
     Dialogue,
     Ending,
 )
@@ -42,6 +45,10 @@ SHOP = "shop"
 
 MIN_WIDTH, MIN_HEIGHT = 320, 180
 MAX_WIDTH, MAX_HEIGHT = 7680, 4320
+
+SUBTITLES_FROM: Final = 3 / 8
+"""播片的字幕从播片的这个比例处开始，依次等分其后的时间：`scene@1` 约 2 秒才判出播片，缺省 4 秒的
+播片里字幕在 1.5–2.75 秒与 2.75–4 秒，判出之后都还看得见。"""
 
 
 class SceneType(StrEnum):
@@ -55,17 +62,19 @@ class SceneType(StrEnum):
     CHOICE = "选择"
     TIMED_CHOICE = "计时选择"
     SHOP = "商店"
+    CUTSCENE = "过场"
     BAD_ENDING = "坏结局"
 
 
 @dataclass(frozen=True)
 class GameConfig:
-    """分辨率（客户区物理像素）、文字速度（每秒显示的字数）与计时选择的时长（秒）。"""
+    """分辨率（客户区物理像素）、文字速度（每秒显示的字数）、计时选择与播片的时长（秒）。"""
 
     width: int = 1280
     height: int = 720
     text_cps: float = 30.0
     choice_seconds: float = 5.0
+    cutscene_seconds: float = 4.0
 
     def __post_init__(self) -> None:
         if not (MIN_WIDTH <= self.width <= MAX_WIDTH and MIN_HEIGHT <= self.height <= MAX_HEIGHT):
@@ -77,6 +86,8 @@ class GameConfig:
             raise ValueError(f"文字速度须为正数：{self.text_cps}")
         if not (math.isfinite(self.choice_seconds) and self.choice_seconds > 0):
             raise ValueError(f"计时时长须为正数：{self.choice_seconds}")
+        if not (math.isfinite(self.cutscene_seconds) and self.cutscene_seconds > 0):
+            raise ValueError(f"播片时长须为正数：{self.cutscene_seconds}")
 
 
 @dataclass(frozen=True)
@@ -98,7 +109,7 @@ class EffectKind(StrEnum):
     SCROLL = "scroll"
     """滚动落在可滚动的区域内并被处理。"""
     IGNORED = "ignored"
-    """当前画面不处理这个输入：非左键点击、没有绑定的键、可滚动区域之外的滚动。"""
+    """当前画面不处理这个输入：非左键点击、没有绑定的键、可滚动区域之外的滚动、播片中的任何输入。"""
 
 
 @dataclass(frozen=True)
@@ -126,17 +137,21 @@ class Truth:
     node: str
     overlay: Overlay | None
     targets: tuple[Target, ...]
-    """当前能点的目标；有弹窗时只有弹窗上的目标。"""
+    """当前能点的目标；有弹窗时只有弹窗上的目标，播片时没有。"""
     selected: str | None
     """键盘光标所在的目标。"""
     text: str
-    """画面的主要文字全文：台词、提问、结局文字，菜单与商店为标题。"""
+    """画面的主要文字全文：台词、提问、结局文字、播片当前的字幕（没有时为空），菜单与商店为标题。"""
     visible_text: str
     """已经显示出来的部分；只有对话逐字显示时与 `text` 不同。"""
     timer_remaining: float | None
     coins: int
     owned: frozenset[str]
     last_effect: Effect | None
+    cutscene_start: float | None
+    """播片时，播片开始的时钟读数（秒）；其余为 None。"""
+    cutscene_end: float | None
+    """播片时，播片放完、回到下一节点的时钟读数（秒）；其余为 None。"""
 
 
 @dataclass(frozen=True)
@@ -154,9 +169,11 @@ class _State:
     owned: frozenset[str]
     line: int = 0
     line_started: float = 0.0
+    """对话里本句开始的时刻；播片里播片开始的时刻。"""
     revealed: bool = False
     cursor: int = 0
     deadline: float | None = None
+    """计时选择的截止时刻；播片放完的时刻。"""
     shop_offset: int = 0
     popup: _Popup | None = None
 
@@ -168,7 +185,7 @@ MENU_ENTRIES: tuple[tuple[str, str], ...] = (
 )
 
 
-def _node[T: Dialogue | Choice | Ending](node_id: str, kind: type[T]) -> T:
+def _node[T: Dialogue | Choice | Ending | Cutscene](node_id: str, kind: type[T]) -> T:
     node = NODES[node_id]
     if not isinstance(node, kind):
         raise TypeError(f"节点 {node_id} 不是 {kind.__name__}")
@@ -218,8 +235,15 @@ class SyntheticGame:
         targets = self._targets(state)
         text, visible = self._texts(state, now)
         remaining = None
-        if state.deadline is not None and state.popup is None:
+        if (
+            state.scene is SceneType.TIMED_CHOICE
+            and state.deadline is not None
+            and state.popup is None
+        ):
             remaining = max(0.0, state.deadline - now)
+        start = end = None
+        if state.scene is SceneType.CUTSCENE:
+            start, end = state.line_started, state.deadline
         return Truth(
             scene=state.scene,
             node=state.node,
@@ -232,24 +256,30 @@ class SyntheticGame:
             coins=state.coins,
             owned=state.owned,
             last_effect=self._last_effect,
+            cutscene_start=start,
+            cutscene_end=end,
         )
 
     # 时间
 
     def _sync(self) -> float:
-        """读一次时钟并处理到点的计时；计时到点的转换发生在截止时刻，与何时被处理无关。"""
+        """读一次时钟并处理到点的计时与播片；到点的转换发生在截止时刻，与何时被处理无关。"""
         now = self._clock.now()
         state = self._state
         while (
-            state.scene is SceneType.TIMED_CHOICE
+            state.scene in (SceneType.TIMED_CHOICE, SceneType.CUTSCENE)
             and state.popup is None
             and state.deadline is not None
             and now >= state.deadline
         ):
-            timeout_next = _node(state.node, Choice).timeout_next
-            if timeout_next is None:
-                raise TypeError(f"节点 {state.node} 不是计时选择")
-            state = self._enter(state, timeout_next, state.deadline)
+            if state.scene is SceneType.CUTSCENE:
+                after = _node(state.node, Cutscene).next
+            else:
+                timeout_next = _node(state.node, Choice).timeout_next
+                if timeout_next is None:
+                    raise TypeError(f"节点 {state.node} 不是计时选择")
+                after = timeout_next
+            state = self._enter(state, after, state.deadline)
         self._state = state
         return now
 
@@ -258,6 +288,17 @@ class SyntheticGame:
             return len(text)
         shown = math.floor((now - state.line_started) * self.config.text_cps)
         return max(0, min(len(text), shown))
+
+    def _subtitle(self, state: _State, now: float) -> str:
+        """播片此刻的字幕：从播片的 `SUBTITLES_FROM` 处起依次等分其后的时间；之前没有字幕。"""
+        subtitles = _node(state.node, Cutscene).subtitles
+        length = self.config.cutscene_seconds
+        start = length * SUBTITLES_FROM
+        elapsed = now - state.line_started
+        if not subtitles or elapsed < start:
+            return ""
+        index = math.floor((elapsed - start) * len(subtitles) / (length - start))
+        return subtitles[min(index, len(subtitles) - 1)]
 
     # 转换
 
@@ -278,10 +319,17 @@ class SyntheticGame:
                 return replace(base, scene=SceneType.TIMED_CHOICE, node=node_id, deadline=deadline)
             case Ending():
                 return replace(base, scene=SceneType.BAD_ENDING, node=node_id)
+            case Cutscene():
+                end = now + self.config.cutscene_seconds
+                return replace(
+                    base, scene=SceneType.CUTSCENE, node=node_id, line_started=now, deadline=end
+                )
 
     def _dispatch(
         self, state: _State, event: Input, now: float
     ) -> tuple[EffectKind, str | None, _State]:
+        if state.scene is SceneType.CUTSCENE:
+            return EffectKind.IGNORED, None, state  # 播片中的输入都忽略
         match event:
             case Click(button=MouseButton.LEFT):
                 for target in self._targets(state):
@@ -408,6 +456,8 @@ class SyntheticGame:
                     for slot, index in enumerate(_visible_items(state))
                 )
                 return (*rows, Target("shop.leave", layout.shop_leave(), UI.shop_leave))
+            case SceneType.CUTSCENE:
+                return ()
             case SceneType.BAD_ENDING:
                 return (Target("ending.retry", layout.ending_retry(), UI.retry),)
 
@@ -423,6 +473,8 @@ class SyntheticGame:
                 return f"choice.{state.cursor}"
             case SceneType.SHOP:
                 return f"shop.item.{state.cursor}"
+            case SceneType.CUTSCENE:
+                return None
             case SceneType.BAD_ENDING:
                 return "ending.retry"
 
@@ -439,6 +491,9 @@ class SyntheticGame:
                 return prompt, prompt
             case Ending(text=text):
                 return text, text
+            case Cutscene():
+                subtitle = self._subtitle(state, now)
+                return subtitle, subtitle
 
     def _view(self, state: _State, now: float) -> View:
         selected = None if state.popup is not None else self._selected(state)
@@ -489,6 +544,10 @@ class SyntheticGame:
                     state.shop_offset,
                     len(SHOP_ITEMS),
                 )
+            case SceneType.CUTSCENE:
+                # 动画按毫秒变：时钟读数不同的两帧画面不同。
+                elapsed_ms = round((now - state.line_started) * 1000)
+                screen = CutsceneView(elapsed_ms, self._subtitle(state, now))
             case SceneType.BAD_ENDING:
                 screen = EndingView(UI.bad_ending, _node(state.node, Ending).text, buttons[0])
         popup = None

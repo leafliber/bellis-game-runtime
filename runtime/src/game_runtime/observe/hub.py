@@ -16,6 +16,7 @@ from game_runtime.adapter import Adapter
 from game_runtime.kernel import Reason, State, Transition
 from game_runtime.narrative import (
     Completeness,
+    Cutscene,
     Discontinuity,
     NarrativeRecord,
     NarrativeService,
@@ -85,6 +86,26 @@ class LineEvent:
         return self.record.first_ns if self.kind is LineKind.APPEAR else self.record.last_ns
 
 
+@dataclass(frozen=True, slots=True)
+class CutsceneEvent:
+    """剧情记录的一个播片段开始或结束。"""
+
+    cutscene: Cutscene
+    """这一刻这个播片段的状态；结束时含其中的各句。"""
+
+    @property
+    def ended(self) -> bool:
+        return self.cutscene.closed
+
+    @property
+    def at_ns(self) -> int:
+        """开始时为开始时刻；结束时为结束时刻，结束时刻随中断丢了时为最后一个在播片中的帧。"""
+        cutscene = self.cutscene
+        if not cutscene.closed:
+            return cutscene.first_ns
+        return cutscene.last_ns if cutscene.end_ns is None else cutscene.end_ns
+
+
 class LanguageResult(StrEnum):
     MATCH = "match"
     """各项都相符。"""
@@ -136,7 +157,9 @@ class PluginEvent:
     reasons: tuple[Reason, ...]
 
 
-type Event = SceneEvent | VoiceEvent | LineEvent | LanguageEvent | ScriptEvent | PluginEvent
+type Event = (
+    SceneEvent | VoiceEvent | LineEvent | CutsceneEvent | LanguageEvent | ScriptEvent | PluginEvent
+)
 type EventSink = Callable[[Event], None]
 
 
@@ -262,10 +285,11 @@ def _ambiguous_screens(state: SceneState) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class NarrativeFinal:
-    """停用时剧情记录的各句、范围与中断。"""
+    """停用时剧情记录的各句、范围、播片段与中断。"""
 
     records: tuple[NarrativeRecord, ...]
     scopes: tuple[Scope, ...]
+    cutscenes: tuple[Cutscene, ...]
     discontinuities: tuple[Discontinuity, ...]
 
 
@@ -308,6 +332,7 @@ class ObserveHub:
         self._voice = _Voice(self.origin_ns)
         self._shown: dict[int, _Shown] = {}
         self._records: dict[int, NarrativeRecord] = {}
+        self._cutscenes: dict[int, Cutscene] = {}
 
     # 插件一侧
 
@@ -383,6 +408,11 @@ class ObserveHub:
         )
         self.sink(LineEvent(kind, record, shown_text))
 
+    def on_cutscene(self, cutscene: Cutscene) -> None:
+        """剧情记录的一个播片段开始或结束：各显示一行。"""
+        self._cutscenes[cutscene.index] = cutscene
+        self.sink(CutsceneEvent(cutscene))
+
     def on_language(self, event: LanguageEvent) -> None:
         self.language_results.setdefault(event.screen, collections.Counter())[event.result] += 1
         if event.result is LanguageResult.MATCH:
@@ -443,6 +473,12 @@ class ObserveHub:
         if self.final is not None:
             return self.final.records
         return tuple(self._records[key] for key in sorted(self._records))
+
+    def cutscenes(self) -> tuple[Cutscene, ...]:
+        """各播片段最后的状态：停用时记下的，或还在运行时收到的（开始与结束时的），按编号。"""
+        if self.final is not None:
+            return self.final.cutscenes
+        return tuple(self._cutscenes[key] for key in sorted(self._cutscenes))
 
     def scene_shares(self) -> list[Share]:
         """画面判别的分布，按第一次出现的顺序；每帧的时长算到下一帧为止。"""

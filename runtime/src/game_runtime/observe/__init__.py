@@ -7,6 +7,7 @@ Bellis。
 
 from game_runtime.observe.display import Formatter, banner, clock, status_line, summary
 from game_runtime.observe.hub import (
+    CutsceneEvent,
     Event,
     LanguageEvent,
     LanguageResult,
@@ -34,6 +35,7 @@ from game_runtime.observe.run import Monitor, run_live
 
 __all__ = [
     "OBSERVER_ENTRY",
+    "CutsceneEvent",
     "Event",
     "Formatter",
     "LanguageEvent",

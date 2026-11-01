@@ -274,6 +274,12 @@ def parse_args(argv: Sequence[str] | None) -> ShellOptions:
         help="duration of the timed choice",
     )
     parser.add_argument(
+        "--cutscene-seconds",
+        type=float,
+        default=defaults.cutscene_seconds,
+        help="duration of the cutscene",
+    )
+    parser.add_argument(
         "--redraw-hz",
         type=float,
         default=DEFAULT_REDRAW_HZ,
@@ -287,7 +293,9 @@ def parse_args(argv: Sequence[str] | None) -> ShellOptions:
     )
     args = parser.parse_args(argv)
     try:
-        game = GameConfig(args.width, args.height, args.text_cps, args.choice_seconds)
+        game = GameConfig(
+            args.width, args.height, args.text_cps, args.choice_seconds, args.cutscene_seconds
+        )
         autoplay = None if args.autoplay is None else check_autoplay(args.autoplay)
         return ShellOptions(game, check_redraw_hz(args.redraw_hz), autoplay)
     except ValueError as error:

@@ -1,7 +1,7 @@
 """录制与 M0 回放经真实实时核的联调：合成游戏的帧写进假显示面、声音写进假音频输出，实时核的假采集源
 与假音频源写进帧环与音频环，定序帧源接纳的帧交给感知插件并录下，声音按块录下；回放同一段录制，
-`scene@1` 的逐帧状态、`voice-activity@1` 的变化与喂入标记都与实时运行逐条相同，录下的像素与样本值与
-写进去的逐一相同。另核对中途停止（像 Ctrl+C）时收尾完整、不留半截文件。
+`scene@1` 的逐帧状态、`voice-activity@1` 的变化与喂入标记、剧情记录的句子与播片段都与实时运行逐条
+相同，录下的像素与样本值与写进去的逐一相同。另核对中途停止（像 Ctrl+C）时收尾完整、不留半截文件。
 
 OCR 用按脚本回答的识别器，配音检测用按音量判断的假模型，都不要模型文件；Windows 上跑命名文件映射，
 Linux 容器里跑 POSIX 共享内存。真机经 WGC 的录制见 `test_record_window.py`（手动）。
@@ -10,6 +10,7 @@ Linux 容器里跑 POSIX 共享内存。真机经 WGC 的录制见 `test_record_
 import asyncio
 import contextlib
 import functools
+import json
 import sys
 import time
 from collections.abc import Callable
@@ -41,7 +42,7 @@ from game_runtime.recording.layout import LIVE_DIR, REPLAY_DIR, ToolInfo, read_m
 from game_runtime.scene import store_template
 from game_runtime.voice_activity import SpeechModel, VoiceActivityPlugin
 from game_runtime.voice_activity.fake import EnergyModel
-from synthetic_game import Click, GameConfig, ManualClock, SyntheticGame
+from synthetic_game import Click, GameConfig, ManualClock, SceneType, SyntheticGame
 from synthetic_game.anchors import anchor_templates
 
 WIDTH, HEIGHT = 640, 360
@@ -141,6 +142,12 @@ class Player:
         rect = next(t.rect for t in self.game.truth().targets if t.id == target)
         self.game.handle(Click(*rect.center))
 
+    async def read_on(self) -> None:
+        """点对话框推进（补全或下一句），每次之后显示 0.1 秒，直到离开对话。"""
+        while self.game.truth().scene is SceneType.DIALOGUE:
+            self.click("dialogue.box")
+            await self.show(0.1)
+
     async def sound(self, pattern: list[tuple[float, bool]]) -> None:
         """依次发出（时长，有声与否）的声音，每 10 ms 一块；之后不再发出，块号不前进。
 
@@ -191,6 +198,16 @@ def test_a_live_recording_replays_to_the_same_results(
                 player.click("menu.start")
                 await player.show(1.6)
                 await sound
+                # 读完开场对话进入选项，敲门回应，读完插曲进入播片；看完 4 秒的播片，回到选项后再
+                # 显示 2 秒，scene@1 在最后一个动帧之后 1.5 秒判出播片结束。
+                await player.read_on()
+                player.click("choice.1")
+                await player.show(0.3)
+                await player.read_on()
+                assert player.game.truth().scene is SceneType.CUTSCENE
+                while player.game.truth().scene is SceneType.CUTSCENE:
+                    await player.show(0.1)
+                await player.show(2.0)
             finally:
                 result = await session.stop("seconds")
             assert result.drained
@@ -217,8 +234,23 @@ def test_a_live_recording_replays_to_the_same_results(
     assert '"stalled"' in voice  # 不再发出声音之后按墙钟发现的中断
     assert '"interrupt"' in (live / "voice-feed.jsonl").read_text(encoding="utf-8")
     # 剧情记录：对白画面上逐句记录，SQLite 在录制目录的 live/ 里，与实时运行的剧情记录分开。
-    assert '"complete"' in (live / "narrative.jsonl").read_text(encoding="utf-8")
+    narrative = (live / "narrative.jsonl").read_text(encoding="utf-8").splitlines()
+    assert any('"complete"' in line for line in narrative)
     assert (live / "narrative" / "synthetic-game.sqlite3").is_file()
+    # 播片：开始与结束各一行插在句子的变化之间，播片中读到的字幕带播片段编号；最后的输出里有这个
+    # 播片段，已结束。
+    cutscenes = [json.loads(line) for line in narrative if '"type":"cutscene"' in line]
+    assert [(c["index"], c["closed_frame"] is not None) for c in cutscenes] == [
+        (1, False),
+        (1, True),
+    ]
+    assert any('"cutscene":1,' in line for line in narrative if '"type"' not in line)
+    final = (live / "narrative-final.jsonl").read_text(encoding="utf-8").splitlines()
+    [ended] = [json.loads(line) for line in final if '"type":"cutscene"' in line]
+    assert ended == cutscenes[-1]
+    assert ended["sentences"]
+    # 手动时钟每显示一帧走 0.02 秒，墙钟上的一帧不一定正好 20 ms：4 秒的播片按采集时刻大约 3–6 秒。
+    assert 2e9 < ended["end_ns"] - ended["first_ns"] < 8e9
 
     async def again() -> None:
         plugins = functools.partial(perception_catalog, voice=FakeVoice)

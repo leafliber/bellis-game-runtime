@@ -22,10 +22,21 @@ from synthetic_game import (
     SyntheticGame,
     Target,
 )
-from synthetic_game.story import NODES, SHOP_ITEMS, START, STARTING_COINS, TITLE, Choice, Dialogue
+from synthetic_game.story import (
+    NODES,
+    SHOP_ITEMS,
+    START,
+    STARTING_COINS,
+    TITLE,
+    Choice,
+    Cutscene,
+    Dialogue,
+)
 
 TEXT_CPS = 8.0
 CHOICE_SECONDS = 4.0
+CUTSCENE_SECONDS = 4.0
+"""缺省的播片时长。"""
 MENU_TARGETS = ("menu.start", "menu.shop", "menu.help")
 
 
@@ -87,6 +98,8 @@ def test_story_graph_references_only_existing_nodes() -> None:
                 destinations = [option.next for option in options]
                 if timeout_next is not None:
                     destinations.append(timeout_next)
+            case Cutscene(next=following):
+                destinations = [following]
             case _:
                 destinations = []
         for destination in destinations:
@@ -202,7 +215,95 @@ def test_dialogue_leads_to_a_choice_and_choices_lead_on(
     assert (game.truth().scene, game.truth().node) == (SceneType.DIALOGUE, "knock")
 
     read_dialogue(game, clock)
+    assert (game.truth().scene, game.truth().node) == (SceneType.CUTSCENE, "echo")
+    clock.advance(CUTSCENE_SECONDS)
     assert (game.truth().scene, game.truth().node) == (SceneType.CHOICE, "door")
+
+
+def to_cutscene(game: SyntheticGame, clock: ManualClock) -> float:
+    """敲门回应、读完插曲进入播片，返回播片开始的时钟读数。"""
+    to_door_choice(game, clock)
+    click(game, "choice.1")
+    read_dialogue(game, clock)
+    assert game.truth().scene is SceneType.CUTSCENE
+    return clock.now()
+
+
+def test_the_cutscene_shows_two_subtitles_late_enough_and_returns_to_the_choice(
+    game: SyntheticGame, clock: ManualClock
+) -> None:
+    start = to_cutscene(game, clock)
+    echo = NODES["echo"]
+    assert isinstance(echo, Cutscene)
+    first, second = echo.subtitles
+    seen: list[tuple[float, str]] = []
+    # 每 1/16 秒看一次：播片的时长是 4 秒，字幕从 3/8 处（1.5 秒）起依次等分其后的时间。
+    while (truth := game.truth()).scene is SceneType.CUTSCENE:
+        assert (truth.node, truth.overlay, truth.targets, truth.selected) == (
+            "echo",
+            None,
+            (),
+            None,
+        )
+        assert (truth.cutscene_start, truth.cutscene_end) == (start, start + CUTSCENE_SECONDS)
+        assert truth.visible_text == truth.text
+        assert truth.timer_remaining is None
+        seen.append((clock.now() - start, truth.text))
+        clock.advance(0.0625)
+    assert [elapsed for elapsed, _ in seen] == [n * 0.0625 for n in range(64)]
+    assert {text for elapsed, text in seen if elapsed < 1.5} == {""}
+    assert {text for elapsed, text in seen if 1.5 <= elapsed < 2.75} == {first}
+    assert {text for elapsed, text in seen if elapsed >= 2.75} == {second}
+    # 放到 4 秒整回到选项：转换按播片结束的时刻本身发生。
+    truth = game.truth()
+    assert (truth.scene, truth.node, truth.cutscene_start, truth.cutscene_end) == (
+        SceneType.CHOICE,
+        "door",
+        None,
+        None,
+    )
+
+
+def test_every_input_is_ignored_during_the_cutscene(
+    game: SyntheticGame, clock: ManualClock
+) -> None:
+    to_cutscene(game, clock)
+    for event in (
+        Click(640, 580),
+        Click(1, 1, MouseButton.RIGHT),
+        Press(Key.ENTER),
+        Press(Key.ESCAPE),
+        Press(Key.DOWN),
+        Scroll(640, 360, 1),
+    ):
+        assert game.handle(event) == Effect(event, EffectKind.IGNORED, None, changed=False)
+        clock.advance(0.5)
+    assert game.truth().scene is SceneType.CUTSCENE
+    clock.advance(1.0)
+    assert game.truth().scene is SceneType.CHOICE
+
+
+def test_a_late_look_lands_after_the_cutscene(game: SyntheticGame, clock: ManualClock) -> None:
+    """放完之后才处理的输入落在选项上：转换按播片结束的时刻发生，与何时被观察无关。"""
+    to_cutscene(game, clock)
+    clock.advance(CUTSCENE_SECONDS + 10)
+
+    effect = click(game, "choice.2")
+    assert effect.kind is EffectKind.HIT
+    assert game.truth().node == "sleep"
+
+
+def test_the_cutscene_picture_changes_with_every_clock_reading(
+    game: SyntheticGame, clock: ManualClock
+) -> None:
+    to_cutscene(game, clock)
+    frames = [game.frame()]
+    assert game.frame() is frames[0]  # 时钟没走，画面不变
+    for _ in range(5):
+        clock.advance(0.015625)
+        frames.append(game.frame())
+    assert [f.number for f in frames] == list(range(frames[0].number, frames[0].number + 6))
+    assert len({f.data for f in frames}) == len(frames)
 
 
 def test_choice_cursor_wraps_and_enter_chooses(game: SyntheticGame, clock: ManualClock) -> None:
@@ -423,6 +524,8 @@ def test_the_same_inputs_give_the_same_results() -> None:
         pytest.param(lambda: GameConfig(text_cps=float("nan")), id="nan-speed"),
         pytest.param(lambda: GameConfig(choice_seconds=-1.0), id="negative-timer"),
         pytest.param(lambda: GameConfig(choice_seconds=float("inf")), id="infinite-timer"),
+        pytest.param(lambda: GameConfig(cutscene_seconds=0.0), id="zero-cutscene"),
+        pytest.param(lambda: GameConfig(cutscene_seconds=float("nan")), id="nan-cutscene"),
     ],
 )
 def test_invalid_configuration_is_rejected(make: Callable[[], GameConfig]) -> None:

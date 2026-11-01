@@ -69,9 +69,9 @@ def test_command_line_sets_the_configuration() -> None:
     assert parse_args(
         [
             *("--width", "800", "--height", "600", "--text-cps", "12"),
-            *("--choice-seconds", "3", "--redraw-hz", "60"),
+            *("--choice-seconds", "3", "--cutscene-seconds", "6", "--redraw-hz", "60"),
         ]
-    ) == ShellOptions(GameConfig(800, 600, 12.0, 3.0), 60.0)
+    ) == ShellOptions(GameConfig(800, 600, 12.0, 3.0, 6.0), 60.0)
     assert parse_args(["--autoplay", "1.5"]) == ShellOptions(GameConfig(), 30.0, 1.5)
 
 
@@ -79,6 +79,7 @@ def test_command_line_sets_the_configuration() -> None:
     "argv",
     [
         ["--width", "10"],
+        ["--cutscene-seconds", "0"],
         ["--redraw-hz", "0"],
         ["--redraw-hz", "1001"],
         ["--redraw-hz", "nan"],

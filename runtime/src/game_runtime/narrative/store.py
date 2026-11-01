@@ -14,6 +14,7 @@ from typing import Final
 
 from game_runtime.narrative.record import (
     Completeness,
+    Cutscene,
     Discontinuity,
     LowConfidenceLine,
     NarrativeRecord,
@@ -22,11 +23,15 @@ from game_runtime.narrative.record import (
 
 NARRATIVE_DIR: Final = "narrative"
 """本地数据目录下放剧情记录的子目录。"""
-SCHEMA_VERSION: Final = 2
-"""存储文件的格式版本（`user_version`）。2：`records.screen` 可为空（对白框没写画面）。"""
+SCHEMA_VERSION: Final = 3
+"""存储文件的格式版本（`user_version`）。2：`records.screen` 可为空（对白框没写画面）。3：加
+`records.cutscene` 与 `cutscenes` 表（播片段）。"""
 
 
-def _records_table(name: str) -> str:
+def _records_table(name: str, *, cutscene: bool = True) -> str:
+    """`records` 表；`cutscene` 为假时是版本 2 的表（没有 `cutscene` 列，升级时用）。新加的列
+    排在最后，与旧文件上 `ALTER TABLE … ADD COLUMN` 加出来的列顺序相同。"""
+    added = "    cutscene INTEGER,\n" if cutscene else ""
     return f"""
 CREATE TABLE {name} (
     session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
@@ -45,10 +50,26 @@ CREATE TABLE {name} (
     complete_frame INTEGER,
     closed_frame INTEGER,
     low_confidence TEXT NOT NULL,
-    PRIMARY KEY (session, occurrence)
+{added}    PRIMARY KEY (session, occurrence)
 );
 """
 
+
+_CUTSCENES_TABLE: Final = """
+CREATE TABLE cutscenes (
+    session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
+    cutscene INTEGER NOT NULL,
+    scope INTEGER NOT NULL,
+    first_frame INTEGER NOT NULL,
+    first_ns INTEGER NOT NULL,
+    last_frame INTEGER NOT NULL,
+    last_ns INTEGER NOT NULL,
+    end_ns INTEGER,
+    closed_frame INTEGER,
+    sentences TEXT NOT NULL,
+    PRIMARY KEY (session, cutscene)
+);
+"""
 
 _SCHEMA: Final = f"""
 CREATE TABLE sessions (
@@ -63,6 +84,7 @@ CREATE TABLE scopes (
     PRIMARY KEY (session, scope)
 );
 {_records_table("records")}
+{_CUTSCENES_TABLE}
 CREATE TABLE discontinuities (
     session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
     first_frame INTEGER NOT NULL,
@@ -74,23 +96,33 @@ CREATE TABLE discontinuities (
 
 _UPGRADES: Final = {
     1: (
-        _records_table("records_v2"),
+        _records_table("records_v2", cutscene=False),
         "INSERT INTO records_v2 SELECT * FROM records;",
         "DROP TABLE records;",
         "ALTER TABLE records_v2 RENAME TO records;",
     ),
+    2: (
+        "ALTER TABLE records ADD COLUMN cutscene INTEGER;",
+        _CUTSCENES_TABLE,
+    ),
 }
-"""从各旧版本升到下一版的语句：版本 1 的 `records.screen` 不能为空，按新表重建，记录照留。"""
+"""从各旧版本升到下一版的语句，记录照留：版本 1 的 `records.screen` 不能为空，按新表重建；版本 2
+没有播片段，加列与表。"""
 
 _INSERT_RECORD: Final = (
-    "INSERT OR REPLACE INTO records (session, occurrence, scope, screen, speaker, text, revision, "
-    "completeness, first_frame, first_ns, last_frame, last_ns, revision_frame, complete_frame, "
-    "closed_frame, low_confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT OR REPLACE INTO records (session, occurrence, scope, screen, cutscene, speaker, text, "
+    "revision, completeness, first_frame, first_ns, last_frame, last_ns, revision_frame, "
+    "complete_frame, closed_frame, low_confidence) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 _SELECT_RECORDS: Final = (
-    "SELECT session, occurrence, scope, screen, speaker, text, revision, completeness, "
+    "SELECT session, occurrence, scope, screen, cutscene, speaker, text, revision, completeness, "
     "first_frame, first_ns, last_frame, last_ns, revision_frame, complete_frame, closed_frame, "
     "low_confidence FROM records WHERE session = ? ORDER BY occurrence"
+)
+_INSERT_CUTSCENE: Final = (
+    "INSERT OR REPLACE INTO cutscenes (session, cutscene, scope, first_frame, first_ns, "
+    "last_frame, last_ns, end_ns, closed_frame, sentences) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 
@@ -154,8 +186,9 @@ class NarrativeStore:
         records: Iterable[NarrativeRecord],
         scopes: Iterable[Scope] = (),
         discontinuities: Iterable[Discontinuity] = (),
+        cutscenes: Iterable[Cutscene] = (),
     ) -> None:
-        """在一个事务里写入变化：记录按运行号与出现编号覆盖为新状态。"""
+        """在一个事务里写入变化：记录与播片段按运行号与编号覆盖为新状态。"""
         with _transaction(self._db):
             self._db.executemany(
                 "INSERT INTO scopes (session, scope, after_screen, first_frame) "
@@ -163,6 +196,7 @@ class NarrativeStore:
                 [(s.session, s.scope, s.after_screen, s.first_frame) for s in scopes],
             )
             self._db.executemany(_INSERT_RECORD, [_record_row(record) for record in records])
+            self._db.executemany(_INSERT_CUTSCENE, [_cutscene_row(c) for c in cutscenes])
             self._db.executemany(
                 "INSERT INTO discontinuities (session, first_frame, last_frame, count) "
                 "VALUES (?, ?, ?, ?)",
@@ -241,6 +275,7 @@ def _record_row(record: NarrativeRecord) -> tuple[object, ...]:
         record.occurrence,
         record.scope,
         record.screen,
+        record.cutscene,
         record.speaker,
         record.text,
         record.revision,
@@ -253,6 +288,21 @@ def _record_row(record: NarrativeRecord) -> tuple[object, ...]:
         record.complete_frame,
         record.closed_frame,
         json.dumps(low, ensure_ascii=False),
+    )
+
+
+def _cutscene_row(cutscene: Cutscene) -> tuple[object, ...]:
+    return (
+        cutscene.session,
+        cutscene.index,
+        cutscene.scope,
+        cutscene.first_frame,
+        cutscene.first_ns,
+        cutscene.last_frame,
+        cutscene.last_ns,
+        cutscene.end_ns,
+        cutscene.closed_frame,
+        json.dumps(list(cutscene.sentences)),
     )
 
 
@@ -311,12 +361,55 @@ def read_discontinuities(path: Path, session: int) -> list[Discontinuity]:
     return [Discontinuity(int(a), int(b), int(c), int(d)) for a, b, c, d in rows]
 
 
+def read_cutscenes(path: Path, session: int) -> list[Cutscene]:
+    """运行 `session` 的播片段，按编号。"""
+    connection = _connect(path)
+    try:
+        rows: Sequence[tuple[object, ...]] = connection.execute(
+            "SELECT session, cutscene, scope, first_frame, first_ns, last_frame, last_ns, end_ns, "
+            "closed_frame, sentences FROM cutscenes WHERE session = ? ORDER BY cutscene",
+            (session,),
+        ).fetchall()
+    finally:
+        connection.close()
+    return [_cutscene_of(row) for row in rows]
+
+
+def _cutscene_of(row: Sequence[object]) -> Cutscene:
+    (
+        session,
+        index,
+        scope,
+        first_frame,
+        first_ns,
+        last_frame,
+        last_ns,
+        end_ns,
+        closed_frame,
+        sentences,
+    ) = row
+    occurrences: list[object] = json.loads(str(sentences))
+    return Cutscene(
+        session=_int(session),
+        index=_int(index),
+        scope=_int(scope),
+        first_frame=_int(first_frame),
+        first_ns=_int(first_ns),
+        last_frame=_int(last_frame),
+        last_ns=_int(last_ns),
+        end_ns=None if end_ns is None else _int(end_ns),
+        closed_frame=None if closed_frame is None else _int(closed_frame),
+        sentences=tuple(_int(occurrence) for occurrence in occurrences),
+    )
+
+
 def _record_of(row: Sequence[object]) -> NarrativeRecord:
     (
         session,
         occurrence,
         scope,
         screen,
+        cutscene,
         speaker,
         text,
         revision,
@@ -336,6 +429,7 @@ def _record_of(row: Sequence[object]) -> NarrativeRecord:
         occurrence=_int(occurrence),
         scope=_int(scope),
         screen=None if screen is None else str(screen),
+        cutscene=None if cutscene is None else _int(cutscene),
         speaker=None if speaker is None else str(speaker),
         text=str(text),
         revision=_int(revision),

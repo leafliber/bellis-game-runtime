@@ -53,7 +53,16 @@ class Ending:
     text: str
 
 
-type Node = Dialogue | Choice | Ending
+@dataclass(frozen=True)
+class Cutscene:
+    """播片：整屏的动画放 `GameConfig.cutscene_seconds` 秒，其间在对白文字的位置上依次显示
+    `subtitles`；输入都忽略，放完进入 `next`。"""
+
+    subtitles: tuple[str, ...]
+    next: str
+
+
+type Node = Dialogue | Choice | Ending | Cutscene
 
 NODES: dict[str, Node] = {
     "intro": Dialogue(
@@ -74,6 +83,10 @@ NODES: dict[str, Node] = {
     ),
     "knock": Dialogue(
         lines=(Line("旁白", "门那边安静了一会儿，又敲了三下。"),),
+        next="echo",
+    ),
+    "echo": Cutscene(
+        subtitles=("雨夜里，钟声传得很远。", "门后的石阶上，又响起了敲门声。"),
         next="door",
     ),
     "stairs": Dialogue(
@@ -169,5 +182,7 @@ def all_text() -> Iterator[str]:
                     yield option.label
             case Ending(text=text):
                 yield text
+            case Cutscene(subtitles=subtitles):
+                yield from subtitles
     for item in SHOP_ITEMS:
         yield item.name

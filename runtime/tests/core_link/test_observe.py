@@ -28,6 +28,7 @@ from game_runtime.frames import AdmissionPolicy, SequencedFrameSource
 from game_runtime.kernel import Kernel
 from game_runtime.narrative import Completeness, read_records, store_path
 from game_runtime.observe import (
+    CutsceneEvent,
     LanguageEvent,
     LanguageResult,
     LineEvent,
@@ -38,6 +39,7 @@ from game_runtime.observe import (
     VoiceEvent,
 )
 from game_runtime.observe.cli import ObserveMonitor, observe
+from game_runtime.observe.display import LINE_KINDS
 from game_runtime.ocr import Image, RecognizedLine, crop_bgr
 from game_runtime.ocr import plugin as ocr_plugin
 from game_runtime.recording import (
@@ -53,7 +55,7 @@ from game_runtime.voice_activity import SpeechModel, VoiceActivityPlugin, VoiceS
 from game_runtime.voice_activity.fake import EnergyModel
 from synthetic_game import Click, GameConfig, Key, ManualClock, Press, SceneType, SyntheticGame
 from synthetic_game.anchors import anchor_templates
-from synthetic_game.story import NODES, UI, Dialogue
+from synthetic_game.story import NODES, UI, Cutscene, Dialogue
 
 WIDTH, HEIGHT = 640, 360
 RATE, CHANNELS, BLOCK = 48_000, 2, 480
@@ -66,8 +68,16 @@ def _intro() -> Dialogue:
     return node
 
 
+def _echo() -> Cutscene:
+    node = NODES["echo"]
+    assert isinstance(node, Cutscene)
+    return node
+
+
 INTRO = _intro()
 """开场对话：标题菜单的“开始”进入它。"""
+ECHO = _echo()
+"""插曲对话读完之后的播片。"""
 
 
 class FakeVoice(VoiceActivityPlugin):
@@ -99,8 +109,8 @@ def _key(image: Image) -> bytes:
 
 class TruthOcr:
     """按真值作答的识别器：`learn` 记下合成游戏显示的一帧里各 ROI 应读出的文字（标题菜单的按钮、
-    对话的名字与已显示的台词、坏结局的“重来”），`recognize` 按裁出的图像查；没记过的图像读不出
-    文字。"""
+    对话的名字与已显示的台词、播片的字幕、坏结局的“重来”），`recognize` 按裁出的图像查；没记过的
+    图像读不出文字。"""
 
     def __init__(self, adapter: Adapter) -> None:
         self.adapter = adapter
@@ -121,6 +131,8 @@ class TruthOcr:
                 assert isinstance(node, Dialogue)
                 line = next(line for line in node.lines if line.text == truth.text)
                 texts = {"speaker": line.speaker or "", "dialogue": truth.visible_text}
+            elif truth.scene is SceneType.CUTSCENE:
+                texts = {"dialogue": truth.text}
             elif truth.scene is SceneType.BAD_ENDING:
                 texts = {"ending-retry": UI.retry}
         frame = _Pixels(WIDTH, HEIGHT, pixels)
@@ -268,6 +280,10 @@ def scripts(monitor: ObserveMonitor) -> list[ScriptEvent]:
     return [e for e in monitor.events if isinstance(e, ScriptEvent)]
 
 
+def cutscenes(monitor: ObserveMonitor) -> list[CutsceneEvent]:
+    return [e for e in monitor.events if isinstance(e, CutsceneEvent)]
+
+
 async def play(
     live: LiveOptions,
     player: Player,
@@ -275,9 +291,11 @@ async def play(
     *,
     quota: int | None = None,
     dialogue: bool = True,
+    cutscene: bool = False,
 ) -> int:
     """显示标题菜单直到做完固定文字的核对；`dialogue` 时再进入开场对话，读完三句（其间发出 0.4 秒
-    的声音），推进到选项，文字系统一层随之相符；然后像 Ctrl+C 那样取消主任务，返回退出码。"""
+    的声音），推进到选项，文字系统一层随之相符；`cutscene` 时再敲门回应，读完插曲，看完播片直到
+    播片段结束；然后像 Ctrl+C 那样取消主任务，返回退出码。"""
     showing = asyncio.create_task(player.show())
     observing = asyncio.create_task(
         observe(live, quota=quota, status_interval=0.5, monitor=monitor)
@@ -296,6 +314,12 @@ async def play(
             player.advance()
             await until(lambda: scripts(monitor) or None)
             await sound
+        if cutscene:
+            player.click("choice.1")
+            await until(lambda: complete(monitor, 4))
+            player.advance()
+            # 播片 4 秒，结束在最后一个动帧之后 1.5 秒判出。
+            await until(lambda: True if any(e.ended for e in cutscenes(monitor)) else None)
         await asyncio.sleep(0.3)
         observing.cancel()
         return await observing
@@ -347,7 +371,10 @@ def test_observing_the_synthetic_game_shows_its_events_and_a_summary(
         ):
             player = Player(display, output, ocr)
             return await play(
-                options(core_exe, synthetic, data_dir, display, output), player, monitor
+                options(core_exe, synthetic, data_dir, display, output),
+                player,
+                monitor,
+                cutscene=True,
             )
 
     assert asyncio.run(main()) == 0
@@ -419,6 +446,24 @@ def test_observing_the_synthetic_game_shows_its_events_and_a_summary(
     assert VoiceState.BUSY in voices
     assert VoiceState.IDLE in voices[voices.index(VoiceState.BUSY) :]
     assert any(line.startswith("[") and " 积压 帧 " in line for line in lines)  # 状态行
+    # 播片：开始与结束各一行；两句字幕记成句子，行里标出播片段编号；结束的一行带时长与句数。
+    started, ended = cutscenes(monitor)
+    assert (started.ended, ended.ended) == (False, True)
+    played = ended.cutscene
+    assert played.sentences == (5, 6)
+    assert monitor.formatter.event(started).endswith(f"播片 1 开始，帧 {played.first_frame}")
+    assert monitor.formatter.event(ended).endswith(
+        f"播片 1 结束：{played.duration_ns / 1e9:.1f} 秒，2 句，帧 {played.closed_frame}"
+    )
+    assert {monitor.formatter.event(started), monitor.formatter.event(ended)} <= set(lines)
+    subtitles = [e for e in monitor.events if isinstance(e, LineEvent) and e.record.cutscene == 1]
+    assert {e.record.text for e in subtitles if e.kind is LineKind.APPEAR} == set(ECHO.subtitles)
+    assert all(
+        f"剧情 #{e.record.occurrence} {LINE_KINDS[e.kind]} 播片 1" in monitor.formatter.event(e)
+        for e in subtitles
+    )
+    # 手动时钟每显示一帧走 0.02 秒，墙钟上的一帧不一定正好 20 ms：4 秒的播片按采集时刻大约 3–6 秒。
+    assert 2e9 < played.duration_ns < 8e9
     # 停止：按顺序收尾，最后是摘要与实时核停在哪一步。
     assert "收到 Ctrl+C，正在收尾（再按一次即强制退出）……" in out
     assert stops == ["close frames", "wait readers", "drain narrative", "stop kernel", "stop core"]
@@ -427,7 +472,8 @@ def test_observing_the_synthetic_game_shows_its_events_and_a_summary(
     counts = {c: sum(1 for r in records if r.completeness is c) for c in Completeness}
     assert summary[1] == (
         f"  剧情记录：{len(records)} 句，完整 {counts[Completeness.COMPLETE]}、"
-        f"部分 {counts[Completeness.PARTIAL]}、缺口 {counts[Completeness.GAP]}；剧情范围 1，中断 0"
+        f"部分 {counts[Completeness.PARTIAL]}、缺口 {counts[Completeness.GAP]}；"
+        f"剧情范围 1，中断 0；播片段 1，共 {played.duration_ns / 1e9:.1f} 秒"
     )
     assert len(records) >= 3
     assert counts[Completeness.COMPLETE] >= 3

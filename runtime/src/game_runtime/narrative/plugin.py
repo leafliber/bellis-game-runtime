@@ -1,5 +1,5 @@
 """普通插件 `narrative`：按顺序处理 `scene@1` 的每个更新，按适配包的对白框以 `ocr@1` 读文字，
-逐句记录剧情，存本机 SQLite，提供 `narrative@1`。
+逐句记录剧情并记下播片段（播片中读到的是字幕），存本机 SQLite，提供 `narrative@1`。
 
 设计见 `docs/modules/narrative-planner.md` 的“剧情记录”。记录只取决于依次处理的 scene 更新与
 OCR 结果，不读墙钟（读不读、节流都按帧的采集时刻）；不调用 VLM 或其它模型，不外发，完整日志
@@ -25,7 +25,7 @@ from game_runtime.adapter import GAME_ADAPTER, Adapter, DialogueBox, PixelRect, 
 from game_runtime.frame_ring import RingFrame
 from game_runtime.kernel import Manifest, Plugin, PluginContext, ServiceToken, Tier
 from game_runtime.local_data import local_data_dir
-from game_runtime.narrative.record import Discontinuity, NarrativeRecord, Scope
+from game_runtime.narrative.record import Cutscene, Discontinuity, NarrativeRecord, Scope
 from game_runtime.narrative.store import NarrativeStore
 from game_runtime.narrative.tracker import (
     BoxFrame,
@@ -33,6 +33,7 @@ from game_runtime.narrative.tracker import (
     Gap,
     Observation,
     OtherScreen,
+    Playback,
     Reading,
     SentenceTracker,
     TrackerParams,
@@ -54,6 +55,7 @@ READING_CACHE_SIZE: Final = 32
 BYTES_PER_PIXEL: Final = 4
 
 type NarrativeListener = Callable[[NarrativeRecord], None]
+type CutsceneListener = Callable[[Cutscene], None]
 
 
 class NarrativeService(Protocol):
@@ -77,6 +79,11 @@ class NarrativeService(Protocol):
     def scopes(self) -> tuple[Scope, ...]: ...
 
     @property
+    def cutscenes(self) -> tuple[Cutscene, ...]:
+        """本次运行的各播片段的最新状态，按编号。"""
+        ...
+
+    @property
     def discontinuities(self) -> tuple[Discontinuity, ...]: ...
 
     def subscribe(self, listener: NarrativeListener) -> Callable[[], None]:
@@ -85,6 +92,12 @@ class NarrativeService(Protocol):
         在事件循环里同步调用，抛错只记录；返回取消订阅的函数（可重复调用），订阅方登记为撤销函数。
         最后出现的帧号与时刻每帧都变，不单独通知，`latest` 与 `records` 里总是最新的。
         """
+        ...
+
+    def subscribe_cutscenes(self, listener: CutsceneListener) -> Callable[[], None]:
+        """播片段每变一次（开始、结束），监听者按处理的顺序收到它的新状态，与 `subscribe` 的通知
+        按发生的顺序交错。其间的句子与最后的帧号不单独通知，`cutscenes` 里总是最新的。调用方式与
+        撤销同 `subscribe`。"""
         ...
 
     @property
@@ -173,6 +186,8 @@ class _BoxItem:
 
 
 type _Item = _BoxItem | OtherScreen | Unjudged | Unread | Gap
+type _Queued = tuple[_Item, Playback | None]
+"""排队中的一项与它那一帧的播片状态（中断没有）。"""
 
 
 def _frame_number(item: _Item) -> int:
@@ -219,6 +234,8 @@ class Recorder:
         """写了画面的对白框，按画面。"""
         self._generic = next((box for box in boxes if box.screen is None), None)
         """没写画面的对白框（通用缺省），至多一项。"""
+        self._subtitles = self._generic or boxes[0]
+        """读播片字幕的对白框：没写画面的一项，没有时为声明的第一项。"""
         self._ocr_interval = ocr_interval_ns
         self._read_ns: dict[str, int] = {}
         """每个 ROI 最近一次读的帧的采集时刻（节流）。"""
@@ -232,7 +249,7 @@ class Recorder:
         self._db = db
         self._tracker = SentenceTracker(store.session, params)
         self._max_backlog = max_backlog
-        self._queue: collections.deque[_Item] = collections.deque()
+        self._queue: collections.deque[_Queued] = collections.deque()
         self._wake = asyncio.Event()
         self._idle = asyncio.Event()
         self._idle.set()
@@ -245,6 +262,7 @@ class Recorder:
             collections.OrderedDict()
         )
         self._listeners: list[NarrativeListener] = []
+        self._cutscene_listeners: list[CutsceneListener] = []
         self._processed = 0
         self._task: asyncio.Task[None] | None = None
         self._stopped = False
@@ -269,18 +287,18 @@ class Recorder:
         return self._tracker.scopes
 
     @property
+    def cutscenes(self) -> tuple[Cutscene, ...]:
+        return self._tracker.cutscenes
+
+    @property
     def discontinuities(self) -> tuple[Discontinuity, ...]:
         return self._tracker.discontinuities
 
     def subscribe(self, listener: NarrativeListener) -> Callable[[], None]:
-        entry: list[NarrativeListener] = [listener]
-        self._listeners.append(listener)
+        return _subscribe(self._listeners, listener)
 
-        def unsubscribe() -> None:
-            if entry:
-                self._listeners.remove(entry.pop())
-
-        return unsubscribe
+    def subscribe_cutscenes(self, listener: CutsceneListener) -> Callable[[], None]:
+        return _subscribe(self._cutscene_listeners, listener)
 
     @property
     def processed_frame(self) -> int:
@@ -299,7 +317,7 @@ class Recorder:
         self._task = asyncio.get_running_loop().create_task(self._run(), name=name)
 
     async def stop(self) -> None:
-        """取消处理任务，丢弃还没处理的更新，把当前句的最新状态写库。"""
+        """取消处理任务，丢弃还没处理的更新，把当前句与还没结束的播片段的最新状态写库。"""
         self._stopped = True
         task = self._task
         if task is not None:
@@ -313,8 +331,13 @@ class Recorder:
         self._queue.clear()
         self._idle.set()
         latest = self._tracker.latest
-        if latest is not None and not latest.closed:
-            await self._write(Changes((latest,)))
+        playing = self._tracker.playing
+        events = (
+            *(() if latest is None or latest.closed else (latest,)),
+            *(() if playing is None else (playing,)),
+        )
+        if events:
+            await self._write(Changes(events))
 
     # scene@1 的监听者
 
@@ -333,7 +356,13 @@ class Recorder:
             logger.error("剧情记录积压达到上限 %d，开始丢弃更新", self._max_backlog)
             self._dropping = [frame_number, frame_number, 1]
             return
-        self._enqueue(self._item(update))
+        state = update.state
+        playback = Playback(
+            state.capture_ns,
+            state.playing_since_ns if state.playing else None,
+            state.playing_ended_ns,
+        )
+        self._enqueue(self._item(update), playback)
 
     def _resume(self) -> None:
         """丢弃中且积压已降到一半时停止丢弃，把丢掉的一段作为中断排进队列。"""
@@ -348,28 +377,31 @@ class Recorder:
             last,
             count,
         )
-        self._enqueue(Gap(first, last, count))
+        self._enqueue(Gap(first, last, count), None)
 
-    def _enqueue(self, item: _Item) -> None:
-        self._queue.append(item)
+    def _enqueue(self, item: _Item, playback: Playback | None) -> None:
+        self._queue.append((item, playback))
         self._idle.clear()
         self._wake.set()
 
     def _item(self, update: SceneUpdate) -> _Item:
-        """按对白框决定这一帧读不读：判为写了画面的对白框的画面即按它读；否则有没写画面的对白框、
-        且不是过场即按它读；节流（按采集时刻）跳过相隔不够的帧。"""
+        """按对白框决定这一帧读不读：判为写了画面的对白框的画面即按它读；否则在播片中即按读字幕的
+        对白框读，有没写画面的对白框、且不是过场即按它读；节流（按采集时刻）跳过相隔不够的帧。"""
         state = update.state
         judged = state.screen if state.verdict is Verdict.SCREEN else None
         scope = judged if judged in self._scope_screens else None
         box = None if judged is None else self._boxes.get(judged)
         if box is None:
-            if self._generic is None:
+            if state.playing:
+                box = self._subtitles
+            elif self._generic is None:
                 if judged is None:
                     return Unjudged(state.frame_number)
                 return OtherScreen(state.frame_number, judged, scope is not None)
-            if state.stability is Stability.TRANSITION:
+            elif state.stability is Stability.TRANSITION:
                 return Unread(state.frame_number, scope)
-            box = self._generic
+            else:
+                box = self._generic
         if not self._due(box, state.capture_ns):
             return Unread(state.frame_number, scope)
         frame = update.frame
@@ -414,11 +446,11 @@ class Recorder:
                 self._idle.set()
                 self._wake.clear()
                 await self._wake.wait()
-            item = self._queue.popleft()
+            item, playback = self._queue.popleft()
             self._resume()
             self._busy = True
             try:
-                changes = self._tracker.observe(await self._observe(item))
+                changes = self._tracker.observe(await self._observe(item), playback)
                 if changes:
                     await self._write(changes)
                     self._notify(changes)
@@ -478,7 +510,7 @@ class Recorder:
     async def _write(self, changes: Changes) -> None:
         scopes = () if changes.scope is None else (changes.scope,)
         gaps = () if changes.discontinuity is None else (changes.discontinuity,)
-        job = functools.partial(self._store.write, changes.records, scopes, gaps)
+        job = functools.partial(self._store.write, changes.records, scopes, gaps, changes.cutscenes)
         try:
             await asyncio.get_running_loop().run_in_executor(self._db, job)
         except asyncio.CancelledError:
@@ -493,12 +525,36 @@ class Recorder:
             self._db_failing = False
 
     def _notify(self, changes: Changes) -> None:
-        for record in changes.records:
-            for listener in list(self._listeners):
-                try:
-                    listener(record)
-                except Exception:
-                    logger.exception("narrative@1 的监听者处理第 %d 句时出错", record.occurrence)
+        """按发生的顺序通知：句子给 `subscribe` 的监听者，播片段给 `subscribe_cutscenes` 的。"""
+        for event in changes.events:
+            if isinstance(event, NarrativeRecord):
+                for listener in list(self._listeners):
+                    try:
+                        listener(event)
+                    except Exception:
+                        logger.exception("narrative@1 的监听者处理第 %d 句时出错", event.occurrence)
+            else:
+                for listener in list(self._cutscene_listeners):
+                    try:
+                        listener(event)
+                    except Exception:
+                        logger.exception(
+                            "narrative@1 的监听者处理第 %d 个播片段时出错", event.index
+                        )
+
+
+def _subscribe[T](
+    listeners: list[Callable[[T], None]], listener: Callable[[T], None]
+) -> Callable[[], None]:
+    """登记监听者，返回取消订阅的函数（可重复调用）。"""
+    entry: list[Callable[[T], None]] = [listener]
+    listeners.append(listener)
+
+    def unsubscribe() -> None:
+        if entry:
+            listeners.remove(entry.pop())
+
+    return unsubscribe
 
 
 def _digest(pixels: bytes) -> bytes:

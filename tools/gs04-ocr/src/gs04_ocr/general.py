@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from game_runtime.adapter import PixelRect
 from synthetic_game.render import FONT_FILE
-from synthetic_game.story import NODES, Choice, Dialogue, Ending
+from synthetic_game.story import NODES, Choice, Cutscene, Dialogue, Ending
 
 CATEGORY = "general"
 PARTIAL_CATEGORY = "general-partial"
@@ -121,6 +121,8 @@ def _synthetic_texts() -> list[str]:
                 texts.append(prompt)
             case Ending(text=text):
                 texts.append(text)
+            case Cutscene():
+                pass  # 播片的字幕不用作泛化样本的对白
     return texts
 
 

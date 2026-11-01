@@ -1,7 +1,7 @@
-"""一句的边界、修订号、完整度与剧情范围：以手写的观察序列逐条核对 `SentenceTracker`。
+"""一句的边界、修订号、完整度、播片段与剧情范围：以手写的观察序列逐条核对 `SentenceTracker`。
 
-规则见 `docs/modules/narrative-planner.md` 的“一句的边界”“完整度”与“剧情范围”。合成游戏上按真值的
-核对见 `test_synthetic.py`。
+规则见 `docs/modules/narrative-planner.md` 的“一句的边界”“完整度”“播片段”与“剧情范围”。合成游戏上
+按真值的核对见 `test_synthetic.py`。
 """
 
 import dataclasses
@@ -10,11 +10,15 @@ import pytest
 
 from game_runtime.narrative import (
     BoxFrame,
+    Changes,
     Completeness,
+    Cutscene,
     Gap,
     LowConfidenceLine,
     NarrativeRecord,
+    Observation,
     OtherScreen,
+    Playback,
     Reading,
     SentenceTracker,
     TrackerParams,
@@ -29,12 +33,34 @@ MS = 1_000_000
 
 
 class Feed:
-    """按帧号与采集时刻依次给出观察；每帧间隔 `step` 毫秒。"""
+    """按帧号与采集时刻依次给出观察；每帧间隔 `step` 毫秒。每帧都带播片状态：`play` 之后的帧在播片
+    中，`stop` 之后的帧不在。"""
 
     def __init__(self, params: TrackerParams | None = None, *, step: int = 33) -> None:
         self.tracker = SentenceTracker(7, params or TrackerParams())
         self.number = 0
         self.step = step
+        self.since: int | None = None
+        self.ended: int | None = None
+        self.changes = Changes()
+        """最近一个观察产生的变化。"""
+
+    def at(self, number: int) -> int:
+        return number * self.step * MS
+
+    def play(self, since: int | None = None) -> None:
+        """此后的帧在播片中，开始时刻缺省为下一帧的采集时刻。"""
+        self.since = self.at(self.number + 1) if since is None else since
+
+    def stop(self, ended: int | None) -> None:
+        """下一帧起不再在播片中，那一帧上给出结束时刻 `ended`（随中断丢了时为 None）。"""
+        self.since, self.ended = None, ended
+
+    def observe(self, observation: Observation) -> Changes:
+        ended, self.ended = self.ended, None
+        playback = Playback(self.at(self.number), self.since, ended)
+        self.changes = self.tracker.observe(observation, playback)
+        return self.changes
 
     def box(
         self,
@@ -55,9 +81,9 @@ class Feed:
             else Reading("speaker", ((speaker, speaker_confidence),) if speaker else ())
         )
         frame = BoxFrame(
-            self.number, self.number * self.step * MS, screen, reading, names, marker, scope_screen
+            self.number, self.at(self.number), screen, reading, names, marker, scope_screen
         )
-        return self.tracker.observe(frame).records
+        return self.observe(frame).records
 
     def typing(
         self, text: str, speaker: str | None = "阿遥", *, start: int = 1, finish: bool = True
@@ -67,19 +93,23 @@ class Feed:
 
     def other(self, screen: str = "choice", *, starts_scope: bool = False) -> None:
         self.number += 1
-        self.tracker.observe(OtherScreen(self.number, screen, starts_scope))
+        self.observe(OtherScreen(self.number, screen, starts_scope))
 
     def unjudged(self) -> None:
         self.number += 1
-        self.tracker.observe(Unjudged(self.number))
+        self.observe(Unjudged(self.number))
 
     def unread(self, scope_screen: str | None = None) -> None:
         self.number += 1
-        self.tracker.observe(Unread(self.number, scope_screen))
+        self.observe(Unread(self.number, scope_screen))
 
     @property
     def records(self) -> tuple[NarrativeRecord, ...]:
         return self.tracker.records
+
+    @property
+    def cutscenes(self) -> tuple[Cutscene, ...]:
+        return self.tracker.cutscenes
 
     def summary(self) -> list[tuple[str | None, str, int, Completeness]]:
         return [(r.speaker, r.text, r.revision, r.completeness) for r in self.records]
@@ -537,6 +567,154 @@ def test_bad_endings_and_loads_start_new_scopes() -> None:
         (2, "bad-ending", 6),
         (3, "save-load", 9),
     ]
+
+
+# 播片段
+
+FIRST = "雨夜里，钟声传得很远。"
+SECOND = "门后的石阶上，又响起了敲门声。"
+
+
+def kinds(changes: Changes) -> list[tuple[str, int, bool]]:
+    """变化按发生的顺序：（句子或播片段，编号，是否已结束）。"""
+    return [
+        ("record", e.occurrence, e.closed)
+        if isinstance(e, NarrativeRecord)
+        else ("cutscene", e.index, e.closed)
+        for e in changes.events
+    ]
+
+
+def test_a_cutscene_closes_the_sentence_around_it_and_its_subtitles_are_sentences() -> None:
+    feed = Feed()
+    feed.box("门后也许")  # 帧 1：还在逐字显示
+    feed.play()
+    feed.box(FIRST, "")  # 帧 2：判出播片，读到第一句字幕
+    # 先结束当前句（缺口），再开始播片段，然后才是这一帧上的字幕。
+    assert kinds(feed.changes) == [
+        ("record", 1, True),
+        ("cutscene", 1, False),
+        ("record", 2, False),
+    ]
+    assert feed.changes.scope is None
+    for _ in range(20):  # 帧 3–22：不变够 0.5 秒，判为完整
+        feed.box(FIRST, "")
+    feed.unread()  # 帧 23，节流跳过：不改变记录，播片段的最后一帧照样前进
+    for _ in range(20):  # 帧 24–43
+        feed.box(SECOND, "")
+    assert feed.changes.events == ()  # 播片中的帧只让最后的帧号前进，不通知
+    last = feed.number
+    feed.stop(ended=feed.at(last - 3))
+    feed.box("我们回去吧。")  # 不再在播片中：先结束字幕与播片段，这一帧上的对白在播片段之外
+    assert kinds(feed.changes) == [("record", 3, True), ("cutscene", 1, True), ("record", 4, False)]
+
+    first, second, third, fourth = feed.records
+    assert (first.completeness, first.closed_frame, first.cutscene) == (Completeness.GAP, 2, None)
+    assert [(r.text, r.speaker, r.cutscene, r.completeness) for r in (second, third)] == [
+        (FIRST, None, 1, Completeness.COMPLETE),
+        (SECOND, None, 1, Completeness.COMPLETE),
+    ]
+    assert (third.closed_frame, fourth.cutscene, fourth.scope) == (last + 1, None, 1)
+    [cutscene] = feed.cutscenes
+    assert cutscene == Cutscene(
+        session=7,
+        index=1,
+        scope=1,
+        first_frame=2,
+        first_ns=feed.at(2),
+        last_frame=last,
+        last_ns=feed.at(last),
+        end_ns=feed.at(last - 3),
+        closed_frame=last + 1,
+        sentences=(2, 3),
+    )
+    assert feed.changes.cutscenes == (cutscene,)
+    assert cutscene.duration_ns == feed.at(last - 3) - feed.at(2)
+    assert feed.tracker.playing is None
+
+
+def test_the_open_cutscene_is_the_latest_state() -> None:
+    feed = Feed()
+    feed.play(since=5 * MS)
+    feed.unjudged()  # 播片开始的帧没读文字
+    [started] = feed.changes.cutscenes
+    assert (started.first_frame, started.first_ns, started.sentences) == (1, 5 * MS, ())
+    feed.box(FIRST, None)
+    feed.other()  # 播片中判出了别的画面：结束当前句，仍在播片中
+
+    playing = feed.tracker.playing
+    assert playing is not None
+    assert feed.cutscenes == (playing,)
+    assert (playing.last_frame, playing.closed_frame, playing.sentences) == (3, None, (1,))
+    assert playing.duration_ns == feed.at(3) - 5 * MS
+    assert feed.records[0].closed_frame == 3
+
+
+def test_cutscenes_start_new_scopes_like_sentences() -> None:
+    """运行的第一个播片段开始范围 1；坏结局之后的下一个播片段开始新的范围，其中的字幕在新范围里。"""
+    feed = Feed()
+    feed.play()
+    feed.box(FIRST, None)  # 帧 1
+    assert feed.changes.scope is not None
+    feed.stop(ended=feed.at(1))
+    feed.other("bad-ending", starts_scope=True)  # 帧 2
+    feed.play()
+    feed.unread()  # 帧 3：新的播片段开始新的范围
+    assert feed.changes.scope is not None
+    feed.box(SECOND, None)  # 帧 4
+    feed.stop(ended=feed.at(4))
+    feed.box("第三句。", marker=True)  # 帧 5：没有触发新的范围
+
+    assert [(s.scope, s.after_screen, s.first_frame) for s in feed.tracker.scopes] == [
+        (1, None, 1),
+        (2, "bad-ending", 3),
+    ]
+    assert [(c.index, c.scope, c.sentences) for c in feed.cutscenes] == [(1, 1, (1,)), (2, 2, (2,))]
+    assert [(r.text, r.scope, r.cutscene) for r in feed.records] == [
+        (FIRST, 1, 1),
+        (SECOND, 2, 2),
+        ("第三句。", 2, None),
+    ]
+
+
+def test_a_gap_does_not_end_the_cutscene() -> None:
+    feed = Feed()
+    feed.play(since=5 * MS)
+    feed.box(FIRST, None)  # 帧 1
+    gap = feed.tracker.observe(Gap(2, 9, 8))
+    feed.number = 9
+    # 中断结束当前句，播片段不结束。
+    assert kinds(gap) == [("record", 1, True)]
+    feed.box(FIRST, None)  # 帧 10：开始时刻相同，仍属这个播片段
+    assert kinds(feed.changes) == [("record", 2, False)]
+    feed.play(since=feed.at(8))  # 中断里结束了一段又开始一段
+    feed.unjudged()  # 帧 11
+    assert kinds(feed.changes) == [
+        ("record", 2, True),
+        ("cutscene", 1, True),
+        ("cutscene", 2, False),
+    ]
+    feed.stop(ended=None)  # 结束的那一帧随中断丢了
+    feed.unjudged()  # 帧 12
+
+    assert [
+        (c.index, c.first_ns, c.end_ns, c.closed_frame, c.sentences) for c in feed.cutscenes
+    ] == [
+        (1, 5 * MS, None, 11, (1, 2)),
+        (2, feed.at(8), None, 12, ()),
+    ]
+    assert feed.cutscenes[1].duration_ns == feed.at(11) - feed.at(8)
+
+
+def test_without_playback_nothing_happens_to_the_cutscene() -> None:
+    """不带播片状态的观察（没有 `scene@1` 的播片输出）不开始也不结束播片段。"""
+    tracker = SentenceTracker(1)
+    tracker.observe(Unjudged(1), Playback(0, 0))
+    tracker.observe(Unjudged(2))
+    assert tracker.playing is not None
+    tracker.observe(Unjudged(3), Playback(10, None, 5))
+    assert tracker.playing is None
+    assert [(c.last_frame, c.closed_frame, c.end_ns) for c in tracker.cutscenes] == [(1, 3, 5)]
 
 
 # 置信度与通知
