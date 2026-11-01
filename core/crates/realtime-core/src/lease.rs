@@ -1,7 +1,8 @@
 //! 输入许可：令牌、到期时刻与“为什么无效”（`docs/modules/core-protocol.md` 的“输入许可”）。
 //!
-//! 规则取自 Bellis D-31、D-34：令牌只增不减，只认等于当前令牌且未过期的许可。G0 的许可源只有测试设备
-//! 连接上的测试许可源（只用于测试，与假输入后端同生同灭）；没有许可源时许可永远无效。
+//! 规则取自 Bellis D-31、D-34：令牌只增不减，只认等于当前令牌且未过期的许可。许可源只有一个：操作员许可
+//! 连接（独立运行中的操作员控制台），或没有它时测试设备连接上的测试许可源（只用于测试，与假输入后端同生
+//! 同灭）；没有许可源时许可永远无效。
 //!
 //! 这里只是状态机，不含锁与时钟：时刻由调用方给出（与帧环同一时钟的纳秒数），释放由控制状态完成。
 
@@ -23,7 +24,7 @@ enum State {
     SourceLost,
 }
 
-/// `test_lease.grant` 接受后的结果。
+/// 授予（`operator_lease.grant` 或 `test_lease.grant`）接受后的结果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Granted {
     /// 此前没有有效的许可，现在有了。
@@ -34,7 +35,7 @@ pub(crate) enum Granted {
     Replaced,
 }
 
-/// `test_lease.grant` 不被接受的原因。
+/// 授予不被接受的原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// 令牌小于当前令牌。

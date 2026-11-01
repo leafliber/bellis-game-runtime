@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use core_protocol::messages::{
     Accepted, Action, ActionBlock, ActionOutcome, ActionReceiptParams, ActionSubmitResult,
-    CaptureState, CoreHealthParams, DropReason, Dropped, Executed, FakeLeaseGrantParams, HeldInput,
-    InputReleasedParams, Producer, ProducerHeartbeatParams, RejectReason, Rejected, ReleaseReason,
+    CaptureState, CoreHealthParams, DropReason, Dropped, Executed, HeldInput, InputReleasedParams,
+    LeaseGrantParams, Producer, ProducerHeartbeatParams, RejectReason, Rejected, ReleaseReason,
 };
 
 use crate::frames::FrameStatus;
@@ -509,7 +509,8 @@ fn nanos(duration: Duration) -> u64 {
 }
 
 impl Control {
-    /// `backend` 是输入后端；有它才有许可源（G0 的许可源只有测试设备连接，与假后端同生同灭）。
+    /// `backend` 是输入后端；有它才有许可源：操作员许可连接，或只用于测试、与假后端同生同灭的
+    /// 测试许可源。
     pub(crate) fn new(
         limits: Limits,
         frames: Arc<FrameStatus>,
@@ -718,10 +719,11 @@ impl Control {
         ActionSubmitResult::Accepted(Accepted {})
     }
 
-    /// `test_lease.grant`。换发了更大的令牌时先释放旧许可负责的输入（`lease_revoked`）。
+    /// 许可源的授予（`operator_lease.grant` 或 `test_lease.grant`）。换发了更大的令牌时先释放旧许可负责的
+    /// 输入（`lease_revoked`）。
     pub(crate) fn grant_lease(
         &self,
-        grant: &FakeLeaseGrantParams,
+        grant: &LeaseGrantParams,
         now: u64,
     ) -> (Result<(), Refusal>, Notices) {
         let mut state = self.lock();
@@ -735,7 +737,8 @@ impl Control {
         (result.map(|_| ()), notices)
     }
 
-    /// `test_lease.revoke`：吊销 `token` 及更早的令牌；吊销了有效的许可时先释放（`lease_revoked`）。
+    /// 许可源的吊销（`operator_lease.revoke` 或 `test_lease.revoke`）：吊销 `token` 及更早的令牌；吊销了
+    /// 有效的许可时先释放（`lease_revoked`）。
     /// 返回时释放已完成。
     pub(crate) fn revoke_lease(&self, token: u64, now: u64) -> Notices {
         let mut state = self.lock();

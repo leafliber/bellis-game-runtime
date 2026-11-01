@@ -15,13 +15,14 @@ import pytest
 from pydantic import BaseModel, RootModel, ValidationError
 
 from core_protocol import models
-from core_protocol.methods import METHODS, TEST_DEVICE_METHODS
+from core_protocol.methods import METHODS, OPERATOR_METHODS, TEST_DEVICE_METHODS
 from core_protocol.rpc import Direction, Method, Request
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 FIXTURES = sorted(FIXTURES_DIR.glob("*/*.json"))
-ALL_METHODS: dict[str, Method] = {**METHODS, **TEST_DEVICE_METHODS}
-"""核连接与测试设备连接上的全部方法；两组没有同名的方法。"""
+ALL_METHODS: dict[str, Method] = {**OPERATOR_METHODS, **TEST_DEVICE_METHODS, **METHODS}
+"""三组连接上的全部方法，按方法名。操作员许可连接与核连接共有的 `input.released` 两处 params 相同，
+示例消息也只有一份。"""
 
 
 def fixture_id(path: Path) -> str:
@@ -69,11 +70,26 @@ def test_every_method_has_its_fixtures() -> None:
 
 
 def test_the_test_device_group_is_separate() -> None:
-    """测试设备连接上的方法单独成组，不与核连接的方法同名，方向只在测试一方与实时核之间。"""
+    """测试设备连接上的方法单独成组，不与其它两组的方法同名，方向只在测试一方与实时核之间。"""
     assert not METHODS.keys() & TEST_DEVICE_METHODS.keys()
+    assert not OPERATOR_METHODS.keys() & TEST_DEVICE_METHODS.keys()
     test_directions = {Direction.CORE_TO_TEST, Direction.TEST_TO_CORE}
     assert {method.direction for method in TEST_DEVICE_METHODS.values()} == test_directions
     assert not {method.direction for method in METHODS.values()} & test_directions
+
+
+def test_the_operator_group_shares_only_input_released() -> None:
+    """操作员许可连接上的方法单独成组，方向只在控制台与实时核之间；与核连接只共有 `input.released`，
+    params 相同。许可的 params 与测试许可源的相同。"""
+    operator_directions = {Direction.CORE_TO_OPERATOR, Direction.OPERATOR_TO_CORE}
+    assert {method.direction for method in OPERATOR_METHODS.values()} == operator_directions
+    assert not {method.direction for method in METHODS.values()} & operator_directions
+    assert METHODS.keys() & OPERATOR_METHODS.keys() == {"input.released"}
+    assert OPERATOR_METHODS["input.released"].params is METHODS["input.released"].params
+    for name in ("grant", "revoke"):
+        operator = OPERATOR_METHODS[f"operator_lease.{name}"]
+        test = TEST_DEVICE_METHODS[f"test_lease.{name}"]
+        assert operator.params is test.params
 
 
 @pytest.mark.parametrize("path", FIXTURES, ids=fixture_id)

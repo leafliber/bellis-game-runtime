@@ -7,9 +7,9 @@ use super::{Control, Limits, Notices, Rejection, check_block};
 use crate::frames::{FrameStatus, Geometry};
 use crate::ledger::tests::{Recorder, axis, key};
 use core_protocol::messages::{
-    Action, ActionBlock, ActionOutcome, ActionSubmitResult, Click, ControlStep,
-    FakeLeaseGrantParams, HeldInput, HeldMouseButton, KeyPress, LatestFrame, LeaseStatus,
-    MouseButton, Producer, ProducerHeartbeatParams, RejectReason, ReleaseReason, Scroll,
+    Action, ActionBlock, ActionOutcome, ActionSubmitResult, Click, ControlStep, HeldInput,
+    HeldMouseButton, KeyPress, LatestFrame, LeaseGrantParams, LeaseStatus, MouseButton, Producer,
+    ProducerHeartbeatParams, RejectReason, ReleaseReason, Scroll,
 };
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -164,7 +164,7 @@ impl Armed {
     fn grant(&self, token: u64, expires_ns: u64, now: u64) -> Notices {
         let (result, notices) = self
             .control
-            .grant_lease(&FakeLeaseGrantParams { token, expires_ns }, now);
+            .grant_lease(&LeaseGrantParams { token, expires_ns }, now);
         result.unwrap();
         notices
     }
@@ -921,7 +921,7 @@ fn a_renewal_with_a_stale_token_does_not_extend_the_lease() {
     let armed = Armed::new();
     armed.grant(5, T0 + 50 * MS, T0);
     let (result, _) = armed.control.grant_lease(
-        &FakeLeaseGrantParams {
+        &LeaseGrantParams {
             token: 4,
             expires_ns: T0 + 10_000 * MS,
         },
@@ -1047,7 +1047,7 @@ fn the_scheduler_runs_steps_and_timers_in_real_time() {
         GEOMETRY,
     );
     let (result, _) = control.grant_lease(
-        &FakeLeaseGrantParams {
+        &LeaseGrantParams {
             token: 1,
             expires_ns: now + 10_000 * MS,
         },
@@ -1104,13 +1104,13 @@ fn releasing_never_waits_for_the_capture_side() {
             push(control.heartbeat(&beat("b", 2, 1), T0).unwrap());
             push(control.tick(T0 + HEARTBEAT_TIMEOUT));
             push(control.revoke(2));
-            let first = FakeLeaseGrantParams {
+            let first = LeaseGrantParams {
                 token: 1,
                 expires_ns: T0 + 10 * MS,
             };
             control.grant_lease(&first, T0).0.unwrap();
             push(control.tick(T0 + 10 * MS));
-            let second = FakeLeaseGrantParams {
+            let second = LeaseGrantParams {
                 token: 2,
                 expires_ns: T0 + 100 * MS,
             };

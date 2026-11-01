@@ -105,11 +105,38 @@
       "result": null
     }
   },
+  "x-operator-methods": {
+    "operator_lease.grant": {
+      "direction": "operator_to_core",
+      "params": {
+        "$ref": "#/$defs/LeaseGrantParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "operator_lease.revoke": {
+      "direction": "operator_to_core",
+      "params": {
+        "$ref": "#/$defs/LeaseRevokeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "input.released": {
+      "direction": "core_to_operator",
+      "params": {
+        "$ref": "#/$defs/InputReleasedParams"
+      },
+      "result": null
+    }
+  },
   "x-test-device-methods": {
     "test_lease.grant": {
       "direction": "test_to_core",
       "params": {
-        "$ref": "#/$defs/FakeLeaseGrantParams"
+        "$ref": "#/$defs/LeaseGrantParams"
       },
       "result": {
         "$ref": "#/$defs/Empty"
@@ -118,7 +145,7 @@
     "test_lease.revoke": {
       "direction": "test_to_core",
       "params": {
-        "$ref": "#/$defs/FakeLeaseRevokeParams"
+        "$ref": "#/$defs/LeaseRevokeParams"
       },
       "result": {
         "$ref": "#/$defs/Empty"
@@ -1173,7 +1200,7 @@
         {
           "type": "string",
           "const": "lease_source_lost",
-          "description": "与许可源的连接断开；G0 的许可源是测试设备连接。"
+          "description": "与许可源的连接断开：操作员许可连接或测试设备连接。"
         },
         {
           "type": "string",
@@ -1368,7 +1395,7 @@
       ],
       "description": "实时核最近写进音频环的一块。只用于诊断与测试。"
     },
-    "FakeLeaseGrantParams": {
+    "LeaseGrantParams": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -1391,9 +1418,9 @@
         "token",
         "expires_ns"
       ],
-      "description": "`test_lease.grant` 的 params：测试许可源授予或续约输入许可。只用于测试。"
+      "description": "`operator_lease.grant` 与 `test_lease.grant` 的 params：许可源授予或续约输入许可。"
     },
-    "FakeLeaseRevokeParams": {
+    "LeaseRevokeParams": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -1408,7 +1435,7 @@
       "required": [
         "token"
       ],
-      "description": "`test_lease.revoke` 的 params：测试许可源吊销输入许可。只用于测试。"
+      "description": "`operator_lease.revoke` 与 `test_lease.revoke` 的 params：许可源吊销输入许可。"
     },
     "FakeInputEventParams": {
       "type": "object",
