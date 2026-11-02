@@ -7,6 +7,7 @@ members = [
     "bellis-game-runtime",
     "bellis-game-runtime-check",
     "bellis-game-runtime-fetch-models",
+    "bellis-game-runtime-gs02-probe",
     "bellis-game-runtime-gs03-probe",
     "bellis-game-runtime-gs04-ocr",
     "bellis-game-runtime-gs06-eval",
@@ -70,6 +71,17 @@ source = { editable = "tools/check" }
 name = "bellis-game-runtime-fetch-models"
 version = "0.0.0"
 source = { editable = "tools/fetch-models" }
+dependencies = [
+    { name = "bellis-game-runtime" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "bellis-game-runtime", editable = "runtime" }]
+
+[[package]]
+name = "bellis-game-runtime-gs02-probe"
+version = "0.0.0"
+source = { editable = "tools/gs02" }
 dependencies = [
     { name = "bellis-game-runtime" },
 ]
