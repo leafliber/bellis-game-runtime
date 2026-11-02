@@ -1,0 +1,24 @@
+# GS-02 探针（`docs/plan/spikes.md` 的 GS-02）：对已经在跑的 `uv run operate <id>` 控制台，以真实输入
+# 后端向游戏点击一个 RON 的中心，量生效率与首个变化帧的时延。只用于真机探测，不是产品代码；提供
+# `uv run gs02`。它只发左键点击，从不按键。
+[project]
+name = "bellis-game-runtime-gs02-probe"
+version = "0.0.0"
+description = "GS-02：真实输入后端点击 ROI 中心，量生效率与首个变化帧的时延，报告写入 reports/gs02/"
+requires-python = "==3.12.*"
+dependencies = [
+    "bellis-game-runtime",
+]
+
+[project.scripts]
+gs02 = "gs02_probe.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "gs02_probe"
+
+[tool.uv.sources]
+bellis-game-runtime = { workspace = true }
