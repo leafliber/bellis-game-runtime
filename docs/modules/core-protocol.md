@@ -138,6 +138,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | -32003 | `capture_unsupported` | `capture.set_target` 或 `audio.set_target` 的目标在这个平台或系统上不支持：非 Windows 上的 `window`，或系统不支持 WGC |
 | -32004 | `lease_refused` | `operator_lease.grant` 或只用于测试的 `test_lease.grant` 不被接受，见[输入许可](#输入许可) |
 | -32005 | `audio_ring_mismatch` | `audio_ring.attach` 打不开共享内存，或音频环头部与参数不符；`audio.set_target` 的假音频输出同样 |
+| -32006 | `input_policy_conflict` | `input.configure` 在本实例已设定过 |
 
 ### 会话
 
@@ -159,12 +160,14 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `capture.set_target` | 主进程 → 实时核 | 请求 | `CaptureSetTargetParams` → `Empty` | 设定采集目标 |
 | `audio_ring.attach` | 主进程 → 实时核 | 请求 | `AudioRingAttachParams` → `Empty` | 音频环挂接 |
 | `audio.set_target` | 主进程 → 实时核 | 请求 | `AudioSetTargetParams` → `Empty` | 设定音频目标 |
+| `input.configure` | 主进程 → 实时核 | 请求 | `InputPolicy` → `Empty` | 交出输入策略：动作白名单与静态禁区 |
 | `producer.heartbeat` | 主进程 → 实时核 | 通知 | `ProducerHeartbeatParams` | 控制产出者心跳 |
 | `action.submit` | 主进程 → 实时核 | 请求 | `ActionBlock` → `ActionSubmitResult` | 提交[动作块](#动作块) |
 | `producer.revoke` | 主进程 → 实时核 | 请求 | `ProducerRevokeParams` → `Empty` | 作废代次；回应即输入已释放的确认 |
 | `core.stop` | 主进程 → 实时核 | 请求 | `Empty` → `Empty` | 正常停止 |
 | `action.receipt` | 实时核 → 主进程 | 通知 | `ActionReceiptParams` | 执行回执 |
 | `input.released` | 实时核 → 主进程 | 通知 | `InputReleasedParams` | 输入已释放的确认 |
+| `input.residual` | 实时核 → 主进程 | 通知 | `InputResidualParams` | 真实后端核验时仍读作按住、已补发抬起的项 |
 | `core.health` | 实时核 → 主进程 | 通知 | `CoreHealthParams` | 实时核健康，也是主进程判断实时核存活的依据 |
 
 输入许可的消息不在核连接上，见[测试设备连接](#测试设备连接)。
@@ -215,6 +218,23 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - 再次设定时先停掉旧的音频源。与 `audio_ring.attach` 的先后不限，两者都到了才开始采集。
 - 错误：窗口识别规则同 `capture.set_target`，不全回 -32602；`window` 在非 Windows 上回 -32003（unsupported）；假音频输出按 `audio_ring.attach` 的规则核对，不符回 -32005。被拒绝的请求不改变当前的目标。
 
+**`input.configure`**：主进程把游戏适配包的动作白名单与静态禁区换算成 `InputPolicy` 交给实时核，在设定采集目标之后、第一次心跳之前，每个实例一次。实时核怎样执行见[输入策略](realtime-core.md#输入策略)。
+
+| 字段 | 含义 |
+| --- | --- |
+| `click_buttons` | 可点击的鼠标键 |
+| `press_keys` | 可短按的扫描码 |
+| `scroll` | 是否允许滚动 |
+| `click_regions` | 点击与滚动的落点须在其中之一内，归一化矩形（`NormRect`：`left`、`top`、`right`、`bottom`，取值 [0, 1]，左上小于右下）的列表；允许点击或滚动时不能为空 |
+| `forbidden_zones` | 静态禁区，归一化矩形的列表，可为空 |
+| `press_duration_ms` | 点击与短按的按住时长，1–500 |
+| `max_rate` | 每秒至多几个一次性动作，大于 0 |
+| `hold_keys`、`hold_buttons` | 可按住的扫描码与鼠标键 |
+| `max_hold_ms` | 最长按住时间；有可按住的项时必需，没有时为 `null` |
+
+- 错误：不合上表的规则回参数无效（-32602）；本实例已设定过回 -32006。被拒绝的请求不改变状态。
+- 没有输入策略时，以真实后端运行的实时核拒绝含输入的动作块（`not_allowed`）；以假后端运行时不限制，只用于测试。
+
 **控制产出者**：`Producer` 由身份 `id` 与代次 `generation` 组成。代次由主进程分配，在一个实时核的生命期内严格递增；实时核记住当前代次与已作废的最高代次。
 
 - 心跳或动作块的代次不大于已作废的代次，或小于当前代次：拒绝。代次等于当前代次而身份不同：拒绝。
@@ -227,7 +247,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | 分支 | 字段 | 含义 |
 | --- | --- | --- |
 | `accepted`（`Accepted`） | 无 | 已接受，交给调度线程按时间执行；回应时一步都还没执行 |
-| `rejected`（`Rejected`） | `reason` | 按以下顺序核对：`stopping`（实时核正在停止）、`stale_generation`（代次早于当前或已作废）、`producer_mismatch`（代次相同、身份不同）、`invalid`（内容不合[动作块](#动作块)的规则）、`stale_seq`（序号不大于同一代次已接受的）、`expired`（有效截止时刻不晚于现在）。被拒绝的动作块不改变任何状态，其中任何动作都不执行 |
+| `rejected`（`Rejected`） | `reason` | 按以下顺序核对：`stopping`（实时核正在停止）、`stale_generation`（代次早于当前或已作废）、`producer_mismatch`（代次相同、身份不同）、`invalid`（内容不合[动作块](#动作块)的规则）、`not_allowed`（持续状态或一次性动作不在输入策略的白名单内，或以真实后端运行时还没有输入策略，见[输入策略](realtime-core.md#输入策略)）、`stale_seq`（序号不大于同一代次已接受的）、`expired`（有效截止时刻不晚于现在）。被拒绝的动作块不改变任何状态，其中任何动作都不执行 |
 | | `message` | 给人看的说明，只用于日志与诊断 |
 
 **`action.receipt`**：报告一块动作中一次性动作的结果，每个动作在一块中只报一次。每执行一步发一条，报这一步的动作；被取代时、释放结束整块时另发一条，报其余未执行的动作。`producer` 与 `block_seq` 指明动作块，`outcomes` 是联合类型 `ActionOutcome` 的列表：
@@ -235,7 +255,8 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | 分支 | 字段 | 含义 |
 | --- | --- | --- |
 | `executed`（`Executed`） | `id`、`at_ns` | 已交给输入后端及其时刻；不代表游戏中的效果已发生 |
-| `dropped`（`Dropped`） | `id`、`reason` | 没有执行：`superseded`（新的动作块已取代本块未执行的部分）、`duplicate`（同一身份在本代次已执行过）、`released`（到时实时核已释放输入，原因见 `input.released`）、`geometry_changed`（带坐标的动作：基准帧之后客户区的尺寸或 DPI 变了，或基准帧的几何已查不到，见[坐标与几何](#坐标与几何)） |
+| `dropped`（`Dropped`） | `id`、`reason` | 没有执行：`superseded`（新的动作块已取代本块未执行的部分）、`duplicate`（同一身份在本代次已执行过）、`released`（到时实时核已释放输入，原因见 `input.released`）、`geometry_changed`（带坐标的动作：基准帧之后客户区的尺寸或 DPI 变了，或基准帧的几何已查不到，见[坐标与几何](#坐标与几何)）、`not_allowed`（落点不在输入策略的 `click_regions` 内或在 `forbidden_zones` 内）、`rate_limited`（超过输入策略的 `max_rate`），后两者见[输入策略](realtime-core.md#输入策略) |
+| `uncertain`（`Uncertain`） | `id`、`at_ns` | 真实后端已注入，但注入过程中前台窗口变了，游戏是否收到不确定；实时核随即释放全部输入（`focus_lost`），不重试，见[注入](realtime-core.md#注入) |
 
 **`input.released`**：实时核每次释放全部输入后发出，不论释放前是否持有输入。有操作员许可连接时也在那条连接上发出（[操作员许可连接](#操作员许可连接)）。核连接断开时已无法发出，只记日志（以假后端运行时测试设备也能看到，见[测试设备连接](#测试设备连接)）；stdin 读到 EOF 时连接若还在就发出，随即以 0 退出（[生命线与 panic](realtime-core.md#生命线与-panic)）。
 
@@ -257,11 +278,26 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `lease_revoked` | 输入许可被吊销，或许可源换发了更大的令牌 |
 | `lease_source_lost` | 与许可源的连接断开：测试设备连接或操作员许可连接 |
 | `no_lease` | 没有输入许可：从未授予，或没有许可源（没有输入后端时即如此） |
+| `focus_lost` | 真实后端：目标窗口不在前台、已最小化、输入桌面不是当前桌面，或注入过程中前台变了（[注入](realtime-core.md#注入)） |
+| `takeover` | 真实后端：许可有效时钩子看到真人输入或第三方注入；同时在本地撤权（[接管与急停](realtime-core.md#接管与急停)） |
+| `emergency_stop` | 真实后端：按下急停组合键；同时在本地撤权 |
+| `injection_blocked` | 真实后端：SendInput 注入的事件少于给出的；同时在本地撤权 |
+| `hook_lost` | 真实后端：本实例的注入没有经过自己的钩子，钩子已失效；同时在本地撤权，随后重新装钩子 |
+| `max_hold` | 持续状态里的一项按住超过输入策略的 `max_hold_ms` |
 | `stop` | 收到 `core.stop` |
 | `core_connection_lost` | 生命线：核连接断开。主进程收不到，见日志与测试设备 |
 | `stdin_closed` | 生命线：stdin 读到 EOF 或读取失败 |
 
-权威检查不成立时的原因按[权威规则](../architecture.md#权威)三个条件的顺序取第一个不成立的：许可（`lease_*`、`no_lease`）、产出者与心跳（`heartbeat_timeout`、`producer_changed`）、帧龄（`frame_stale`）。
+权威检查不成立时的原因按[权威规则](../architecture.md#权威)三个条件的顺序取第一个不成立的：许可（`lease_*`、`no_lease`）、产出者与心跳（`heartbeat_timeout`、`producer_changed`）、帧龄（`frame_stale`）；以真实后端运行时其后是前台（`focus_lost`）。
+
+**`input.residual`**：只在真实后端上。释放全部输入之后、以及收到输入策略时，实时核以 `GetAsyncKeyState` 核验输入策略里的键与鼠标键，仍读作按住的项已补发抬起，以这条通知报出；没有残留不发。有操作员许可连接时也在那条连接上发出。规则见[持键账目与释放](realtime-core.md#持键账目与释放)。
+
+| 字段 | 含义 |
+| --- | --- |
+| `cause` | `release`（释放全部输入之后的核验，`reason` 同那次 `input.released`）或 `core_start`（新实例收到输入策略时的核验，旧实例可能留下了按住的键） |
+| `reason` | `cause` 为 `release` 时那次释放的原因，否则为 `null` |
+| `items` | 读作按住的项，联合类型 `HeldInput` 的 `key` 与 `mouse_button`，至少一项 |
+| `checked_at_ns` | 读按键状态的时刻 |
 
 **`core.health`**
 
@@ -335,6 +371,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | 到了到期时刻 | 过期，释放全部输入（`lease_expired`）。调度线程按到期时刻定时，不等下一个动作 |
 | 吊销：令牌不小于有效许可的令牌 | 吊销，释放全部输入（`lease_revoked`）；此后这个令牌及更早的令牌都不能再授予 |
 | 与许可源的连接断开 | 此后没有许可，释放全部输入（`lease_source_lost`） |
+| 本地撤权：真实后端上的接管、急停、注入被拦截、钩子失效 | 同吊销当前令牌，释放全部输入（原因为 `takeover`、`emergency_stop`、`injection_blocked`、`hook_lost`），此后这个令牌及更早的令牌都不能再授予；许可源须换发更大的令牌（[接管与急停](realtime-core.md#接管与急停)） |
 | 没有许可源（没有输入后端） | 从无许可（`no_lease`），不发任何输入 |
 
 许可源只有一个：给了操作员许可连接时，测试许可源不构造（[测试设备连接](#测试设备连接)的门禁）。
@@ -346,7 +383,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - **为什么不经主进程**：同[测试设备连接](#测试设备连接)，主进程只能让输入停下，不能让输入继续；拓扑与 G3 的控制连接相同，G3 换成 Bellis 宿主时只换连接信息与消息。
 - **凭据**：主进程从 SecretStore 读取控制台本次会话的地址与密钥，经环境变量交给实时核：`GAME_RUNTIME_OPERATOR_PATH`（地址）、`GAME_RUNTIME_OPERATOR_KEY`（base64url 密钥）；角色为 `game-runtime.core`。主进程一侧由 `CoreLinkOptions.operator` 给出。
 - **顺序**：同测试设备连接。实时核先连上控制台并开始处理它的请求；有测试设备连接时接着连它；再释放全部输入（`core_start`，控制台随即收到 `input.released(core_start)`），再连接主进程。连不上控制台即以 1 退出。断开后不重连：此后没有许可，不发任何输入（`lease_source_lost`）。
-- **门禁**：操作员许可连接须与一个输入后端一起给出，否则以参数不合法（2）退出。与假后端一起时，测试设备连接只承载 `fake_input.event`，`test_lease.*` 回“方法不存在”（-32601）。真实后端（G2 第 2 步）只能与操作员许可连接（或 G3 的控制连接）一起选出。
+- **门禁**：操作员许可连接须与一个输入后端一起给出，否则以参数不合法（2）退出。与假后端一起时，测试设备连接只承载 `fake_input.event`，`test_lease.*` 回“方法不存在”（-32601）。真实后端（`--input-backend sendinput`）只能与操作员许可连接（或 G3 的控制连接）一起选出，不能同时给测试设备的凭据（[输入后端](realtime-core.md#输入后端)）。
 - 消息名是本仓库自有的，不冒用游戏桥控制连接的 `lease.renew`（那份契约的源在 Bellis，GD-03）。
 
 | 方法 | 方向 | 类型 | params → result | 用途 |
@@ -354,6 +391,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `operator_lease.grant` | 控制台 → 实时核 | 请求 | `LeaseGrantParams` → `Empty` | 授予或续约许可：`token`、`expires_ns`（与帧环同一时钟）。不被接受时回 -32004 |
 | `operator_lease.revoke` | 控制台 → 实时核 | 请求 | `LeaseRevokeParams` → `Empty` | 吊销 `token` 及更早的令牌；释放完成后才回应 |
 | `input.released` | 实时核 → 控制台 | 通知 | `InputReleasedParams` | 每次释放全部输入后发出，同核连接的 [`input.released`](#消息集) |
+| `input.residual` | 实时核 → 控制台 | 通知 | `InputResidualParams` | 真实后端核验出残留时发出，同核连接的 [`input.residual`](#消息集) |
 
 `LeaseGrantParams`、`LeaseRevokeParams` 也是 `test_lease.grant`、`test_lease.revoke` 的 params。
 
@@ -364,7 +402,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - **为什么不经主进程**：主进程只能让输入停下，不能让输入继续，许可不能来自主进程；主进程崩溃时测试一方仍能看到实时核是否发出了抬起与释放全部，这是“主进程崩溃即释放”唯一可观察的办法；拓扑与生产时“许可来自另一方（Bellis 控制连接）”一致。
 - **凭据**：像核连接一样由环境变量交付，另用一组名字：`GAME_RUNTIME_TEST_DEVICE_PATH`（地址）、`GAME_RUNTIME_TEST_DEVICE_KEY`（base64url 密钥）；角色与核连接相同，为 `game-runtime.core`。主进程一侧由 `CoreLinkOptions.test_device` 给出（只用于测试）。
 - **顺序**：实时核先连上测试设备并开始处理它的请求，再释放全部输入（`core_start`，测试设备随即收到 `release_all(core_start)`），再连接主进程。连不上测试设备即以 1 退出。连接断开后不重连：此后没有许可，不发任何输入。
-- **门禁**：`--input-backend` 现在只有 `fake` 一个取值，其它取值（真实后端）unsupported；给了测试设备的凭据却没有 `--input-backend fake`、或 `--input-backend fake` 却没有凭据，都以参数不合法（2）退出。测试许可源只在假后端的代码里构造，且只在没有[操作员许可连接](#操作员许可连接)时构造，没有路径能让它与其它后端或其它许可源一起出现。
+- **门禁**：给了测试设备的凭据却没有 `--input-backend fake`（没有后端或真实后端）、或 `--input-backend fake` 却没有凭据，都以参数不合法（2）退出。测试许可源只在假后端的代码里构造，且只在没有[操作员许可连接](#操作员许可连接)时构造，没有路径能让它与其它后端或其它许可源一起出现。
 - 这些消息不是游戏桥控制连接的契约，也不冒用它的消息名（那份契约的源在 Bellis，GD-03）。
 
 | 方法 | 方向 | 类型 | params → result | 用途 |

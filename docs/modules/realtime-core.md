@@ -31,15 +31,16 @@ Rust 写的独立进程，是游戏侧的安全核：采集画面与声音，并
 
 1. 以 `session_credentials` 生成本实例的会话地址与密钥，在 `bellis-channel/1` 上开服务端监听。每个实例的凭据都是新的，被杀或已退出的旧实例连不上。
 2. 以 `subprocess.Popen` 和参数列表拉起 `realtime-core`：不经 shell，不用 `DETACHED_PROCESS`、`CREATE_BREAKAWAY_FROM_JOB` 或 `start_new_session`；stdin 是管道，stdout 与 stderr 继承主进程。
-3. 环境变量按 Bellis 的 `baseEnvironment` 只取系统必需的（Windows 的 `SYSTEMROOT`、`PATH` 等，POSIX 的 `HOME`、`PATH` 等），其余不继承；凭据按 Bellis 的 `ChildEnv` 放在 `BELLIS_CHANNEL_PATH`（地址）、`BELLIS_CHANNEL_KEY`（base64url 密钥）与 `BELLIS_ROLE`（角色，固定为 `game-runtime.core`）里。时限经命令行参数 `--heartbeat-timeout-ms`、`--health-interval-ms`、`--max-frame-age-ms` 给出。只用于测试：`CoreLinkOptions.test_device` 给出时另加 `--input-backend fake`，测试设备的地址与密钥放在 `GAME_RUNTIME_TEST_DEVICE_PATH`、`GAME_RUNTIME_TEST_DEVICE_KEY` 里（[测试设备连接](core-protocol.md#测试设备连接)）。`CoreLinkOptions.operator` 给出时，操作员控制台的地址与密钥放在 `GAME_RUNTIME_OPERATOR_PATH`、`GAME_RUNTIME_OPERATOR_KEY` 里（[操作员许可连接](core-protocol.md#操作员许可连接)）。
+3. 环境变量按 Bellis 的 `baseEnvironment` 只取系统必需的（Windows 的 `SYSTEMROOT`、`PATH` 等，POSIX 的 `HOME`、`PATH` 等），其余不继承；凭据按 Bellis 的 `ChildEnv` 放在 `BELLIS_CHANNEL_PATH`（地址）、`BELLIS_CHANNEL_KEY`（base64url 密钥）与 `BELLIS_ROLE`（角色，固定为 `game-runtime.core`）里。时限经命令行参数 `--heartbeat-timeout-ms`、`--health-interval-ms`、`--max-frame-age-ms` 给出。只用于测试：`CoreLinkOptions.test_device` 给出时另加 `--input-backend fake`，测试设备的地址与密钥放在 `GAME_RUNTIME_TEST_DEVICE_PATH`、`GAME_RUNTIME_TEST_DEVICE_KEY` 里（[测试设备连接](core-protocol.md#测试设备连接)）。`CoreLinkOptions.operator` 给出时，操作员控制台的地址与密钥放在 `GAME_RUNTIME_OPERATOR_PATH`、`GAME_RUNTIME_OPERATOR_KEY` 里（[操作员许可连接](core-protocol.md#操作员许可连接)）。`CoreLinkOptions.real_input` 为真时另加 `--input-backend sendinput` 与 `--emergency-hotkey`，须同时给出 `operator`、不给 `test_device`，否则构造时即报错（与实时核的门禁相同，见[输入后端](#输入后端)）。
 4. Windows 上以 `CREATE_SUSPENDED` 创建，放进 Job Object 并交出 job 句柄之后才恢复运行，见下文。同时以 `CREATE_NEW_PROCESS_GROUP` 放进自己的进程组：控制台里按 Ctrl+C 只到主进程，由主进程按[停止](#停止)的顺序停实时核，实时核不会被控制台直接终止、来不及释放输入。它仍在同一个控制台里，stdout、stderr 照常继承；关闭控制台窗口时照样收到关闭事件。其它平台不另设进程组（只在测试中运行，没有交互终端）。
 5. 实时核连上后发 `core.hello`；主进程只接受角色为 `game-runtime.core` 的第一个连接，核对协议版本，不相等即以 -32001 回错并断开。收到 `input.released(core_start)` 才算就绪。从拉起到就绪超过 `start_timeout` 或实例在就绪前退出，即按停止顺序终止它并报 `CoreStartError`。
 6. 配置了采集（`CoreLinkOptions.capture`）时先挂接帧环、再设定采集目标；配置了音频（`CoreLinkOptions.audio`）时接着挂接音频环、设定音频目标；任一被拒绝即按停止顺序终止它并报 `CoreStartError`（[帧环的挂接](core-protocol.md#读写规则)、[音频环的挂接](core-protocol.md#音频环的读写规则)）。之后开始发心跳。
 
-实例退出后宿主可以再 `start`，即重启。自动重启按 GR-35，G2 接真实输入之前实现，现在 unsupported：
+实例退出后宿主可以再 `start`，即重启。自动重启按 GR-35，G2 第 2 步实现：
 
-- 实例非 0 退出（panic 的 101、被强杀、运行中失败）后，`CoreLink` 按 1、2、4 秒退避重新拉起，至多 3 次，每次上报宿主；就绪后连续运行满 60 秒，次数清零。
-- 重启的实例照常先释放全部输入（`core_start`）再接受动作；等待中的 `wait_released` 由它的 `core_start` 完成（[释放](#释放)）。
+- 实例非 0 退出（panic 的 101、被强杀、运行中失败）后，`CoreLink` 按 1、2、4 秒退避重新拉起，至多 3 次，每次经 `on_restart` 报给宿主；就绪后连续运行满 60 秒，次数清零。
+- 重启的实例照常先释放全部输入（`core_start`）再接受动作；等待中的 `wait_released` 由它的 `core_start` 完成（[释放](#释放)）。`CoreLink` 照第一次启动的顺序给它挂接帧环与音频环、设定采集与音频目标、交出输入策略，然后恢复心跳。
+- 独立运行中重启的实例重新连上操作员控制台，控制台换发新令牌授予它（[许可](game-bridge.md#许可)）。
 - 不重启：主进程要求的停止、按生命线退出（退出码 0）、参数不合法（2）。次数用尽即停止并上报，由操作员处理。
 - 被杀的实例留下的按键只能靠新实例尽快启动后结束，见[失效与释放](../architecture.md#失效与释放)中的“实时核崩溃”。
 
@@ -126,6 +127,8 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 | 两条生命线 | 一个等核连接关闭，一个读 stdin 直到 EOF |
 | 操作员许可连接（只在给出时） | 读线程处理 `operator_lease.grant`、`operator_lease.revoke`；发送线程写出 `input.released`（每次释放全部输入时，与核连接上的同一份放进它的发送队列）；一条生命线等它断开，断开即许可失效 |
 | 测试设备连接（只在假后端时） | 发送线程写出假输入事件；没有操作员许可连接时它是测试许可源：读线程处理 `test_lease.grant`、`test_lease.revoke`，一条生命线等它断开，断开即许可失效 |
+| 钩子（只在真实后端时） | 装低层键盘与鼠标钩子并跑消息循环；回调只分类、入队，接管、急停与钩子失效交给调度线程释放，见[接管与急停](#接管与急停) |
+| 核验（只在真实后端时） | 释放后与收到输入策略时以 `GetAsyncKeyState` 核验，补发抬起，`input.residual` 放进发送队列，见[持键账目与释放](#持键账目与释放) |
 
 通知有两条出口：读线程上的处理函数直接写（`producer.revoke` 与 `core.stop` 由此在回应之前发出 `input.released`）；调度线程与测试设备连接的线程放进发送队列，由发送线程写，它们因此从不等网络写入，主进程卡住时只有发送线程阻塞。两条出口之间的先后不定。`core.stop` 以 `Handlers::request_then` 登记（见[错误处理](core-protocol.md#错误处理)）：回应写出之后才通知主线程结束会话，否则退出会丢掉回应。日志写 stderr，写失败丢弃，不 panic。
 
@@ -146,6 +149,10 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 | `producer.revoke` 的请求 | 2 秒 | `CoreLinkOptions.rpc_timeout` | 超时只记录，等待由其它事件完成；内核另有 `release_timeout` |
 | `core.hello` 的回应 | 2 秒 | 实时核内的常量 | 与通道握手的缺省时限相同 |
 | 停止各步 | 2、2、5 秒 | `CoreLinkOptions.stop` | 见上文“停止” |
+| 自动重启的退避 | 1、2、4 秒，至多 3 次；运行满 60 秒清零 | `CoreLinkOptions.restart` | GR-35 |
+| 释放后的 `GetAsyncKeyState` 核验 | 50 ms | 实时核内的常量 | 注入的抬起要经系统的输入线程处理后才反映在按键状态里；GS-02 实测 |
+| 钩子的自检 | 100 ms | 实时核内的常量 | 本实例的注入应在这之内经过自己的钩子；GS-02 实测回调延迟 |
+| 鼠标移动算接管的阈值 | 8 个物理像素 | 实时核内的常量 | 避开光电鼠标的抖动；GS-02 实测 |
 
 这些取值只在测试与假后端上跑过；真实输入下的表现（误判的频率、主进程卡死到释放的时延）在 G2 实测，PENDING。
 
@@ -170,6 +177,9 @@ job 设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：最后一个 job 句柄关闭时�
 | `runtime/tests/core_link/test_operator.py` | 操作员控制台作许可源，主进程一侧经 `OperatorClient` 连上：只在会话运行时执行动作；暂停即 `lease_revoked`、控制台退出即 `lease_source_lost`、到时即吊销并结束，都不留按住的键；有操作员许可连接时 `test_lease.*` 回“方法不存在”；重启的实时核得到更大的新令牌；门禁（操作员许可连接没有输入后端、假后端没有测试设备以 2 退出，连不上控制台以 1 退出）以真实的程序核对；脚本化的产出者只在运行时推进合成游戏的对白 |
 | `runtime/tests/core_link/test_link.py` | `CoreLink` 启动与停止；与插件内核联调的 QUIESCING 与停止顺序；杀掉实时核后重启，新实例的 `core_start` 使等待完成；干净退出后等待完成；真的杀掉主进程（Windows 上先单独关闭主进程的 job 句柄）后实时核按生命线释放并以 0 退出 |
 | `runtime/tests/core_link/test_process.py` | 替身子进程：RPC 不应答时退到关 stdin，不理 stdin 时强制终止；Windows 上孙进程在 job 里并在停止后不残留 |
+| `realtime-core` 的单元测试（真实后端） | 以替身的 Win32 层核对：前台、最小化、安全桌面的核对与 `focus_lost`、注入后焦点变化的 `uncertain`；绝对坐标的换算；按住时长与按住中的下一个动作；`injection_blocked`；钩子事件的分类、阈值、急停组合键与急停优先；本地撤权后旧令牌不能续约；核验补发抬起与 `input.residual`；输入策略的提交时与执行时核对；真实后端的门禁 |
+| `runtime/tests/core_link/test_link.py` 的自动重启 | 非 0 退出后按退避重启并报 `on_restart`、重启后重新挂接与交出输入策略、次数用尽即停止、0 退出与参数不合法不重启、运行满 60 秒清零（测试用缩短的退避） |
+| 真机手动测试（`-m manual`，不在 `uv run check` 中） | GS-02 在合成游戏的窗口上的各项，见[GS-02 的实测](#gs-02-的实测) |
 
 ## 画面采集
 
@@ -473,9 +483,11 @@ WASAPI 给出包里第一个采样点的 QPC 时刻（`GetBuffer` 的 `pu64QPCPo
 
 | 后端 | `--input-backend` | 状态 |
 | --- | --- | --- |
-| 没有后端 | 不给 | G0 生产中的配置：动作块照常校验与调度，但没有许可源，权威检查从不通过，不发任何输入（`no_lease`） |
+| 没有后端 | 不给 | 动作块照常校验与调度，但没有许可源，权威检查从不通过，不发任何输入（`no_lease`） |
 | 假输入后端，只用于测试 | `fake` | G0 实现，见下文；许可来自测试设备连接，或来自操作员许可连接 |
-| 真实后端（SendInput） | 无 | unsupported，G2 实现；给出其它取值以参数不合法（2）退出 |
+| 真实后端（SendInput），只在 Windows 上 | `sendinput` | G2 实现，见[注入](#注入)。须同时给出生产许可源（操作员许可连接；G3 起另有 Bellis 控制连接），没有、或同时给了测试设备的凭据，都以参数不合法（2）退出；其它平台 unsupported，同样以 2 退出 |
+
+给出其它取值以 2 退出。`InputSetup::select` 里真实后端只带生产许可源（`PermitSource`），不能与测试许可源一起构造。`--emergency-hotkey` 只与真实后端一起给出（[接管与急停](#接管与急停)）。
 
 ### 假输入后端与测试设备连接
 
@@ -488,30 +500,90 @@ WASAPI 给出包里第一个采样点的 QPC 时刻（`GetBuffer` 的 `pu64QPCPo
 
 ### 注入
 
-用 SendInput 注入（GR-09）：键盘发扫描码；点击把客户区物理像素换算为绝对坐标后移动、按下、按住、抬起，按住时长写在游戏适配包；每个注入事件的 `dwExtraInfo` 带本次会话的标记。不用窗口消息、虚拟 HID 或内核过滤驱动。G2 实现，现在 unsupported。
+真实后端（`sendinput.rs`，GR-09）用 SendInput 注入，不用窗口消息、虚拟 HID 或内核过滤驱动：
 
-每次注入前核对：游戏窗口在前台，落点在客户区内，窗口未最小化且不在安全桌面，以及[权威规则](../architecture.md#权威)的三个条件（G0 已在假后端之前核对，见[动作块的执行](#动作块的执行)）。注入后再核对一次前台，焦点中途变化即报部分提交或结果未知，不自动重试。从不自动把游戏切回前台，失焦时上报并暂停输入。
+- **目标窗口**：采集目标（`capture.set_target` 的 `window`）认定的窗口；没有采集源（`searching`）时没有目标窗口。假显示面没有窗口：以真实后端运行时 `capture.set_target` 的 `fake` 回 -32003。
+- **键**：发扫描码（`KEYEVENTF_SCANCODE`；高字节为 `0xE0` 的扩展键另加 `KEYEVENTF_EXTENDEDKEY`）。
+- **点击与滚动**：先以绝对坐标移动到落点，再按下、抬起或滚动。落点是客户区物理像素加注入时客户区原点的屏幕坐标，换算到虚拟桌面的 0–65535（`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`）。实时核以每显示器 DPI 感知（v2）运行，坐标都是物理像素。鼠标键按 `SM_SWAPBUTTON` 换算成注入用的物理键。
+- **按住时长**：点击与短按在按下与抬起之间按住输入策略的 `press_duration`。
+  - 按下在核对通过时注入，这一项随即记进持键账目；到时由调度线程注入抬起，其间释放全部输入照样把它抬起。
+  - 按住中，同一步的下一个一次性动作等它抬起之后再执行，执行前照样核对。
+  - 没有输入策略的假后端上按住时长为 0，一次性动作仍是单个事件（G0 的行为）。
+- **标记**：每个注入事件的 `dwExtraInfo` 都带本实例的会话标记（启动时生成的随机数），低层钩子据此认出本实例的注入。
+- **注入被拦截**：SendInput 注入的事件少于给出的（UIPI 或其它程序拦截），即释放全部输入（`injection_blocked`）并在本地撤权（同[接管](#接管与急停)），不重试。反作弊拦截也按此处理，按合规停止，不绕过。
 
-### 白名单与静态禁区
+每次注入按下类之前，在[权威规则](../architecture.md#权威)的三个条件之后再核对：目标窗口存在、可见、没有最小化，是前台窗口（`GetForegroundWindow`），输入桌面是当前桌面而不是安全桌面（UAC、锁屏）。
 
-游戏适配包写明允许的扫描码、鼠标键、点击区域、最高动作速率与最长按住时间，以及不论画面都不能点的静态禁区（GR-21）。实时核在白名单之外强制执行静态禁区，不满足即拒绝该动作并上报。
+- 不成立即不发，释放全部输入（`focus_lost`），这一块结束，同权威检查的失败。实时核从不把游戏切回前台；主进程收到释放后停止提议动作，等操作员处理（[逐步控制](step-control.md)）。
+- 注入后再核对一次前台：焦点在注入过程中变了，这个动作回执 `uncertain`（结果未知），释放全部输入（`focus_lost`），不自动重试。
+- 抬起与释放不做这些核对：抬起是安全方向，目标窗口不在前台时照样注入。
+
+### 输入策略
+
+游戏适配包的[动作白名单](game-adapter.md#动作白名单)与静态禁区（GR-21）由主进程换算成输入策略，以 `input.configure` 交给实时核：ROI 名换成归一化矩形，时长换成毫秒（[核协议](core-protocol.md#消息集)）。`CoreLink` 在设定采集目标之后、第一次心跳之前交出，重启的实例照样再交一次；每个实例只设定一次，此后不能更改。实时核在许可与权威检查之外强制执行它：
+
+- **提交时**（`action.submit` 的校验，在 `invalid` 之后）：持续状态里的键须在 `hold_keys`、鼠标键须在 `hold_buttons`，不允许轴；一次性动作里点击的键须在 `click_buttons`，短按的扫描码须在 `press_keys`，滚动须 `scroll` 为真，不允许相对位移。不符即整块拒绝（`not_allowed`），不改变任何状态。
+- **执行时**：
+  - 带坐标的动作，落点（归一化矩形按基准帧的客户区尺寸换算）须在某个 `click_regions` 之内、不在任何 `forbidden_zones` 之内。否则这个动作回执 `dropped(not_allowed)`，不释放，块里其余动作照常（同 `geometry_changed`）。
+  - 过去 1 秒内已按下 `max_rate` 个一次性动作时，下一个回执 `dropped(rate_limited)`。
+  - 持续状态里的一项按住超过 `max_hold`，即释放全部输入（`max_hold`）。
+- **没有输入策略**：以真实后端运行时，含输入的动作块一律以 `not_allowed` 拒绝，不发任何输入；以假后端运行时不限制（G0 的测试照旧）。
+
+被拒绝与丢弃的动作经回执交给主进程，由逐步控制记下原因（[动作风险](step-control.md#动作风险)）。
 
 ### 持键账目与释放
 
 持键账目（`InputLedger`）按按下的顺序记录本实例按下且尚未抬起的每一项：键按扫描码、鼠标键按键、轴按轴名（取值改变时原地更新）。任何失效都按[失效与释放](../architecture.md#失效与释放)释放全部输入：按相反的顺序逐项抬起，告诉后端已全部释放，再清空账目，见[释放](#释放)。
 
 - 假后端上，抬起与 `release_all` 是交给测试一方的事件，测试一方据此核对释放是否完整。
-- 真实后端上释放后以 `GetAsyncKeyState` 核验：G2，unsupported。
-- 被杀的实例发不出抬起；新实例的账目是空的，它的 `core_start` 释放不知道旧实例按住了什么。假后端上由测试实测为残余风险（[失效与释放](../architecture.md#失效与释放)的“实时核崩溃”）；真实后端上新实例能否据 `GetAsyncKeyState` 补发抬起在 G2 定，PENDING。
+- 真实后端上，释放全部输入时逐项注入抬起（带会话标记）。释放后 50 ms，核验线程（不在锁内）以 `GetAsyncKeyState` 读输入策略里的全部键与鼠标键：仍读作按住的项补发一次抬起，并以 `input.residual` 报给主进程与操作员控制台。实时核分不清残留来自自己、真人还是其它程序；抬起是安全方向，所以照样补发。`GetAsyncKeyState` 读的是物理鼠标键，不随左右键交换。
+- 被杀的实例发不出抬起，新实例的账目是空的。真实后端上，新实例收到输入策略时同样核验一次，读作按住的项补发抬起，并报 `input.residual`（`core_start`）。代价：操作员这时正按着其中某个键，也会被抬起（键盘的自动重复会把键再按下，鼠标键不会）。假后端上的残留由测试实测（[失效与释放](../architecture.md#失效与释放)的“实时核崩溃”）。
 
 ### 接管与急停
 
-- 低层键鼠钩子在专用线程上运行，回调只入队。
-- 没有“已注入”标志的真人动作（鼠标位移超过阈值才算）与不带本会话标记的注入都按接管处理：本地撤权、释放全部输入、上报。Bellis 切到人工模式，交还控制只能由操作员执行。
-- 实时核同时监听 OBS 急停热键（Bellis R-27）的组合键，按下即释放全部输入并上报，不依赖 Bellis 转发；组合键在配置中与 OBS 的绑定保持一致。
-- 反作弊拦截或标记注入的输入时按合规停止信号处理，不绕过。
+以真实后端运行时，实时核在专用线程上装低层键盘与鼠标钩子（`WH_KEYBOARD_LL`、`WH_MOUSE_LL`），这个线程跑自己的消息循环。
 
-待实测项见 [GS-02](../plan/spikes.md)。
+- 回调只按下表分类，把结果放进队列就返回。事件一律交给下一个钩子（`CallNextHookEx`），从不吞掉，与 OBS 等程序的热键互不干扰。
+- 装不上钩子即以 1 退出：没有接管检测就不发真实输入。
+
+| 事件 | 判为 |
+| --- | --- |
+| 带注入标志，`dwExtraInfo` 是本实例的会话标记 | 本实例的注入，忽略 |
+| 带注入标志，标记不是本实例的 | 第三方注入：接管 |
+| 不带注入标志的键按下、鼠标键按下、滚轮 | 真人：接管 |
+| 不带注入标志的鼠标移动，从许可生效起累计超过 8 个物理像素 | 真人：接管；更小的抖动不算 |
+| 急停组合键：最后一键按下时其余键都按住（不论是否注入） | 急停 |
+
+抬起不算接管：操作员在控制台敲完 `start` 后才抬起回车，不会触发。
+
+- **接管**只在许可有效时算数。许可无效时没有可接管的输入，操作员照常在控制台里敲命令。
+  - 接管即释放全部输入（`takeover`），并在本地撤权：当前令牌作废，不能再续约，许可源须换发更大的令牌（同吊销，见[输入许可](core-protocol.md#输入许可)）。
+  - 独立运行中控制台随即转为暂停，交还控制只能由操作员在控制台上按“开始”（[许可](game-bridge.md#许可)）；G3 中 Bellis 切到人工模式。
+- **急停**：组合键缺省 `Ctrl+Shift+F12`，以 `--emergency-hotkey` 改（如 `ctrl+alt+end`），须与 OBS 的急停热键（Bellis R-27）一致。
+  - 按下即释放全部输入（`emergency_stop`）并本地撤权。不论许可是否有效都如此，不依赖主进程或 Bellis 转发。
+  - 急停优先于接管：同一次按键只报急停。
+- **钩子的自检**：Windows 在回调超时（`LowLevelHooksTimeout`）后会静默摘掉钩子。本实例注入的每个事件都应在 100 ms 内经过自己的钩子；没有经过即判钩子失效：释放全部输入（`hook_lost`），本地撤权，重新装钩子。
+- 反作弊拦截或标记注入的输入时，按合规停止信号处理，不绕过。
+
+### GS-02 的实测
+
+[GS-02](../plan/spikes.md) 先在合成游戏的窗口上，再在《魔女审判》上实测，两者都在操作员控制台的测试会话下。
+
+- **合成游戏的窗口**：
+  - 点击与短按的生效率；
+  - 测试给出允许按住一个键的输入策略（只在这个测试里）。按住时触发暂停、控制台退出、许可过期与急停，量从触发到测试进程的低层钩子看到抬起的时延；
+  - 释放后 `GetAsyncKeyState` 的核验；
+  - 第三方注入（测试进程自己以 SendInput 注入）判为接管；
+  - 前台核对与注入之间焦点变化的频率。
+- **《魔女审判》**：只发左键点击（C-5）。
+  - 点击对白框的生效率；
+  - 暂停与控制台退出后的释放与 `GetAsyncKeyState` 核验；
+  - 编码助手的 computer use 的输入判为第三方注入。
+
+不在实测中做：
+- 真人接管（不带注入标志的输入）要人手，在 G2 验收时由维护者实测；
+- 与 OBS 急停热键同时触发，G3 再测（维护者 2026-11-02）；
+- 满载下钩子回调延迟的分布：《魔女审判》的 GPU 负载低，原神阶段再测。
 
 ## 动作块的执行
 
@@ -534,6 +606,8 @@ WASAPI 给出包里第一个采样点的 QPC 时刻（`GetBuffer` 的 `pu64QPCPo
 1. 抬起账目里不在这一步持续状态中的项：抬起是安全方向，不检查。
 2. 按下这一步持续状态里尚未按住（或轴取值不同）的项：每项之前检查。
 3. 按列出的顺序执行一次性动作：本代次已执行过的身份回执 `duplicate`；带坐标的动作在基准帧之后几何变了的回执 `geometry_changed`（[坐标与几何](core-protocol.md#坐标与几何)）；其余每个之前检查，通过即交给后端，回执 `executed`。
+
+以真实后端运行时，按下类在三个条件之后另核对前台（[注入](#注入)）；带坐标的动作与一次性动作的速率另按[输入策略](#输入策略)核对，不符只丢弃这个动作。
 
 检查不成立即不发，在同一把锁内释放全部输入与持续状态（原因取第一个不成立的条件），这一块随之结束：其余动作回执 `released`，之后的步不再执行。每执行完一步，这一步的动作回执一次。
 
