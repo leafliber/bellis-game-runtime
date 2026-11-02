@@ -181,6 +181,13 @@ class TerminalConsole:
         """一个事件写成的几行。"""
         fields = event.fields
         match event.kind:
+            case EventKind.COUNTDOWN:
+                seconds = fields["seconds"]
+                if seconds <= 0:
+                    return ["开始……"]
+                return [f"倒数 {seconds:g} 秒后授予许可，请把游戏窗口切到前台……"]
+            case EventKind.COUNTDOWN_CANCELLED:
+                return ["已取消倒数。"]
             case EventKind.STARTED | EventKind.RESUMED:
                 verb = "开始" if event.kind is EventKind.STARTED else "继续"
                 ends_at = fields.get("ends_at_ns")
@@ -205,6 +212,12 @@ class TerminalConsole:
                 return [f"拒绝了一个连接（{fields['role']}）：{fields['reason']}"]
             case EventKind.INPUT_RELEASED:
                 return [f"实时核释放了全部输入：{fields['reason']}"]
+            case EventKind.INPUT_RESIDUAL:
+                reason = fields.get("reason")
+                tail = "" if reason is None else f"，{reason}"
+                return [
+                    f"实时核核验出残留（{fields['cause']}{tail}）：{fields['items']} 项，已补发抬起"
+                ]
             case EventKind.DECISION_OPENED:
                 return self._decision(fields)
             case EventKind.DECISION_CHOSEN:

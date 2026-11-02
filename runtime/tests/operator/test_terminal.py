@@ -57,7 +57,7 @@ def console(data_dir: Path, *, max_minutes: float = 60) -> OperatorConsole:
         adapter,
         store=MemorySecretStore(),
         data_dir=data_dir,
-        options=ConsoleOptions(max_minutes=max_minutes),
+        options=ConsoleOptions(max_minutes=max_minutes, start_delay=0.0),
     )
 
 

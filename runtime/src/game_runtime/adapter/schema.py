@@ -25,6 +25,7 @@ from pydantic import (
     model_validator,
 )
 
+from core_protocol import models
 from core_protocol.models import MouseButton
 from game_runtime.core_link.capture import WindowRule
 
@@ -593,6 +594,40 @@ class Adapter(_Model):
     def window_rule(self) -> WindowRule:
         """采集配置的窗口识别规则。"""
         return self.window.rule()
+
+    def input_policy(self) -> models.InputPolicy:
+        """把动作白名单与静态禁区换算成交给实时核的输入策略（`input.configure` 的 params）：
+        ROI 名换成归一化矩形，时长换成毫秒（1–500）。引用的 ROI 未标定即 NotCalibratedError。"""
+        whitelist = self.whitelist
+
+        def rect(name: str) -> dict[str, float]:
+            roi = self.roi(name)
+            return {
+                "left": float(roi.left),
+                "top": float(roi.top),
+                "right": float(roi.right),
+                "bottom": float(roi.bottom),
+            }
+
+        press_duration_ms = min(500, max(1, round(whitelist.press_duration * 1000)))
+        max_hold_ms = (
+            None if whitelist.max_hold is None else max(1, round(whitelist.max_hold * 1000))
+        )
+        # 以 model_validate 构造：扫描码在模型里是 RootModel 包装，直接传整数由 pydantic 校验。
+        return models.InputPolicy.model_validate(
+            {
+                "click_buttons": [button.value for button in whitelist.click_buttons],
+                "press_keys": list(whitelist.press_keys),
+                "scroll": whitelist.scroll,
+                "click_regions": [rect(name) for name in whitelist.click_regions],
+                "forbidden_zones": [rect(name) for name in self.risk.forbidden_zones],
+                "press_duration_ms": press_duration_ms,
+                "max_rate": whitelist.max_rate,
+                "hold_keys": list(whitelist.hold_keys),
+                "hold_buttons": [button.value for button in whitelist.hold_buttons],
+                "max_hold_ms": max_hold_ms,
+            }
+        )
 
     def roi(self, name: str) -> NormalizedRect:
         """ROI 的归一化矩形。没有声明即 LookupError，尚未标定即 NotCalibratedError。"""

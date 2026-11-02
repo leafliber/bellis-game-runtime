@@ -31,6 +31,7 @@ from game_runtime.core_link.link import (
     CoreLink,
     CoreLinkOptions,
     CoreStartError,
+    RestartPolicy,
     shutdown_runtime,
 )
 from game_runtime.core_link.process import (
@@ -62,6 +63,7 @@ __all__ = [
     "CoreLinkOptions",
     "CoreStartError",
     "ManagedProcess",
+    "RestartPolicy",
     "StopResult",
     "StopStage",
     "StopTimeouts",
