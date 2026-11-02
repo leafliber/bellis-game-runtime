@@ -256,6 +256,7 @@ dependencies = [
  "capture",
  "core-protocol",
  "frame-ring",
+ "getrandom",
  "mono-clock",
  "serde",
  "serde_json",

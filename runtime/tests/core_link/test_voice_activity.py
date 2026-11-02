@@ -108,6 +108,7 @@ def test_voice_activity_follows_the_sound_through_the_core(core_exe: Path) -> No
                 heartbeat_timeout=0.3,
                 health_interval=0.05,
                 audio=audio,
+                restart=None,  # 杀掉后由测试自己重启
             )
             link = CoreLink(options, on_health=health.append)
             kernel = Kernel(

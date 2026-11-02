@@ -287,7 +287,7 @@ fn start_input(
 ) -> Result<Started, StartError> {
     let operator_queue = input.operator().map(|_| Arc::new(SendQueue::default()));
     let outbox = Arc::new(Outbox::new(operator_queue.clone()));
-    let target = Arc::new(TargetWindow::default());
+    let target = Arc::new(TargetWindow::new(matches!(input, InputSetup::Real { .. })));
     let post: Post = {
         let outbox = Arc::clone(&outbox);
         Arc::new(move |notices| outbox.post(notices))
@@ -749,6 +749,16 @@ fn set_target_handler(
     move |params| {
         let params: CaptureSetTargetParams =
             parse(params).map_err(|error| invalid_params(CaptureSetTarget::NAME, &error))?;
+        if !target.accepts(&params.target) {
+            log!(
+                "{} refused: the real input backend needs a window",
+                CaptureSetTarget::NAME
+            );
+            return Err(RpcError::new(
+                i64::from(error_code::CAPTURE_UNSUPPORTED),
+                "unsupported: the real input backend injects into a window; a fake display has none",
+            ));
+        }
         target.set(target_selector(&params.target));
         let opener = opener_for(params.target).map_err(|error| {
             log!("{} refused: {error}", CaptureSetTarget::NAME);

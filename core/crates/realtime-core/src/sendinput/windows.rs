@@ -16,7 +16,7 @@
 )]
 
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -438,14 +438,17 @@ pub(crate) fn start(control: &Arc<Control>, post: &Post, wiring: Wiring) -> io::
     Ok(())
 }
 
+/// 本实例的会话标记：启动时从系统随机数源取的随机数，放进每个注入事件的 `dwExtraInfo`。不取 0，
+/// 以免与不带标记的注入（`dwExtraInfo` 为 0）混同。
 fn session_marker() -> usize {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    // 用一个随机数作会话标记；getrandom 不在依赖里，用时间与地址凑一个非零值即可（只需本进程唯一且
-    // 不等于常见的 0/1）。
-    let salt = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = mono_clock::now_ns() as usize;
-    let addr = (&raw const COUNTER) as usize;
-    (now ^ addr ^ (salt << 48)) | 0x1000_0000
+    loop {
+        let mut bytes = [0u8; size_of::<usize>()];
+        getrandom::fill(&mut bytes).expect("系统随机数源不可用");
+        let marker = usize::from_ne_bytes(bytes);
+        if marker != 0 {
+            return marker;
+        }
+    }
 }
 
 fn spawn_verify(
