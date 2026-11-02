@@ -14,8 +14,9 @@ use serde::de::DeserializeOwned;
 use crate::messages::{
     ActionBlock, ActionReceiptParams, ActionSubmitResult, AudioRingAttachParams,
     AudioSetTargetParams, CaptureSetTargetParams, CoreHealthParams, CoreHelloParams,
-    CoreHelloResult, Empty, FakeInputEventParams, FrameRingAttachParams, InputReleasedParams,
-    LeaseGrantParams, LeaseRevokeParams, ProducerHeartbeatParams, ProducerRevokeParams,
+    CoreHelloResult, Empty, FakeInputEventParams, FrameRingAttachParams, InputPolicy,
+    InputReleasedParams, InputResidualParams, LeaseGrantParams, LeaseRevokeParams,
+    ProducerHeartbeatParams, ProducerRevokeParams,
 };
 
 /// 消息的发送方。
@@ -139,6 +140,8 @@ methods! {
     AudioRingAttach = "audio_ring.attach", MainToCore, AudioRingAttachParams => Empty;
     /// 设定音频目标。
     AudioSetTarget = "audio.set_target", MainToCore, AudioSetTargetParams => Empty;
+    /// 交出输入策略：动作白名单与静态禁区。每个实例一次，设定过回 -32006。
+    InputConfigure = "input.configure", MainToCore, InputPolicy => Empty;
     /// 控制产出者心跳。
     ProducerHeartbeat = "producer.heartbeat", MainToCore, ProducerHeartbeatParams;
     /// 提交动作块。
@@ -151,6 +154,8 @@ methods! {
     ActionReceipt = "action.receipt", CoreToMain, ActionReceiptParams;
     /// 输入已释放的确认。
     InputReleased = "input.released", CoreToMain, InputReleasedParams;
+    /// 真实后端核验时仍读作按住、已补发抬起的项。
+    InputResidual = "input.residual", CoreToMain, InputResidualParams;
     /// 实时核健康。
     CoreHealth = "core.health", CoreToMain, CoreHealthParams;
 }
@@ -165,6 +170,8 @@ methods! {
     OperatorLeaseRevoke = "operator_lease.revoke", OperatorToCore, LeaseRevokeParams => Empty;
     /// 输入已释放的确认，与核连接上的 `input.released` 同名、同 params。
     OperatorInputReleased = "input.released", CoreToOperator, InputReleasedParams;
+    /// 核验出残留时发出，与核连接上的 `input.residual` 同名、同 params。
+    OperatorInputResidual = "input.residual", CoreToOperator, InputResidualParams;
 }
 
 methods! {
@@ -191,13 +198,16 @@ pub mod error_code {
     pub const LEASE_REFUSED: i32 = -32004;
     /// `audio_ring.attach` 打不开共享内存，或音频环头部与参数不符；`audio.set_target` 的假音频输出同样。
     pub const AUDIO_RING_MISMATCH: i32 = -32005;
+    /// `input.configure` 在本实例已设定过。
+    pub const INPUT_POLICY_CONFLICT: i32 = -32006;
 
     /// 全部自定义错误码及其名字，供导出 Schema。
-    pub const ALL: [(&str, i32); 5] = [
+    pub const ALL: [(&str, i32); 6] = [
         ("protocol_version_mismatch", PROTOCOL_VERSION_MISMATCH),
         ("frame_ring_mismatch", FRAME_RING_MISMATCH),
         ("capture_unsupported", CAPTURE_UNSUPPORTED),
         ("lease_refused", LEASE_REFUSED),
         ("audio_ring_mismatch", AUDIO_RING_MISMATCH),
+        ("input_policy_conflict", INPUT_POLICY_CONFLICT),
     ];
 }

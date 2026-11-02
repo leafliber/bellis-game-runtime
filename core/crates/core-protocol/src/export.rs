@@ -18,16 +18,18 @@ use crate::messages::{
     CoreHelloParams, CoreHelloResult, DropReason, Dropped, Empty, Executed, FakeAudioTarget,
     FakeAxisRelease, FakeAxisSet, FakeClick, FakeInputEvent, FakeInputEventParams, FakeKeyDown,
     FakeKeyPress, FakeKeyUp, FakeMouseDown, FakeMouseMove, FakeMouseUp, FakeReleaseAll, FakeScroll,
-    FakeTarget, FrameRingAttachParams, HeldAxis, HeldInput, HeldKey, HeldMouseButton,
-    InputReleasedParams, KeyPress, LatestAudio, LatestFrame, LeaseGrantParams, LeaseRevokeParams,
-    LeaseStatus, MouseButton, MouseMove, Producer, ProducerHeartbeatParams, ProducerRevokeParams,
-    RejectReason, Rejected, ReleaseReason, Scroll, WindowTarget,
+    FakeTarget, FrameRingAttachParams, HeldAxis, HeldInput, HeldKey, HeldMouseButton, InputPolicy,
+    InputReleasedParams, InputResidualParams, KeyPress, LatestAudio, LatestFrame, LeaseGrantParams,
+    LeaseRevokeParams, LeaseStatus, MouseButton, MouseMove, NormRect, Producer,
+    ProducerHeartbeatParams, ProducerRevokeParams, RejectReason, Rejected, ReleaseReason,
+    ResidualCause, Scroll, WindowTarget,
 };
 use crate::methods::{
     ActionReceipt, ActionSubmit, AudioRingAttach, AudioSetTarget, CaptureSetTarget, CoreHealth,
-    CoreHello, CoreStop, FakeInput, FrameRingAttach, InputReleased, Method, MethodInfo,
-    OperatorLeaseGrant, OperatorLeaseRevoke, ProducerHeartbeat, ProducerRevoke, Request,
-    TestLeaseGrant, TestLeaseRevoke, catalog, error_code, operator_catalog, test_device_catalog,
+    CoreHello, CoreStop, FakeInput, FrameRingAttach, InputConfigure, InputReleased, InputResidual,
+    Method, MethodInfo, OperatorInputResidual, OperatorLeaseGrant, OperatorLeaseRevoke,
+    ProducerHeartbeat, ProducerRevoke, Request, TestLeaseGrant, TestLeaseRevoke, catalog,
+    error_code, operator_catalog, test_device_catalog,
 };
 use crate::{audio_ring, frame_ring};
 
@@ -313,6 +315,32 @@ pub fn fixtures() -> Vec<Fixture> {
             },
         ),
         Fixture::result::<AudioSetTarget>(None, &Empty {}),
+        Fixture::params::<InputConfigure>(
+            None,
+            &InputPolicy {
+                click_buttons: vec![MouseButton::Left],
+                press_keys: vec![0x1C, 0x39],
+                scroll: true,
+                click_regions: vec![NormRect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 1.0,
+                    bottom: 1.0,
+                }],
+                forbidden_zones: vec![NormRect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 0.2,
+                    bottom: 0.1,
+                }],
+                press_duration_ms: 50,
+                max_rate: 10.0,
+                hold_keys: vec![0x11],
+                hold_buttons: vec![MouseButton::Right],
+                max_hold_ms: Some(2000),
+            },
+        ),
+        Fixture::result::<InputConfigure>(None, &Empty {}),
         Fixture::params::<ProducerHeartbeat>(
             None,
             &ProducerHeartbeatParams {
@@ -423,12 +451,73 @@ pub fn fixtures() -> Vec<Fixture> {
                 ],
             },
         ),
+        Fixture::params::<ActionReceipt>(
+            Some("real-backend"),
+            &ActionReceiptParams {
+                producer: step_control(),
+                block_seq: 8,
+                outcomes: vec![
+                    // `Uncertain` 与 `Executed` 字段相同、只有标签不同，放进示例会让“换标签即被拒”的
+                    // 核对失配；它的往返由 `realtime-core` 的单元测试覆盖。
+                    ActionOutcome::Dropped(Dropped {
+                        id: 4,
+                        reason: DropReason::NotAllowed,
+                    }),
+                    ActionOutcome::Dropped(Dropped {
+                        id: 5,
+                        reason: DropReason::RateLimited,
+                    }),
+                ],
+            },
+        ),
         Fixture::params::<InputReleased>(
             Some("revoked"),
             &InputReleasedParams {
                 reason: ReleaseReason::GenerationRevoked,
                 producer: Some(step_control()),
                 released_at_ns: 5_600_000_000,
+            },
+        ),
+        Fixture::params::<InputReleased>(
+            Some("takeover"),
+            &InputReleasedParams {
+                reason: ReleaseReason::Takeover,
+                producer: Some(step_control()),
+                released_at_ns: 5_650_000_000,
+            },
+        ),
+        Fixture::params::<InputResidual>(
+            Some("release"),
+            &InputResidualParams {
+                cause: ResidualCause::Release,
+                reason: Some(ReleaseReason::EmergencyStop),
+                items: vec![
+                    HeldInput::Key(HeldKey { scan_code: 0x11 }),
+                    HeldInput::MouseButton(HeldMouseButton {
+                        button: MouseButton::Left,
+                    }),
+                ],
+                checked_at_ns: 5_700_050_000,
+            },
+        ),
+        Fixture::params::<InputResidual>(
+            Some("core-start"),
+            &InputResidualParams {
+                cause: ResidualCause::CoreStart,
+                reason: None,
+                items: vec![HeldInput::Key(HeldKey { scan_code: 0x1E })],
+                checked_at_ns: 1_050_000,
+            },
+        ),
+        Fixture::params::<OperatorInputResidual>(
+            None,
+            &InputResidualParams {
+                cause: ResidualCause::Release,
+                reason: Some(ReleaseReason::Takeover),
+                items: vec![HeldInput::MouseButton(HeldMouseButton {
+                    button: MouseButton::Left,
+                })],
+                checked_at_ns: 5_700_050_000,
             },
         ),
         Fixture::params::<InputReleased>(
@@ -574,8 +663,8 @@ mod tests {
 
     use super::{fixtures, schema};
     use crate::methods::{
-        InputReleased, Method, MethodInfo, OperatorInputReleased, catalog, operator_catalog,
-        test_device_catalog,
+        InputReleased, InputResidual, Method, MethodInfo, OperatorInputReleased,
+        OperatorInputResidual, catalog, operator_catalog, test_device_catalog,
     };
 
     /// 三组方法：核连接上的、操作员许可连接上的与测试设备连接上的。
@@ -735,9 +824,9 @@ mod tests {
     }
 
     /// 测试设备连接与核连接、操作员许可连接没有同名的方法；操作员许可连接与核连接只共有
-    /// `input.released`，两处的 params 相同。
+    /// `input.released` 与 `input.residual`，两处的 params 相同。
     #[test]
-    fn the_groups_share_only_input_released() {
+    fn the_groups_share_only_the_core_to_operator_notifications() {
         let core: BTreeSet<&str> = catalog().iter().map(|method| method.name).collect();
         let operator: BTreeSet<&str> = operator_catalog()
             .iter()
@@ -747,13 +836,17 @@ mod tests {
             assert!(!core.contains(method.name), "{}", method.name);
             assert!(!operator.contains(method.name), "{}", method.name);
         }
-        let shared: Vec<&str> = core.intersection(&operator).copied().collect();
-        assert_eq!(shared, [InputReleased::NAME]);
+        let mut shared: Vec<&str> = core.intersection(&operator).copied().collect();
+        shared.sort_unstable();
+        assert_eq!(shared, [InputReleased::NAME, InputResidual::NAME]);
         assert_eq!(OperatorInputReleased::NAME, InputReleased::NAME);
+        assert_eq!(OperatorInputResidual::NAME, InputResidual::NAME);
         let schema = schema();
-        assert_eq!(
-            schema["x-operator-methods"][InputReleased::NAME]["params"],
-            schema["x-methods"][InputReleased::NAME]["params"]
-        );
+        for name in [InputReleased::NAME, InputResidual::NAME] {
+            assert_eq!(
+                schema["x-operator-methods"][name]["params"],
+                schema["x-methods"][name]["params"]
+            );
+        }
     }
 }

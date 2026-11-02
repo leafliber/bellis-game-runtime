@@ -1,0 +1,11 @@
+{
+  "cause": "core_start",
+  "reason": null,
+  "items": [
+    {
+      "type": "key",
+      "scan_code": 30
+    }
+  ],
+  "checked_at_ns": 1050000
+}

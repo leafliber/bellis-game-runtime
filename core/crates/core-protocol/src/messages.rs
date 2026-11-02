@@ -160,6 +160,52 @@ pub struct FakeAudioTarget {
     pub output: AudioRingAttachParams,
 }
 
+// ---------------------------------------------------------------- 输入策略
+
+/// 归一化矩形：客户区的相对坐标，各分量取值 [0, 1]，左上小于右下。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "NormRect")]
+pub struct NormRect {
+    /// 左边界（含）。
+    pub left: f64,
+    /// 上边界（含）。
+    pub top: f64,
+    /// 右边界（不含）。
+    pub right: f64,
+    /// 下边界（不含）。
+    pub bottom: f64,
+}
+
+/// `input.configure` 的 params：主进程把游戏适配包的动作白名单与静态禁区换算成的输入策略。
+///
+/// 实时核怎样执行见 `docs/modules/realtime-core.md` 的“输入策略”：提交时核对键与鼠标键，执行时
+/// 核对落点与速率，按住超时即释放。每个实例只设定一次。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputPolicy {
+    /// 可点击的鼠标键。
+    pub click_buttons: Vec<MouseButton>,
+    /// 可短按的扫描码（Set 1）。
+    pub press_keys: Vec<u16>,
+    /// 是否允许滚动。
+    pub scroll: bool,
+    /// 点击与滚动的落点须在其中之一内；允许点击或滚动时不能为空。
+    pub click_regions: Vec<NormRect>,
+    /// 静态禁区，落点不能在其中之一内；可为空。
+    pub forbidden_zones: Vec<NormRect>,
+    /// 点击与短按的按住时长，1–500 毫秒。
+    pub press_duration_ms: u32,
+    /// 每秒至多几个一次性动作，大于 0。
+    pub max_rate: f64,
+    /// 可按住的扫描码（Set 1）。
+    pub hold_keys: Vec<u16>,
+    /// 可按住的鼠标键。
+    pub hold_buttons: Vec<MouseButton>,
+    /// 最长按住时间（毫秒）；有可按住的项时必需，没有时为 `null`。
+    pub max_hold_ms: Option<u32>,
+}
+
 // ---------------------------------------------------------------- 控制产出者
 
 /// 控制产出者的身份与代次。
@@ -375,6 +421,8 @@ pub enum RejectReason {
     Expired,
     /// 内容不合规则，例如步的时刻倒序、同一项持续状态出现两次、动作身份在块内重复。
     Invalid,
+    /// 持续状态或一次性动作不在输入策略的白名单内，或以真实后端运行时还没有输入策略。
+    NotAllowed,
     /// 实时核正在停止，不再接受动作块。
     Stopping,
 }
@@ -399,6 +447,7 @@ pub struct ActionReceiptParams {
 pub enum ActionOutcome {
     Executed(Executed),
     Dropped(Dropped),
+    Uncertain(Uncertain),
 }
 
 /// 动作已交给输入后端；不代表游戏中的效果已发生。
@@ -435,6 +484,21 @@ pub enum DropReason {
     Released,
     /// 带坐标的动作：基准帧之后客户区的尺寸或 DPI 变了，或基准帧的几何已查不到。
     GeometryChanged,
+    /// 落点不在输入策略的 `click_regions` 内，或在 `forbidden_zones` 内。
+    NotAllowed,
+    /// 超过输入策略的 `max_rate`。
+    RateLimited,
+}
+
+/// 真实后端已注入，但注入过程中前台窗口变了，游戏是否收到不确定；实时核随即释放全部输入，不重试。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Uncertain")]
+pub struct Uncertain {
+    /// 动作身份。
+    pub id: u64,
+    /// 交给输入后端的时刻。
+    pub at_ns: u64,
 }
 
 /// `input.released` 的 params：实时核释放了全部输入。
@@ -473,12 +537,49 @@ pub enum ReleaseReason {
     LeaseSourceLost,
     /// 没有输入许可：许可源从未授予，或没有许可源。
     NoLease,
+    /// 真实后端：目标窗口不在前台、已最小化、输入桌面不是当前桌面，或注入过程中前台变了。
+    FocusLost,
+    /// 真实后端：许可有效时钩子看到真人输入或第三方注入；同时在本地撤权。
+    Takeover,
+    /// 真实后端：按下急停组合键；同时在本地撤权。
+    EmergencyStop,
+    /// 真实后端：SendInput 注入的事件少于给出的；同时在本地撤权。
+    InjectionBlocked,
+    /// 真实后端：本实例的注入没有经过自己的钩子，钩子已失效；同时在本地撤权，随后重新装钩子。
+    HookLost,
+    /// 持续状态里的一项按住超过输入策略的 `max_hold_ms`。
+    MaxHold,
     /// 收到 `core.stop`。
     Stop,
     /// 生命线：核连接断开。主进程收不到，只出现在测试设备的事件与日志里。
     CoreConnectionLost,
     /// 生命线：stdin 读到 EOF 或读取失败。
     StdinClosed,
+}
+
+/// `input.residual` 的 params：只在真实后端上。释放全部输入之后、以及收到输入策略时，实时核以
+/// `GetAsyncKeyState` 核验输入策略里的键与鼠标键，仍读作按住的项已补发抬起，以这条通知报出。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputResidualParams {
+    /// 核验的缘由。
+    pub cause: ResidualCause,
+    /// `cause` 为 `release` 时那次释放的原因，否则为 `null`。
+    pub reason: Option<ReleaseReason>,
+    /// 读作按住、已补发抬起的项，至少一项；只有 `key` 与 `mouse_button`。
+    pub items: Vec<HeldInput>,
+    /// 读按键状态的时刻。
+    pub checked_at_ns: u64,
+}
+
+/// `input.residual` 的核验缘由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidualCause {
+    /// 释放全部输入之后的核验，`reason` 同那次 `input.released`。
+    Release,
+    /// 新实例收到输入策略时的核验，旧实例可能留下了按住的键。
+    CoreStart,
 }
 
 // ---------------------------------------------------------------- 健康

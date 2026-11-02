@@ -1,0 +1,35 @@
+{
+  "click_buttons": [
+    "left"
+  ],
+  "press_keys": [
+    28,
+    57
+  ],
+  "scroll": true,
+  "click_regions": [
+    {
+      "left": 0.0,
+      "top": 0.0,
+      "right": 1.0,
+      "bottom": 1.0
+    }
+  ],
+  "forbidden_zones": [
+    {
+      "left": 0.0,
+      "top": 0.0,
+      "right": 0.2,
+      "bottom": 0.1
+    }
+  ],
+  "press_duration_ms": 50,
+  "max_rate": 10.0,
+  "hold_keys": [
+    17
+  ],
+  "hold_buttons": [
+    "right"
+  ],
+  "max_hold_ms": 2000
+}

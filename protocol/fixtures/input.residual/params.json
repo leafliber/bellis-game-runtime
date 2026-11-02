@@ -1,0 +1,11 @@
+{
+  "cause": "release",
+  "reason": "takeover",
+  "items": [
+    {
+      "type": "mouse_button",
+      "button": "left"
+    }
+  ],
+  "checked_at_ns": 5700050000
+}

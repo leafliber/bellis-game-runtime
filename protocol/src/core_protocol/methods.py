@@ -30,6 +30,9 @@ AUDIO_RING_ATTACH: Final = Request(
 AUDIO_SET_TARGET: Final = Request(
     "audio.set_target", Direction.MAIN_TO_CORE, models.AudioSetTargetParams, models.Empty
 )
+INPUT_CONFIGURE: Final = Request(
+    "input.configure", Direction.MAIN_TO_CORE, models.InputPolicy, models.Empty
+)
 PRODUCER_HEARTBEAT: Final = Notification(
     "producer.heartbeat", Direction.MAIN_TO_CORE, models.ProducerHeartbeatParams
 )
@@ -46,6 +49,9 @@ ACTION_RECEIPT: Final = Notification(
 INPUT_RELEASED: Final = Notification(
     "input.released", Direction.CORE_TO_MAIN, models.InputReleasedParams
 )
+INPUT_RESIDUAL: Final = Notification(
+    "input.residual", Direction.CORE_TO_MAIN, models.InputResidualParams
+)
 CORE_HEALTH: Final = Notification("core.health", Direction.CORE_TO_MAIN, models.CoreHealthParams)
 
 METHODS: Final[Mapping[str, Method]] = {
@@ -54,12 +60,14 @@ METHODS: Final[Mapping[str, Method]] = {
     CAPTURE_SET_TARGET.name: CAPTURE_SET_TARGET,
     AUDIO_RING_ATTACH.name: AUDIO_RING_ATTACH,
     AUDIO_SET_TARGET.name: AUDIO_SET_TARGET,
+    INPUT_CONFIGURE.name: INPUT_CONFIGURE,
     PRODUCER_HEARTBEAT.name: PRODUCER_HEARTBEAT,
     ACTION_SUBMIT.name: ACTION_SUBMIT,
     PRODUCER_REVOKE.name: PRODUCER_REVOKE,
     CORE_STOP.name: CORE_STOP,
     ACTION_RECEIPT.name: ACTION_RECEIPT,
     INPUT_RELEASED.name: INPUT_RELEASED,
+    INPUT_RESIDUAL.name: INPUT_RESIDUAL,
     CORE_HEALTH.name: CORE_HEALTH,
 }
 """核连接上的全部方法，按方法名索引。"""
@@ -73,11 +81,15 @@ OPERATOR_LEASE_REVOKE: Final = Request(
 OPERATOR_INPUT_RELEASED: Final = Notification(
     "input.released", Direction.CORE_TO_OPERATOR, models.InputReleasedParams
 )
+OPERATOR_INPUT_RESIDUAL: Final = Notification(
+    "input.residual", Direction.CORE_TO_OPERATOR, models.InputResidualParams
+)
 
 OPERATOR_METHODS: Final[Mapping[str, Method]] = {
     OPERATOR_LEASE_GRANT.name: OPERATOR_LEASE_GRANT,
     OPERATOR_LEASE_REVOKE.name: OPERATOR_LEASE_REVOKE,
     OPERATOR_INPUT_RELEASED.name: OPERATOR_INPUT_RELEASED,
+    OPERATOR_INPUT_RESIDUAL.name: OPERATOR_INPUT_RESIDUAL,
 }
 """操作员许可连接上的全部方法，按方法名索引。"""
 
@@ -107,3 +119,4 @@ class ErrorCode(IntEnum):
     CAPTURE_UNSUPPORTED = -32003
     LEASE_REFUSED = -32004
     AUDIO_RING_MISMATCH = -32005
+    INPUT_POLICY_CONFLICT = -32006
