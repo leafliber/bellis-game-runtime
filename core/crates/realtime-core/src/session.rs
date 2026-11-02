@@ -399,7 +399,11 @@ fn start_real_input(
 }
 
 #[cfg(not(windows))]
-#[allow(clippy::needless_pass_by_value, reason = "与 Windows 版同一签名")]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    reason = "与 Windows 版同一签名"
+)]
 fn start_real_input(
     source: PermitSource,
     emergency: crate::sendinput::Combo,
