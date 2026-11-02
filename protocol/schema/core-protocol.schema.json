@@ -49,6 +49,15 @@
         "$ref": "#/$defs/Empty"
       }
     },
+    "input.configure": {
+      "direction": "main_to_core",
+      "params": {
+        "$ref": "#/$defs/InputPolicy"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
     "producer.heartbeat": {
       "direction": "main_to_core",
       "params": {
@@ -97,6 +106,13 @@
       },
       "result": null
     },
+    "input.residual": {
+      "direction": "core_to_main",
+      "params": {
+        "$ref": "#/$defs/InputResidualParams"
+      },
+      "result": null
+    },
     "core.health": {
       "direction": "core_to_main",
       "params": {
@@ -128,6 +144,13 @@
       "direction": "core_to_operator",
       "params": {
         "$ref": "#/$defs/InputReleasedParams"
+      },
+      "result": null
+    },
+    "input.residual": {
+      "direction": "core_to_operator",
+      "params": {
+        "$ref": "#/$defs/InputResidualParams"
       },
       "result": null
     }
@@ -164,7 +187,8 @@
     "frame_ring_mismatch": -32002,
     "capture_unsupported": -32003,
     "lease_refused": -32004,
-    "audio_ring_mismatch": -32005
+    "audio_ring_mismatch": -32005,
+    "input_policy_conflict": -32006
   },
   "$defs": {
     "CoreHelloParams": {
@@ -503,6 +527,152 @@
         "propertyName": "type"
       }
     },
+    "InputPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "click_buttons": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MouseButton"
+          },
+          "description": "可点击的鼠标键。"
+        },
+        "press_keys": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "description": "可短按的扫描码（Set 1）。"
+        },
+        "scroll": {
+          "type": "boolean",
+          "description": "是否允许滚动。"
+        },
+        "click_regions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NormRect"
+          },
+          "description": "点击与滚动的落点须在其中之一内；允许点击或滚动时不能为空。"
+        },
+        "forbidden_zones": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NormRect"
+          },
+          "description": "静态禁区，落点不能在其中之一内；可为空。"
+        },
+        "press_duration_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "点击与短按的按住时长，1–500 毫秒。",
+          "maximum": 4294967295
+        },
+        "max_rate": {
+          "type": "number",
+          "format": "double",
+          "description": "每秒至多几个一次性动作，大于 0。"
+        },
+        "hold_keys": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "description": "可按住的扫描码（Set 1）。"
+        },
+        "hold_buttons": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MouseButton"
+          },
+          "description": "可按住的鼠标键。"
+        },
+        "max_hold_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "最长按住时间（毫秒）；有可按住的项时必需，没有时为 `null`。",
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "click_buttons",
+        "press_keys",
+        "scroll",
+        "click_regions",
+        "forbidden_zones",
+        "press_duration_ms",
+        "max_rate",
+        "hold_keys",
+        "hold_buttons"
+      ],
+      "description": "`input.configure` 的 params：主进程把游戏适配包的动作白名单与静态禁区换算成的输入策略。\n\n实时核怎样执行见 `docs/modules/realtime-core.md` 的“输入策略”：提交时核对键与鼠标键，执行时\n核对落点与速率，按住超时即释放。每个实例只设定一次。"
+    },
+    "MouseButton": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "left",
+          "description": "左键。"
+        },
+        {
+          "type": "string",
+          "const": "right",
+          "description": "右键。"
+        },
+        {
+          "type": "string",
+          "const": "middle",
+          "description": "中键。"
+        }
+      ],
+      "description": "鼠标键。"
+    },
+    "NormRect": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "left": {
+          "type": "number",
+          "format": "double",
+          "description": "左边界（含）。"
+        },
+        "top": {
+          "type": "number",
+          "format": "double",
+          "description": "上边界（含）。"
+        },
+        "right": {
+          "type": "number",
+          "format": "double",
+          "description": "右边界（不含）。"
+        },
+        "bottom": {
+          "type": "number",
+          "format": "double",
+          "description": "下边界（不含）。"
+        }
+      },
+      "required": [
+        "left",
+        "top",
+        "right",
+        "bottom"
+      ],
+      "title": "NormRect",
+      "description": "归一化矩形：客户区的相对坐标，各分量取值 [0, 1]，左上小于右下。"
+    },
     "ProducerHeartbeatParams": {
       "type": "object",
       "additionalProperties": false,
@@ -710,26 +880,6 @@
       "discriminator": {
         "propertyName": "type"
       }
-    },
-    "MouseButton": {
-      "oneOf": [
-        {
-          "type": "string",
-          "const": "left",
-          "description": "左键。"
-        },
-        {
-          "type": "string",
-          "const": "right",
-          "description": "右键。"
-        },
-        {
-          "type": "string",
-          "const": "middle",
-          "description": "中键。"
-        }
-      ],
-      "description": "鼠标键。"
     },
     "Action": {
       "oneOf": [
@@ -977,6 +1127,11 @@
         },
         {
           "type": "string",
+          "const": "not_allowed",
+          "description": "持续状态或一次性动作不在输入策略的白名单内，或以真实后端运行时还没有输入策略。"
+        },
+        {
+          "type": "string",
           "const": "stopping",
           "description": "实时核正在停止，不再接受动作块。"
         }
@@ -1090,6 +1245,37 @@
           ],
           "title": "Dropped",
           "description": "动作没有执行。"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "uncertain"
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "动作身份。",
+              "maximum": 18446744073709551615
+            },
+            "at_ns": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "description": "交给输入后端的时刻。",
+              "maximum": 18446744073709551615
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "at_ns"
+          ],
+          "title": "Uncertain",
+          "description": "真实后端已注入，但注入过程中前台窗口变了，游戏是否收到不确定；实时核随即释放全部输入，不重试。"
         }
       ],
       "description": "一个一次性动作的结果。",
@@ -1118,6 +1304,16 @@
           "type": "string",
           "const": "geometry_changed",
           "description": "带坐标的动作：基准帧之后客户区的尺寸或 DPI 变了，或基准帧的几何已查不到。"
+        },
+        {
+          "type": "string",
+          "const": "not_allowed",
+          "description": "落点不在输入策略的 `click_regions` 内，或在 `forbidden_zones` 内。"
+        },
+        {
+          "type": "string",
+          "const": "rate_limited",
+          "description": "超过输入策略的 `max_rate`。"
         }
       ],
       "description": "一次性动作没有执行的原因。"
@@ -1209,6 +1405,36 @@
         },
         {
           "type": "string",
+          "const": "focus_lost",
+          "description": "真实后端：目标窗口不在前台、已最小化、输入桌面不是当前桌面，或注入过程中前台变了。"
+        },
+        {
+          "type": "string",
+          "const": "takeover",
+          "description": "真实后端：许可有效时钩子看到真人输入或第三方注入；同时在本地撤权。"
+        },
+        {
+          "type": "string",
+          "const": "emergency_stop",
+          "description": "真实后端：按下急停组合键；同时在本地撤权。"
+        },
+        {
+          "type": "string",
+          "const": "injection_blocked",
+          "description": "真实后端：SendInput 注入的事件少于给出的；同时在本地撤权。"
+        },
+        {
+          "type": "string",
+          "const": "hook_lost",
+          "description": "真实后端：本实例的注入没有经过自己的钩子，钩子已失效；同时在本地撤权，随后重新装钩子。"
+        },
+        {
+          "type": "string",
+          "const": "max_hold",
+          "description": "持续状态里的一项按住超过输入策略的 `max_hold_ms`。"
+        },
+        {
+          "type": "string",
           "const": "stop",
           "description": "收到 `core.stop`。"
         },
@@ -1224,6 +1450,62 @@
         }
       ],
       "description": "释放全部输入的原因。"
+    },
+    "InputResidualParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cause": {
+          "$ref": "#/$defs/ResidualCause",
+          "description": "核验的缘由。"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReleaseReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`cause` 为 `release` 时那次释放的原因，否则为 `null`。"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HeldInput"
+          },
+          "description": "读作按住、已补发抬起的项，至少一项；只有 `key` 与 `mouse_button`。"
+        },
+        "checked_at_ns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "读按键状态的时刻。",
+          "maximum": 18446744073709551615
+        }
+      },
+      "required": [
+        "cause",
+        "items",
+        "checked_at_ns"
+      ],
+      "description": "`input.residual` 的 params：只在真实后端上。释放全部输入之后、以及收到输入策略时，实时核以\n`GetAsyncKeyState` 核验输入策略里的键与鼠标键，仍读作按住的项已补发抬起，以这条通知报出。"
+    },
+    "ResidualCause": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "release",
+          "description": "释放全部输入之后的核验，`reason` 同那次 `input.released`。"
+        },
+        {
+          "type": "string",
+          "const": "core_start",
+          "description": "新实例收到输入策略时的核验，旧实例可能留下了按住的键。"
+        }
+      ],
+      "description": "`input.residual` 的核验缘由。"
     },
     "CoreHealthParams": {
       "type": "object",

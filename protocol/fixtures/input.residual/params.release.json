@@ -1,0 +1,15 @@
+{
+  "cause": "release",
+  "reason": "emergency_stop",
+  "items": [
+    {
+      "type": "key",
+      "scan_code": 17
+    },
+    {
+      "type": "mouse_button",
+      "button": "left"
+    }
+  ],
+  "checked_at_ns": 5700050000
+}

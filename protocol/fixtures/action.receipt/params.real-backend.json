@@ -1,0 +1,19 @@
+{
+  "producer": {
+    "id": "step-control",
+    "generation": 3
+  },
+  "block_seq": 8,
+  "outcomes": [
+    {
+      "type": "dropped",
+      "id": 4,
+      "reason": "not_allowed"
+    },
+    {
+      "type": "dropped",
+      "id": 5,
+      "reason": "rate_limited"
+    }
+  ]
+}

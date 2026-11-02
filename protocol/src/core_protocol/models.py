@@ -225,6 +225,59 @@ class AudioTarget(RootModel[AudioWindowTarget | FakeAudioTarget]):
     """
 
 
+class PressKey(RootModel[int]):
+    root: Annotated[int, Field(ge=0, le=65535)]
+
+
+class HoldKey(RootModel[int]):
+    root: Annotated[int, Field(ge=0, le=65535)]
+
+
+class MouseButton(StrEnum):
+    """
+    鼠标键。
+    """
+
+    LEFT = "left"
+    """
+    左键。
+    """
+    RIGHT = "right"
+    """
+    右键。
+    """
+    MIDDLE = "middle"
+    """
+    中键。
+    """
+
+
+class NormRect(BaseModel):
+    """
+    归一化矩形：客户区的相对坐标，各分量取值 [0, 1]，左上小于右下。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    left: float
+    """
+    左边界（含）。
+    """
+    top: float
+    """
+    上边界（含）。
+    """
+    right: float
+    """
+    右边界（不含）。
+    """
+    bottom: float
+    """
+    下边界（不含）。
+    """
+
+
 class Producer(BaseModel):
     """
     控制产出者的身份与代次。
@@ -258,6 +311,21 @@ class HeldKey(BaseModel):
     """
 
 
+class HeldMouseButton(BaseModel):
+    """
+    按住的鼠标键。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["mouse_button"] = "mouse_button"
+    button: MouseButton
+    """
+    鼠标键。
+    """
+
+
 class HeldAxis(BaseModel):
     """
     轴的取值。
@@ -277,22 +345,10 @@ class HeldAxis(BaseModel):
     """
 
 
-class MouseButton(StrEnum):
+class HeldInput(RootModel[HeldKey | HeldMouseButton | HeldAxis]):
+    root: Annotated[HeldKey | HeldMouseButton | HeldAxis, Field(discriminator="type")]
     """
-    鼠标键。
-    """
-
-    LEFT = "left"
-    """
-    左键。
-    """
-    RIGHT = "right"
-    """
-    右键。
-    """
-    MIDDLE = "middle"
-    """
-    中键。
+    持续状态的一项。
     """
 
 
@@ -435,6 +491,10 @@ class RejectReason(StrEnum):
     """
     内容不合规则，例如步的时刻倒序、同一项持续状态出现两次、动作身份在块内重复。
     """
+    NOT_ALLOWED = "not_allowed"
+    """
+    持续状态或一次性动作不在输入策略的白名单内，或以真实后端运行时还没有输入策略。
+    """
     STOPPING = "stopping"
     """
     实时核正在停止，不再接受动作块。
@@ -474,6 +534,25 @@ class Executed(BaseModel):
     """
 
 
+class Uncertain(BaseModel):
+    """
+    真实后端已注入，但注入过程中前台窗口变了，游戏是否收到不确定；实时核随即释放全部输入，不重试。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    type: Literal["uncertain"] = "uncertain"
+    id: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    动作身份。
+    """
+    at_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    交给输入后端的时刻。
+    """
+
+
 class DropReason(StrEnum):
     """
     一次性动作没有执行的原因。
@@ -494,6 +573,14 @@ class DropReason(StrEnum):
     GEOMETRY_CHANGED = "geometry_changed"
     """
     带坐标的动作：基准帧之后客户区的尺寸或 DPI 变了，或基准帧的几何已查不到。
+    """
+    NOT_ALLOWED = "not_allowed"
+    """
+    落点不在输入策略的 `click_regions` 内，或在 `forbidden_zones` 内。
+    """
+    RATE_LIMITED = "rate_limited"
+    """
+    超过输入策略的 `max_rate`。
     """
 
 
@@ -542,6 +629,30 @@ class ReleaseReason(StrEnum):
     """
     没有输入许可：许可源从未授予，或没有许可源。
     """
+    FOCUS_LOST = "focus_lost"
+    """
+    真实后端：目标窗口不在前台、已最小化、输入桌面不是当前桌面，或注入过程中前台变了。
+    """
+    TAKEOVER = "takeover"
+    """
+    真实后端：许可有效时钩子看到真人输入或第三方注入；同时在本地撤权。
+    """
+    EMERGENCY_STOP = "emergency_stop"
+    """
+    真实后端：按下急停组合键；同时在本地撤权。
+    """
+    INJECTION_BLOCKED = "injection_blocked"
+    """
+    真实后端：SendInput 注入的事件少于给出的；同时在本地撤权。
+    """
+    HOOK_LOST = "hook_lost"
+    """
+    真实后端：本实例的注入没有经过自己的钩子，钩子已失效；同时在本地撤权，随后重新装钩子。
+    """
+    MAX_HOLD = "max_hold"
+    """
+    持续状态里的一项按住超过输入策略的 `max_hold_ms`。
+    """
     STOP = "stop"
     """
     收到 `core.stop`。
@@ -553,6 +664,21 @@ class ReleaseReason(StrEnum):
     STDIN_CLOSED = "stdin_closed"
     """
     生命线：stdin 读到 EOF 或读取失败。
+    """
+
+
+class ResidualCause(StrEnum):
+    """
+    `input.residual` 的核验缘由。
+    """
+
+    RELEASE = "release"
+    """
+    释放全部输入之后的核验，`reason` 同那次 `input.released`。
+    """
+    CORE_START = "core_start"
+    """
+    新实例收到输入策略时的核验，旧实例可能留下了按住的键。
     """
 
 
@@ -937,6 +1063,59 @@ class AudioSetTargetParams(BaseModel):
     """
 
 
+class InputPolicy(BaseModel):
+    """
+    `input.configure` 的 params：主进程把游戏适配包的动作白名单与静态禁区换算成的输入策略。
+
+    实时核怎样执行见 `docs/modules/realtime-core.md` 的“输入策略”：提交时核对键与鼠标键，执行时
+    核对落点与速率，按住超时即释放。每个实例只设定一次。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    click_buttons: list[MouseButton]
+    """
+    可点击的鼠标键。
+    """
+    press_keys: list[PressKey]
+    """
+    可短按的扫描码（Set 1）。
+    """
+    scroll: bool
+    """
+    是否允许滚动。
+    """
+    click_regions: list[NormRect]
+    """
+    点击与滚动的落点须在其中之一内；允许点击或滚动时不能为空。
+    """
+    forbidden_zones: list[NormRect]
+    """
+    静态禁区，落点不能在其中之一内；可为空。
+    """
+    press_duration_ms: Annotated[int, Field(ge=0, le=4294967295)]
+    """
+    点击与短按的按住时长，1–500 毫秒。
+    """
+    max_rate: float
+    """
+    每秒至多几个一次性动作，大于 0。
+    """
+    hold_keys: list[HoldKey]
+    """
+    可按住的扫描码（Set 1）。
+    """
+    hold_buttons: list[MouseButton]
+    """
+    可按住的鼠标键。
+    """
+    max_hold_ms: Annotated[int | None, Field(ge=0, le=4294967295)] = None
+    """
+    最长按住时间（毫秒）；有可按住的项时必需，没有时为 `null`。
+    """
+
+
 class ProducerHeartbeatParams(BaseModel):
     """
     `producer.heartbeat` 的 params：当前控制产出者的心跳。
@@ -955,25 +1134,25 @@ class ProducerHeartbeatParams(BaseModel):
     """
 
 
-class HeldMouseButton(BaseModel):
+class ControlStep(BaseModel):
     """
-    按住的鼠标键。
+    动作块中的一步：从这一步的时刻起生效的完整持续状态，以及在这一时刻执行的一次性动作。
     """
 
     model_config = ConfigDict(
         extra="forbid",
     )
-    type: Literal["mouse_button"] = "mouse_button"
-    button: MouseButton
+    offset_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
     """
-    鼠标键。
+    相对起始时刻的纳秒数，在块内不减。
     """
-
-
-class HeldInput(RootModel[HeldKey | HeldMouseButton | HeldAxis]):
-    root: Annotated[HeldKey | HeldMouseButton | HeldAxis, Field(discriminator="type")]
+    held: list[HeldInput]
     """
-    持续状态的一项。
+    完整的持续状态：列出的保持按下或保持取值，没列出的一律释放。
+    """
+    actions: list[Action]
+    """
+    一次性动作，按列出的顺序执行。
     """
 
 
@@ -1022,8 +1201,8 @@ class Dropped(BaseModel):
     """
 
 
-class ActionOutcome(RootModel[Executed | Dropped]):
-    root: Annotated[Executed | Dropped, Field(discriminator="type")]
+class ActionOutcome(RootModel[Executed | Dropped | Uncertain]):
+    root: Annotated[Executed | Dropped | Uncertain, Field(discriminator="type")]
     """
     一个一次性动作的结果。
     """
@@ -1048,6 +1227,33 @@ class InputReleasedParams(BaseModel):
     released_at_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
     """
     释放完成的时刻。
+    """
+
+
+class InputResidualParams(BaseModel):
+    """
+    `input.residual` 的 params：只在真实后端上。释放全部输入之后、以及收到输入策略时，实时核以
+    `GetAsyncKeyState` 核验输入策略里的键与鼠标键，仍读作按住的项已补发抬起，以这条通知报出。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    cause: ResidualCause
+    """
+    核验的缘由。
+    """
+    reason: ReleaseReason | None = None
+    """
+    `cause` 为 `release` 时那次释放的原因，否则为 `null`。
+    """
+    items: list[HeldInput]
+    """
+    读作按住、已补发抬起的项，至少一项；只有 `key` 与 `mouse_button`。
+    """
+    checked_at_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    读按键状态的时刻。
     """
 
 
@@ -1115,50 +1321,6 @@ class FakeInputEventParams(BaseModel):
     """
 
 
-class ControlStep(BaseModel):
-    """
-    动作块中的一步：从这一步的时刻起生效的完整持续状态，以及在这一时刻执行的一次性动作。
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    offset_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
-    """
-    相对起始时刻的纳秒数，在块内不减。
-    """
-    held: list[HeldInput]
-    """
-    完整的持续状态：列出的保持按下或保持取值，没列出的一律释放。
-    """
-    actions: list[Action]
-    """
-    一次性动作，按列出的顺序执行。
-    """
-
-
-class ActionReceiptParams(BaseModel):
-    """
-    `action.receipt` 的 params：一块动作中一次性动作的执行结果。
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    producer: Producer
-    """
-    动作块所属的控制产出者。
-    """
-    block_seq: Annotated[int, Field(ge=0, le=18446744073709551615)]
-    """
-    动作块的序号。
-    """
-    outcomes: list[ActionOutcome]
-    """
-    各一次性动作的结果，每个动作在一块中只报一次。
-    """
-
-
 class ActionBlock(BaseModel):
     """
     `action.submit` 的 params：主进程向实时核提交的唯一动作形式。
@@ -1190,4 +1352,26 @@ class ActionBlock(BaseModel):
     steps: list[ControlStep]
     """
     按时间排列的控制步，至少一步。
+    """
+
+
+class ActionReceiptParams(BaseModel):
+    """
+    `action.receipt` 的 params：一块动作中一次性动作的执行结果。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    producer: Producer
+    """
+    动作块所属的控制产出者。
+    """
+    block_seq: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    动作块的序号。
+    """
+    outcomes: list[ActionOutcome]
+    """
+    各一次性动作的结果，每个动作在一块中只报一次。
     """
