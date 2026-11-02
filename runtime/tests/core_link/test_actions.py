@@ -856,8 +856,8 @@ def test_killing_the_main_process_releases_held_inputs_via_the_lifeline(
 def test_the_test_lease_source_only_runs_with_the_fake_backend(
     core_exe: Path, tmp_path: Path
 ) -> None:
-    """测试许可源不能与非假后端（G0 里即没有后端）同时启用；假后端也离不开测试设备；真实后端
-    unsupported。三种都以参数不合法（2）退出，连主进程都不连。"""
+    """测试许可源不能与非假后端（没有后端）同时启用；假后端也离不开测试设备；真实后端不收测试设备的
+    凭据（非 Windows 上真实后端本身 unsupported）。三种都以参数不合法（2）退出，连主进程都不连。"""
 
     async def exit_code(argv: list[str], extra: dict[str, str]) -> tuple[int, str]:
         with session_credentials(f"g{os.getpid()}") as core, session_credentials("gd") as dev:
@@ -891,7 +891,8 @@ def test_the_test_lease_source_only_runs_with_the_fake_backend(
         assert ENV_TEST_DEVICE_PATH in log
         code, log = await exit_code(["--input-backend", "sendinput"], {"device": "yes"})
         assert code == 2
-        assert "unsupported" in log
+        # Windows 上真实后端不收测试设备的凭据；非 Windows 上真实后端本身 unsupported。
+        assert ("test device" in log) or ("only available on Windows" in log), log
 
     asyncio.run(main())
 
