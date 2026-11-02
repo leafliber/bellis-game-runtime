@@ -103,6 +103,7 @@ fn receipts(notices: &Notices) -> Vec<(u64, Vec<String>)> {
                     ActionOutcome::Dropped(dropped) => {
                         format!("dropped {} {:?}", dropped.id, dropped.reason)
                     }
+                    ActionOutcome::Uncertain(uncertain) => format!("uncertain {}", uncertain.id),
                 })
                 .collect();
             (receipt.block_seq, outcomes)
@@ -132,7 +133,7 @@ impl Armed {
     fn new() -> Self {
         let frames = Arc::new(FrameStatus::default());
         let backend = Recorder::default();
-        let control = Control::new(limits(), Arc::clone(&frames), backend.backend());
+        let control = Control::new(limits(), Arc::clone(&frames), backend.backend(), false);
         let armed = Self {
             control,
             frames,
@@ -183,7 +184,7 @@ impl Armed {
 #[test]
 fn start_releases_without_a_producer() {
     let backend = Recorder::default();
-    let control = Control::new(limits(), Arc::default(), backend.backend());
+    let control = Control::new(limits(), Arc::default(), backend.backend(), false);
     let released = control.release_on_start();
     assert_eq!(released.reason, ReleaseReason::CoreStart);
     assert_eq!(released.producer, None);
@@ -197,14 +198,14 @@ fn start_releases_without_a_producer() {
 
 #[test]
 fn first_heartbeat_sets_the_producer_without_releasing() {
-    let control = Control::new(limits(), Arc::default(), None);
+    let control = Control::new(limits(), Arc::default(), None, false);
     assert!(control.heartbeat(&beat("a", 1, 7), T0).unwrap().is_empty());
     assert_eq!(control.health().producer, Some(producer("a", 1)));
 }
 
 #[test]
 fn seq_must_increase_within_a_generation() {
-    let control = Control::new(limits(), Arc::default(), None);
+    let control = Control::new(limits(), Arc::default(), None, false);
     control.heartbeat(&beat("a", 1, 5), T0).unwrap();
     for stale in [5, 4, 0] {
         assert_eq!(
@@ -228,7 +229,7 @@ fn seq_must_increase_within_a_generation() {
 
 #[test]
 fn heartbeat_timeout_releases_once_and_stands_by() {
-    let control = Control::new(limits(), Arc::default(), None);
+    let control = Control::new(limits(), Arc::default(), None, false);
     control.heartbeat(&beat("a", 3, 1), T0).unwrap();
     let notices = control.tick(T0 + HEARTBEAT_TIMEOUT);
     assert_eq!(released(&notices), [ReleaseReason::HeartbeatTimeout]);
@@ -245,7 +246,7 @@ fn heartbeat_timeout_releases_once_and_stands_by() {
 
 #[test]
 fn old_generations_and_other_identities_are_rejected() {
-    let control = Control::new(limits(), Arc::default(), None);
+    let control = Control::new(limits(), Arc::default(), None, false);
     control.heartbeat(&beat("a", 2, 1), T0).unwrap();
     assert_eq!(
         control.heartbeat(&beat("a", 1, 9), T0).unwrap_err(),
@@ -260,7 +261,7 @@ fn old_generations_and_other_identities_are_rejected() {
 
 #[test]
 fn higher_generation_releases_before_switching() {
-    let control = Control::new(limits(), Arc::default(), None);
+    let control = Control::new(limits(), Arc::default(), None, false);
     control.heartbeat(&beat("a", 1, 10), T0).unwrap();
     let notices = control.heartbeat(&beat("b", 2, 1), T0).unwrap();
     assert_eq!(released(&notices), [ReleaseReason::ProducerChanged]);
@@ -271,7 +272,7 @@ fn higher_generation_releases_before_switching() {
 
 #[test]
 fn revoke_releases_the_current_generation_and_blocks_it() {
-    let control = Control::new(limits(), Arc::default(), None);
+    let control = Control::new(limits(), Arc::default(), None, false);
     control.heartbeat(&beat("a", 4, 1), T0).unwrap();
     // 作废更早的代次不影响当前产出者。
     assert!(control.revoke(3).is_empty());
@@ -761,7 +762,7 @@ fn every_authority_condition_gates_every_input() {
             },
             GEOMETRY,
         );
-        let control = Control::new(limits(), frames, backend);
+        let control = Control::new(limits(), frames, backend, false);
         control.heartbeat(&beat("a", 1, 1), T0).unwrap();
         control.submit(block(1, T0, 100, vec![step(0, vec![], vec![click(1)])]), T0);
         let notices = control.tick(T0);
@@ -1032,6 +1033,7 @@ fn the_scheduler_runs_steps_and_timers_in_real_time() {
         limits(),
         Arc::clone(&frames),
         backend.backend(),
+        false,
     ));
     let (sender, received) = mpsc::channel();
     let scheduler = thread::spawn({
@@ -1087,6 +1089,7 @@ fn releasing_never_waits_for_the_capture_side() {
         limits(),
         Arc::clone(&frames),
         backend.backend(),
+        false,
     ));
     // 采集一侧一直占着它的锁：每条释放的路径照样完成，持有输入时的帧龄检查也不等它。
     let held = frames.hold();
@@ -1155,4 +1158,284 @@ fn the_frame_age_check_does_not_take_the_capture_lock() {
     let notices = armed.control.tick(T0 + MAX_FRAME_AGE + 1);
     assert_eq!(released(&notices), [ReleaseReason::FrameStale]);
     drop(held);
+}
+
+// ---------------------------------------------------------------- 输入策略
+
+use super::Configured;
+use core_protocol::messages::{InputPolicy, NormRect};
+
+fn full_region() -> NormRect {
+    NormRect {
+        left: 0.0,
+        top: 0.0,
+        right: 1.0,
+        bottom: 1.0,
+    }
+}
+
+/// 一个合规的输入策略：左键点击、短按 0x1C/0x39、滚动，按住 0x11，按住时长 50 ms。
+fn input_policy() -> InputPolicy {
+    InputPolicy {
+        click_buttons: vec![MouseButton::Left],
+        press_keys: vec![0x1C, 0x39],
+        scroll: true,
+        click_regions: vec![full_region()],
+        forbidden_zones: vec![],
+        press_duration_ms: 50,
+        max_rate: 2.0,
+        hold_keys: vec![0x11],
+        hold_buttons: vec![],
+        max_hold_ms: Some(300),
+    }
+}
+
+impl Armed {
+    /// 真实后端的控制状态（`requires_policy`），仍用记录后端，便于核对交给后端的输入。
+    fn new_real() -> Self {
+        let frames = Arc::new(FrameStatus::default());
+        let backend = Recorder::default();
+        let control = Control::new(limits(), Arc::clone(&frames), backend.backend(), true);
+        let armed = Self {
+            control,
+            frames,
+            backend,
+        };
+        armed.frame(1, T0, GEOMETRY);
+        armed.grant(1, T0 + 10_000 * MS, T0);
+        armed.control.heartbeat(&beat("a", 1, 1), T0).unwrap();
+        armed.backend.take();
+        armed
+    }
+
+    fn configure(&self, policy: &InputPolicy) -> Configured {
+        self.control.configure(policy).unwrap()
+    }
+}
+
+fn click_at(id: u64, x: u32, y: u32) -> Action {
+    Action::Click(Click {
+        id,
+        x,
+        y,
+        button: MouseButton::Left,
+    })
+}
+
+#[test]
+fn configure_is_once_and_validated() {
+    let armed = Armed::new();
+    assert_eq!(armed.configure(&input_policy()), Configured::Accepted);
+    // 再设定即冲突（-32006）。
+    assert_eq!(
+        armed.control.configure(&input_policy()).unwrap(),
+        Configured::Conflict
+    );
+    // 不合规则的策略在未设定过的实例上回参数无效。
+    let other = Armed::new();
+    let mut bad = input_policy();
+    bad.press_duration_ms = 0;
+    assert!(other.control.configure(&bad).is_err());
+}
+
+#[test]
+fn the_real_backend_rejects_input_without_a_policy() {
+    let armed = Armed::new_real();
+    // 含输入的动作块：没有策略即拒绝。
+    let (result, _) = armed.submit(
+        block(1, T0, 10_000, vec![step(0, vec![], vec![press(1, 0x1C)])]),
+        T0,
+    );
+    assert_eq!(rejection(&result), Some(RejectReason::NotAllowed));
+    // 不含输入的动作块（空步）照常接受。
+    let (result, _) = armed.submit(block(2, T0, 10_000, vec![step(0, vec![], vec![])]), T0);
+    assert!(accepted(&result), "{result:?}");
+}
+
+#[test]
+fn the_whitelist_is_checked_at_submit() {
+    let armed = Armed::new_real();
+    armed.configure(&input_policy());
+    // 持续状态的键不在 hold_keys 内。
+    let (result, _) = armed.submit(
+        block(1, T0, 10_000, vec![step(0, vec![key(0x20)], vec![])]),
+        T0,
+    );
+    assert_eq!(rejection(&result), Some(RejectReason::NotAllowed));
+    // 右键不在 click_buttons 内。
+    let right = Action::Click(Click {
+        id: 1,
+        x: 10,
+        y: 20,
+        button: MouseButton::Right,
+    });
+    let (result, _) = armed.submit(block(2, T0, 10_000, vec![step(0, vec![], vec![right])]), T0);
+    assert_eq!(rejection(&result), Some(RejectReason::NotAllowed));
+    // 白名单内的块接受。
+    let (result, _) = armed.submit(
+        block(
+            3,
+            T0,
+            10_000,
+            vec![step(0, vec![key(0x11)], vec![press(4, 0x1C)])],
+        ),
+        T0,
+    );
+    assert!(accepted(&result), "{result:?}");
+}
+
+#[test]
+fn a_click_outside_the_regions_is_dropped_at_execution() {
+    let armed = Armed::new_real();
+    let mut policy = input_policy();
+    // 只允许客户区左上角 1/4。
+    policy.click_regions = vec![NormRect {
+        left: 0.0,
+        top: 0.0,
+        right: 0.5,
+        bottom: 0.5,
+    }];
+    armed.configure(&policy);
+    // 320×180：允许区在 x<160、y<90。(300, 20) 在区外。
+    armed.submit(
+        block(
+            1,
+            T0,
+            10_000,
+            vec![step(0, vec![], vec![click_at(1, 300, 20)])],
+        ),
+        T0,
+    );
+    let notices = armed.control.tick(T0);
+    assert_eq!(
+        receipts(&notices),
+        [(1, vec!["dropped 1 NotAllowed".to_owned()])]
+    );
+    assert_eq!(armed.inputs(), Vec::<String>::new(), "落点不合即不注入");
+}
+
+#[test]
+fn a_forbidden_zone_drops_the_click() {
+    let armed = Armed::new_real();
+    let mut policy = input_policy();
+    policy.forbidden_zones = vec![NormRect {
+        left: 0.0,
+        top: 0.0,
+        right: 0.2,
+        bottom: 0.2,
+    }];
+    armed.configure(&policy);
+    // (10, 20) 归一化到 (0.03, 0.11) 在禁区内。
+    armed.submit(
+        block(
+            1,
+            T0,
+            10_000,
+            vec![step(0, vec![], vec![click_at(1, 10, 20)])],
+        ),
+        T0,
+    );
+    let notices = armed.control.tick(T0);
+    assert_eq!(
+        receipts(&notices),
+        [(1, vec!["dropped 1 NotAllowed".to_owned()])]
+    );
+}
+
+#[test]
+fn the_rate_limit_drops_extra_one_shots() {
+    let armed = Armed::new_real();
+    armed.configure(&input_policy()); // max_rate = 2
+    // 同一步三个短按：前两个执行，第三个超速丢弃。
+    armed.submit(
+        block(
+            1,
+            T0,
+            10_000,
+            vec![step(
+                0,
+                vec![],
+                vec![press(1, 0x1C), press(2, 0x1C), press(3, 0x1C)],
+            )],
+        ),
+        T0,
+    );
+    // 第一个按下后要等它抬起（50 ms）才做下一个：逐个推进时钟。
+    armed.control.tick(T0);
+    armed.control.tick(T0 + 50 * MS + 1);
+    let notices = armed.control.tick(T0 + 100 * MS + 2);
+    let joined: Vec<String> = receipts(&notices)
+        .into_iter()
+        .flat_map(|(_, o)| o)
+        .collect();
+    assert!(
+        joined.contains(&"dropped 3 RateLimited".to_owned()),
+        "{joined:?}"
+    );
+}
+
+#[test]
+fn a_one_shot_is_a_momentary_press_lifted_after_the_duration() {
+    let armed = Armed::new_real();
+    armed.configure(&input_policy());
+    armed.submit(
+        block(1, T0, 10_000, vec![step(0, vec![], vec![press(1, 0x1C)])]),
+        T0,
+    );
+    armed.control.tick(T0);
+    // 按下作为瞬时按住注入，还没抬起。
+    assert_eq!(armed.inputs(), ["begin press 0x1c"]);
+    // 到按住时长（50 ms）由调度抬起。
+    armed.control.tick(T0 + 50 * MS + 1);
+    assert_eq!(armed.inputs(), ["end press 0x1c"]);
+}
+
+#[test]
+fn max_hold_releases_a_key_held_too_long() {
+    let armed = Armed::new_real();
+    armed.configure(&input_policy()); // max_hold = 300 ms
+    armed.submit(
+        block(1, T0, 10_000, vec![step(0, vec![key(0x11)], vec![])]),
+        T0,
+    );
+    armed.control.tick(T0);
+    assert_eq!(armed.inputs(), ["down key 0x11"]);
+    // 帧要够新，否则先因 frame_stale 释放。补一帧。
+    armed.frame(2, T0 + 290 * MS, GEOMETRY);
+    let notices = armed.control.tick(T0 + 300 * MS + 1);
+    assert_eq!(released(&notices), [ReleaseReason::MaxHold]);
+    assert_eq!(armed.inputs(), ["up key 0x11", "release all MaxHold"]);
+}
+
+#[test]
+fn a_local_revoke_releases_and_invalidates_the_token() {
+    let armed = Armed::new_real();
+    armed.configure(&input_policy());
+    armed.submit(
+        block(1, T0, 10_000, vec![step(0, vec![key(0x11)], vec![])]),
+        T0,
+    );
+    armed.control.tick(T0);
+    armed.inputs();
+    // 接管即本地撤权并释放。
+    let notices = armed.control.local_revoke(ReleaseReason::Takeover);
+    assert_eq!(released(&notices), [ReleaseReason::Takeover]);
+    assert_eq!(armed.inputs(), ["up key 0x11", "release all Takeover"]);
+    // 旧令牌不能再续约，须换发更大的令牌。
+    let (result, _) = armed.control.grant_lease(
+        &LeaseGrantParams {
+            token: 1,
+            expires_ns: T0 + 20_000 * MS,
+        },
+        T0 + MS,
+    );
+    assert!(result.is_err());
+    let (result, _) = armed.control.grant_lease(
+        &LeaseGrantParams {
+            token: 2,
+            expires_ns: T0 + 20_000 * MS,
+        },
+        T0 + MS,
+    );
+    assert!(result.is_ok(), "换发更大的令牌被接受");
 }

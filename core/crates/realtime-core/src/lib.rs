@@ -26,7 +26,9 @@ mod lease;
 mod ledger;
 mod operator;
 mod panic_exit;
+mod policy;
 mod queue;
+mod sendinput;
 pub mod session;
 mod side;
 

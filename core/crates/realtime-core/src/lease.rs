@@ -148,6 +148,15 @@ impl Lease {
         }
     }
 
+    /// 本地撤权（真实后端上的接管、急停、注入被拦截、钩子失效）：吊销当前令牌及更早的全部令牌，
+    /// 同吊销。返回是否吊销了一个有效的许可（调用方随之释放）；没有授予过令牌时什么也不做。
+    pub(crate) fn local_revoke(&mut self) -> bool {
+        match self.current_token {
+            Some(token) => self.revoke(token),
+            None => false,
+        }
+    }
+
     /// 到了到期时刻即转为过期；返回是否刚刚过期（调用方随之释放）。
     pub(crate) fn expire(&mut self, now: u64) -> bool {
         match self.state {
@@ -292,6 +301,23 @@ mod tests {
             Err(Refusal::Revoked { .. })
         ));
         assert_eq!(lease.grant(8, 500, 10), Ok(Granted::New));
+    }
+
+    #[test]
+    fn local_revoke_invalidates_the_current_token_like_a_revoke() {
+        let mut lease = Lease::new(true);
+        assert!(!lease.local_revoke(), "没有令牌时什么也不做");
+        lease.grant(3, 500, 0).unwrap();
+        assert!(lease.local_revoke());
+        assert_eq!(lease.check(10), Err(ReleaseReason::LeaseRevoked));
+        // 当前令牌及更早的不能再授予，须换发更大的令牌。
+        assert!(matches!(
+            lease.grant(3, 500, 10),
+            Err(Refusal::Revoked { .. })
+        ));
+        assert_eq!(lease.grant(4, 500, 10), Ok(Granted::New));
+        assert!(lease.local_revoke(), "刚换发的更大令牌又被本地撤权");
+        assert_eq!(lease.check(10), Err(ReleaseReason::LeaseRevoked));
     }
 
     #[test]

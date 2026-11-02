@@ -34,26 +34,28 @@ use bellis_channel::{
 use core_protocol::PROTOCOL_VERSION;
 use core_protocol::messages::{
     ActionBlock, ActionSubmitResult, AudioRingAttachParams, AudioSetTargetParams,
-    CaptureSetTargetParams, CoreHealthParams, CoreHelloParams, CoreHelloResult, Empty,
-    FrameRingAttachParams, InputReleasedParams, ProducerHeartbeatParams, ProducerRevokeParams,
-    ReleaseReason,
+    CaptureSetTargetParams, CaptureTarget, CoreHealthParams, CoreHelloParams, CoreHelloResult,
+    Empty, FrameRingAttachParams, InputPolicy, InputReleasedParams, InputResidualParams,
+    ProducerHeartbeatParams, ProducerRevokeParams, ReleaseReason,
 };
 use core_protocol::methods::{
     ActionReceipt, ActionSubmit, AudioRingAttach, AudioSetTarget, CaptureSetTarget, CoreHealth,
-    CoreHello, CoreStop, FrameRingAttach, InputReleased, Method, Notification,
-    OperatorInputReleased, ProducerHeartbeat, ProducerRevoke, error_code,
+    CoreHello, CoreStop, FrameRingAttach, InputConfigure, InputReleased, InputResidual, Method,
+    Notification, OperatorInputReleased, OperatorInputResidual, ProducerHeartbeat, ProducerRevoke,
+    error_code,
 };
 use frame_ring::FrameRingWriter;
 use serde_json::{Map, Value, json};
 
 use crate::audio::{self, Audio, AudioStatus, AudioThread, audio_opener_for};
 use crate::config::{FakePermit, HELLO_TIMEOUT, InputSetup, Launch, Options, PermitSource};
-use crate::control::{Control, Limits, Notice, Notices};
+use crate::control::{Configured, Control, Limits, Notice, Notices};
 use crate::fake::{DeviceRole, FakeBackend, connect_test_device};
 use crate::frames::{Capture, CaptureThread, FrameStatus, TargetError, opener_for};
 use crate::ledger::InputBackend;
 use crate::operator::connect_operator;
 use crate::queue::SendQueue;
+use crate::sendinput::TargetWindow;
 use crate::side::{Post, SideConnection};
 
 /// 实时核的程序版本，经 `core.hello` 报给主进程。
@@ -148,7 +150,7 @@ pub fn run(
         heartbeat_timeout: options.heartbeat_timeout,
         max_frame_age: options.max_frame_age,
     };
-    let (control, outbox, sides) = start_input(input, limits, &frames, &launch.role)?;
+    let (control, outbox, sides, target) = start_input(input, limits, &frames, &launch.role)?;
     // 每次启动先释放全部输入，再接受任何产出者与动作。操作员控制台随即收到 `core_start`。
     let started = control.release_on_start();
     log!("released all inputs on start");
@@ -187,7 +189,7 @@ pub fn run(
     let (ended, end) = mpsc::channel();
     let peer = RpcPeer::spawn(
         connection,
-        handlers(&control, &outbox, &media, ended.clone()),
+        handlers(&control, &outbox, &media, &target, ended.clone()),
         &RpcOptions {
             timeout: RPC_TIMEOUT,
         },
@@ -268,66 +270,148 @@ impl Sides {
 }
 
 /// 建立控制状态、输入后端与许可源。有操作员许可连接时先连上控制台、开始处理它的请求；以假后端启动时
-/// 接着连上测试设备。测试许可源只在这里与假后端一起、且只在没有操作员许可连接时出现。
+/// 接着连上测试设备；真实后端（只在 Windows 上）装上低层钩子、起核验线程。测试许可源只在假后端一起、且
+/// 只在没有操作员许可连接时出现。
 ///
-/// 交出的 [`Outbox`] 是发给主进程的通知的出口；有操作员许可连接时，它把每条 `input.released` 也放进那条
-/// 连接的发送队列。
+/// [`start_input`] 交出的东西：控制状态、通知出口、旁路连接与目标窗口句柄。
+type Started = (Arc<Control>, Arc<Outbox>, Sides, Arc<TargetWindow>);
+
+/// 交出的 [`Outbox`] 是发给主进程的通知的出口；有操作员许可连接时，它把每条 `input.released`、
+/// `input.residual` 也放进那条连接的发送队列。还交出 [`TargetWindow`]：`capture.set_target` 据它告诉真实
+/// 后端当前的目标窗口，没有真实后端时无人读它。
 fn start_input(
     input: InputSetup,
     limits: Limits,
     frames: &Arc<FrameStatus>,
     role: &str,
-) -> Result<(Arc<Control>, Arc<Outbox>, Sides), StartError> {
+) -> Result<Started, StartError> {
     let operator_queue = input.operator().map(|_| Arc::new(SendQueue::default()));
     let outbox = Arc::new(Outbox::new(operator_queue.clone()));
-    let InputSetup::Fake {
-        test_device,
-        permit,
-    } = input
-    else {
-        return Ok((
-            Arc::new(Control::new(limits, Arc::clone(frames), None)),
-            outbox,
-            Sides::default(),
-        ));
-    };
-    let (backend, events) = FakeBackend::new();
-    let backend: Box<dyn InputBackend> = Box::new(backend);
-    let control = Arc::new(Control::new(limits, Arc::clone(frames), Some(backend)));
+    let target = Arc::new(TargetWindow::default());
     let post: Post = {
         let outbox = Arc::clone(&outbox);
         Arc::new(move |notices| outbox.post(notices))
     };
-    let mut sides = Sides::default();
-    let device_role = match permit {
-        FakePermit::TestLease => DeviceRole::LeaseSource,
-        FakePermit::Source(PermitSource::Operator(operator)) => {
-            let connection = connect_operator(&operator, role).map_err(StartError::Operator)?;
-            let queue = operator_queue.unwrap_or_default();
-            sides.operator = Some(
+    match input {
+        InputSetup::None => Ok((
+            Arc::new(Control::new(limits, Arc::clone(frames), None, false)),
+            outbox,
+            Sides::default(),
+            target,
+        )),
+        InputSetup::Fake {
+            test_device,
+            permit,
+        } => {
+            let (backend, events) = FakeBackend::new();
+            let backend: Box<dyn InputBackend> = Box::new(backend);
+            let control = Arc::new(Control::new(
+                limits,
+                Arc::clone(frames),
+                Some(backend),
+                false,
+            ));
+            let mut sides = Sides::default();
+            let device_role = match permit {
+                FakePermit::TestLease => DeviceRole::LeaseSource,
+                FakePermit::Source(PermitSource::Operator(operator)) => {
+                    let connection =
+                        connect_operator(&operator, role).map_err(StartError::Operator)?;
+                    let queue = operator_queue.clone().unwrap_or_default();
+                    sides.operator = Some(
+                        connection
+                            .start(queue, &control, &post)
+                            .map_err(StartError::Thread)?,
+                    );
+                    log!("lease source: the operator console");
+                    DeviceRole::EventsOnly
+                }
+            };
+            let connection =
+                connect_test_device(&test_device, role).map_err(StartError::TestDevice)?;
+            sides.device = Some(
                 connection
-                    .start(queue, &control, &post)
+                    .start(device_role, events, &control, &post)
                     .map_err(StartError::Thread)?,
             );
-            log!("lease source: the operator console");
-            DeviceRole::EventsOnly
+            match device_role {
+                DeviceRole::LeaseSource => {
+                    log!("input backend: fake, lease from the test device (tests only)");
+                }
+                DeviceRole::EventsOnly => {
+                    log!("input backend: fake, events to the test device (tests only)");
+                }
+            }
+            Ok((control, outbox, sides, target))
         }
+        InputSetup::Real { source, emergency } => start_real_input(
+            source,
+            emergency,
+            limits,
+            frames,
+            role,
+            &outbox,
+            operator_queue,
+            target,
+        ),
+    }
+}
+
+/// 真实后端（SendInput）只在 Windows 上：装钩子（装不上即报错，以 1 退出）、建控制状态、连操作员许可
+/// 连接、起核验与接管检测的线程。
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments, reason = "各项在 start_input 里各有来源")]
+fn start_real_input(
+    source: PermitSource,
+    emergency: crate::sendinput::Combo,
+    limits: Limits,
+    frames: &Arc<FrameStatus>,
+    role: &str,
+    outbox: &Arc<Outbox>,
+    operator_queue: Option<Arc<SendQueue>>,
+    target: Arc<TargetWindow>,
+) -> Result<Started, StartError> {
+    let PermitSource::Operator(operator) = source;
+    let (backend, wiring) =
+        crate::sendinput::windows::build_backend(emergency, Arc::clone(&target))
+            .map_err(StartError::Thread)?;
+    let control = Arc::new(Control::new(
+        limits,
+        Arc::clone(frames),
+        Some(backend),
+        true,
+    ));
+    let post: Post = {
+        let outbox = Arc::clone(outbox);
+        Arc::new(move |notices| outbox.post(notices))
     };
-    let connection = connect_test_device(&test_device, role).map_err(StartError::TestDevice)?;
-    sides.device = Some(
+    let mut sides = Sides::default();
+    let connection = connect_operator(&operator, role).map_err(StartError::Operator)?;
+    let queue = operator_queue.unwrap_or_default();
+    sides.operator = Some(
         connection
-            .start(device_role, events, &control, &post)
+            .start(queue, &control, &post)
             .map_err(StartError::Thread)?,
     );
-    match device_role {
-        DeviceRole::LeaseSource => {
-            log!("input backend: fake, lease from the test device (tests only)");
-        }
-        DeviceRole::EventsOnly => {
-            log!("input backend: fake, events to the test device (tests only)");
-        }
-    }
-    Ok((control, outbox, sides))
+    crate::sendinput::windows::start(&control, &post, wiring).map_err(StartError::Thread)?;
+    log!("input backend: sendinput (real input)");
+    Ok((control, Arc::clone(outbox), sides, target))
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::needless_pass_by_value, reason = "与 Windows 版同一签名")]
+fn start_real_input(
+    source: PermitSource,
+    emergency: crate::sendinput::Combo,
+    _limits: Limits,
+    _frames: &Arc<FrameStatus>,
+    _role: &str,
+    _outbox: &Arc<Outbox>,
+    _operator_queue: Option<Arc<SendQueue>>,
+    _target: Arc<TargetWindow>,
+) -> Result<Started, StartError> {
+    let _ = (source, emergency);
+    unreachable!("the real input backend is only selected on Windows")
 }
 
 /// 处理函数经它把命令交给采集线程与音频线程；健康线程从这里读音频的状态。
@@ -496,6 +580,15 @@ impl Outbox {
         }
     }
 
+    /// 把一次残留的 `input.residual` 放进操作员许可连接的发送队列；没有这条连接时什么也不做。
+    fn mirror_residual(&self, residual: &InputResidualParams) {
+        if let Some(queue) = &self.operator
+            && let Some(params) = to_params(OperatorInputResidual::NAME, residual)
+        {
+            queue.push(OperatorInputResidual::NAME, params);
+        }
+    }
+
     /// 记下通知中的释放：主进程收不到时，日志是唯一的记录。操作员控制台照常收到。
     fn log(&self, notices: &Notices) {
         for notice in &notices.0 {
@@ -519,6 +612,14 @@ impl Outbox {
                 }
                 Notice::Receipt(receipt) => {
                     (ActionReceipt::NAME, to_params(ActionReceipt::NAME, receipt))
+                }
+                Notice::Residual(residual) => {
+                    log_residual(residual);
+                    self.mirror_residual(residual);
+                    (
+                        InputResidual::NAME,
+                        to_params(InputResidual::NAME, residual),
+                    )
                 }
             };
             if let Some(params) = params {
@@ -556,6 +657,15 @@ fn log_released(released: &InputReleasedParams) {
         "released all inputs: {:?} (producer {:?})",
         released.reason,
         released.producer
+    );
+}
+
+fn log_residual(residual: &InputResidualParams) {
+    log!(
+        "input residual ({:?}, reason {:?}): {} item(s) still held, re-sent up",
+        residual.cause,
+        residual.reason,
+        residual.items.len()
     );
 }
 
@@ -613,14 +723,29 @@ fn attach_handler(
     }
 }
 
-/// `capture.set_target`：核对目标，交给采集线程；旧的采集源先停掉。
+/// 采集目标里的窗口识别规则（真实后端据它找目标窗口）；假显示面没有窗口。
+fn target_selector(target: &CaptureTarget) -> Option<capture::WindowSelector> {
+    match target {
+        CaptureTarget::Window(window) => Some(capture::WindowSelector {
+            process_name: Some(window.process_name.clone()),
+            class_name: window.window_class.clone(),
+            title: window.title.clone(),
+        }),
+        CaptureTarget::Fake(_) => None,
+    }
+}
+
+/// `capture.set_target`：核对目标，交给采集线程；旧的采集源先停掉。同时更新真实后端的目标窗口。
 fn set_target_handler(
     media: &Arc<Media>,
+    target: &Arc<TargetWindow>,
 ) -> impl Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync + 'static {
     let media = Arc::clone(media);
+    let target = Arc::clone(target);
     move |params| {
         let params: CaptureSetTargetParams =
             parse(params).map_err(|error| invalid_params(CaptureSetTarget::NAME, &error))?;
+        target.set(target_selector(&params.target));
         let opener = opener_for(params.target).map_err(|error| {
             log!("{} refused: {error}", CaptureSetTarget::NAME);
             let code = match &error {
@@ -699,10 +824,33 @@ fn audio_target_handler(
     }
 }
 
+/// `input.configure`：核对并存下输入策略。设定过回 -32006，不合规则回参数无效。
+fn configure_handler(
+    control: &Arc<Control>,
+) -> impl Fn(&Map<String, Value>) -> Result<Value, RpcError> + Send + Sync + 'static {
+    let control = Arc::clone(control);
+    move |params| {
+        let policy: InputPolicy =
+            parse(params).map_err(|error| invalid_params(InputConfigure::NAME, &error))?;
+        match control.configure(&policy) {
+            Ok(Configured::Accepted) => {
+                log!("input policy configured");
+                Ok(empty())
+            }
+            Ok(Configured::Conflict) => Err(RpcError::new(
+                i64::from(error_code::INPUT_POLICY_CONFLICT),
+                "the input policy is already set for this instance",
+            )),
+            Err(message) => Err(invalid_params(InputConfigure::NAME, &message)),
+        }
+    }
+}
+
 fn handlers(
     control: &Arc<Control>,
     outbox: &Arc<Outbox>,
     media: &Arc<Media>,
+    target: &Arc<TargetWindow>,
     ended: Sender<Ended>,
 ) -> Handlers {
     let heartbeat = {
@@ -754,9 +902,10 @@ fn handlers(
         .request_then(CoreStop::NAME, stop, stopped)
         .request(ActionSubmit::NAME, submit_handler(control, outbox))
         .request(FrameRingAttach::NAME, attach_handler(media))
-        .request(CaptureSetTarget::NAME, set_target_handler(media))
+        .request(CaptureSetTarget::NAME, set_target_handler(media, target))
         .request(AudioRingAttach::NAME, audio_attach_handler(media))
         .request(AudioSetTarget::NAME, audio_target_handler(media))
+        .request(InputConfigure::NAME, configure_handler(control))
 }
 
 /// `action.submit`：校验并交给调度线程，不在读线程上执行任何一步。参数解析不了（未知字段、类型不对）

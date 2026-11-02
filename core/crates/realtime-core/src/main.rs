@@ -47,6 +47,7 @@ fn main() -> ExitCode {
         options.input_backend,
         launch.test_device.take(),
         launch.operator.take(),
+        options.emergency_hotkey.clone(),
     ) {
         Ok(input) => input,
         Err(error) => {

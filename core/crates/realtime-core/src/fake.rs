@@ -19,13 +19,13 @@ use bellis_channel::{ChannelCredentials, ChannelError, Connection, Handlers};
 use core_protocol::messages::{
     Action, FakeAxisRelease, FakeAxisSet, FakeClick, FakeInputEvent, FakeInputEventParams,
     FakeKeyDown, FakeKeyPress, FakeKeyUp, FakeMouseDown, FakeMouseMove, FakeMouseUp,
-    FakeReleaseAll, FakeScroll, HeldInput, ReleaseReason,
+    FakeReleaseAll, FakeScroll, HeldInput, MouseButton, ReleaseReason,
 };
 use core_protocol::methods::{FakeInput, Method, TestLeaseGrant, TestLeaseRevoke};
 use serde_json::Value;
 
 use crate::control::Control;
-use crate::ledger::InputBackend;
+use crate::ledger::{Inject, InputBackend, Momentary};
 use crate::queue::SendQueue;
 use crate::side::{Post, SideConnection, connect_side, with_lease_handlers};
 
@@ -61,37 +61,48 @@ impl FakeBackend {
     }
 }
 
+impl FakeBackend {
+    fn key_down(&mut self, scan_code: u16) {
+        self.emit(FakeInputEvent::KeyDown(FakeKeyDown { scan_code }));
+    }
+
+    fn key_up(&mut self, scan_code: u16) {
+        self.emit(FakeInputEvent::KeyUp(FakeKeyUp { scan_code }));
+    }
+
+    fn mouse_down(&mut self, button: MouseButton) {
+        self.emit(FakeInputEvent::MouseDown(FakeMouseDown { button }));
+    }
+
+    fn mouse_up(&mut self, button: MouseButton) {
+        self.emit(FakeInputEvent::MouseUp(FakeMouseUp { button }));
+    }
+}
+
 impl InputBackend for FakeBackend {
-    fn press(&mut self, input: &HeldInput) {
-        self.emit(match input {
-            HeldInput::Key(key) => FakeInputEvent::KeyDown(FakeKeyDown {
-                scan_code: key.scan_code,
-            }),
-            HeldInput::MouseButton(button) => FakeInputEvent::MouseDown(FakeMouseDown {
-                button: button.button,
-            }),
-            HeldInput::Axis(axis) => FakeInputEvent::AxisSet(FakeAxisSet {
+    fn press(&mut self, input: &HeldInput) -> Inject {
+        match input {
+            HeldInput::Key(key) => self.key_down(key.scan_code),
+            HeldInput::MouseButton(button) => self.mouse_down(button.button),
+            HeldInput::Axis(axis) => self.emit(FakeInputEvent::AxisSet(FakeAxisSet {
                 axis: axis.axis.clone(),
                 value: axis.value,
-            }),
-        });
+            })),
+        }
+        Inject::Done
     }
 
     fn release(&mut self, input: &HeldInput) {
-        self.emit(match input {
-            HeldInput::Key(key) => FakeInputEvent::KeyUp(FakeKeyUp {
-                scan_code: key.scan_code,
-            }),
-            HeldInput::MouseButton(button) => FakeInputEvent::MouseUp(FakeMouseUp {
-                button: button.button,
-            }),
-            HeldInput::Axis(axis) => FakeInputEvent::AxisRelease(FakeAxisRelease {
+        match input {
+            HeldInput::Key(key) => self.key_up(key.scan_code),
+            HeldInput::MouseButton(button) => self.mouse_up(button.button),
+            HeldInput::Axis(axis) => self.emit(FakeInputEvent::AxisRelease(FakeAxisRelease {
                 axis: axis.axis.clone(),
-            }),
-        });
+            })),
+        }
     }
 
-    fn act(&mut self, action: &Action) {
+    fn act(&mut self, action: &Action) -> Inject {
         self.emit(match action {
             Action::Click(click) => FakeInputEvent::Click(FakeClick {
                 id: click.id,
@@ -115,6 +126,23 @@ impl InputBackend for FakeBackend {
                 dy: moved.dy,
             }),
         });
+        Inject::Done
+    }
+
+    fn begin_momentary(&mut self, momentary: &Momentary) -> Inject {
+        // 有输入策略时的瞬时按住：点击发鼠标按下，短按发键按下（坐标在真实后端用，假后端不记）。
+        match momentary {
+            Momentary::Click { button, .. } => self.mouse_down(*button),
+            Momentary::Key { scan_code } => self.key_down(*scan_code),
+        }
+        Inject::Done
+    }
+
+    fn end_momentary(&mut self, momentary: &Momentary) {
+        match momentary {
+            Momentary::Click { button, .. } => self.mouse_up(*button),
+            Momentary::Key { scan_code } => self.key_up(*scan_code),
+        }
     }
 
     fn released_all(&mut self, reason: ReleaseReason) {
