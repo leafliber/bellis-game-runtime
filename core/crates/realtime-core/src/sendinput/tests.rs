@@ -1,0 +1,529 @@
+//! 真实后端逻辑的单元测试：替身 [`Win32`] 在任何平台上核对注入事件的构造、前台核对、绝对坐标、钩子
+//! 分类、急停组合键与残留核验。真实的 Win32 调用、钩子线程与核验线程只在 Windows 上，由真机手动测试
+//! （GS-02）核对。
+
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "替身 Win32 的事件计数是小整数"
+)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "断言某次没有注入任何事件，用 is_empty 最直白"
+)]
+
+use std::sync::atomic::AtomicU64;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
+use core_protocol::messages::{
+    Action, Click, HeldInput, HeldKey, HeldMouseButton, KeyPress, MouseButton, ReleaseReason,
+    ResidualCause, Scroll,
+};
+
+use super::{
+    Class, Combo, Desktop, Event, HookState, PhysicalButton, RawEvent, Target, VerifyKey,
+    VerifyKeys, Win32, absolute, physical_button, verify_residual,
+};
+use crate::ledger::{Inject, InputBackend, Momentary};
+use crate::sendinput::SendInputBackend;
+
+/// 替身 Win32：按脚本给出前台目标与按键状态，记下注入的事件。
+#[derive(Default)]
+struct FakeWin32 {
+    inner: Mutex<FakeInner>,
+}
+
+#[derive(Default)]
+struct FakeInner {
+    /// 每次 `foreground_target` 依次返回这些；用尽后返回最后一个。
+    targets: Vec<Option<Target>>,
+    target_cursor: usize,
+    swapped: bool,
+    /// `send` 至多接受这么多事件（模拟被拦截）；`None` 表示全部接受。
+    accept: Option<usize>,
+    /// 读作按下的键与鼠标键。
+    down_scans: Vec<u16>,
+    down_buttons: Vec<MouseButton>,
+    sent: Vec<Vec<Event>>,
+}
+
+impl FakeWin32 {
+    fn with_target(target: Target) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(FakeInner {
+                targets: vec![Some(target)],
+                ..FakeInner::default()
+            }),
+        })
+    }
+
+    fn inner(&self) -> std::sync::MutexGuard<'_, FakeInner> {
+        self.inner.lock().unwrap()
+    }
+}
+
+impl Win32 for FakeWin32 {
+    fn foreground_target(&self) -> Option<Target> {
+        let mut inner = self.inner();
+        let index = inner
+            .target_cursor
+            .min(inner.targets.len().saturating_sub(1));
+        inner.target_cursor += 1;
+        inner.targets.get(index).copied().flatten()
+    }
+
+    fn virtual_desktop(&self) -> Desktop {
+        Desktop {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        }
+    }
+
+    fn buttons_swapped(&self) -> bool {
+        self.inner().swapped
+    }
+
+    fn send(&self, events: &[Event]) -> u32 {
+        let mut inner = self.inner();
+        inner.sent.push(events.to_vec());
+        let accepted = inner
+            .accept
+            .map_or(events.len(), |cap| cap.min(events.len()));
+        accepted as u32
+    }
+
+    fn is_down(&self, key: VerifyKey) -> bool {
+        let inner = self.inner();
+        match key {
+            VerifyKey::Scan(scan) => inner.down_scans.contains(&scan),
+            VerifyKey::Mouse(button) => inner.down_buttons.contains(&button),
+        }
+    }
+}
+
+fn target(window: isize) -> Target {
+    Target {
+        window,
+        client_x: 100,
+        client_y: 200,
+    }
+}
+
+fn backend(win32: &Arc<FakeWin32>) -> (SendInputBackend, mpsc::Receiver<super::VerifyRequest>) {
+    let (tx, rx) = mpsc::channel();
+    let backend = SendInputBackend::new(
+        Arc::clone(win32) as Arc<dyn Win32>,
+        Arc::new(AtomicU64::new(0)),
+        tx,
+        Arc::new(Mutex::new(VerifyKeys::default())),
+    );
+    (backend, rx)
+}
+
+// ---------------------------------------------------------------- 坐标与鼠标键
+
+#[test]
+fn absolute_maps_client_pixels_to_the_virtual_desktop() {
+    let desktop = Desktop {
+        left: 0,
+        top: 0,
+        width: 1920,
+        height: 1080,
+    };
+    // 客户区原点 (100, 200)，客户区点 (860, 340) → 屏幕 (960, 540)，正中。
+    let (x, y) = absolute(860, 340, target(1), desktop);
+    assert!((32_750..=32_790).contains(&x), "{x}");
+    assert!((32_750..=32_790).contains(&y), "{y}");
+    // 负偏移的虚拟桌面：原点左移。
+    let desktop = Desktop {
+        left: -1920,
+        top: 0,
+        width: 3840,
+        height: 1080,
+    };
+    let (x, _) = absolute(0, 0, target(1), desktop);
+    // 屏幕 x = 100，归一化到 [-1920, 1920]：约 (100+1920)/3840*65535。
+    assert!((34_000..=34_800).contains(&x), "{x}");
+}
+
+#[test]
+fn physical_button_follows_swap() {
+    assert_eq!(
+        physical_button(MouseButton::Left, false),
+        PhysicalButton::Left
+    );
+    assert_eq!(
+        physical_button(MouseButton::Left, true),
+        PhysicalButton::Right
+    );
+    assert_eq!(
+        physical_button(MouseButton::Right, true),
+        PhysicalButton::Left
+    );
+    assert_eq!(
+        physical_button(MouseButton::Middle, true),
+        PhysicalButton::Middle
+    );
+}
+
+// ---------------------------------------------------------------- 急停组合键
+
+#[test]
+fn combo_parses_and_triggers() {
+    let combo = Combo::parse("ctrl+shift+f12").unwrap();
+    assert_eq!(combo, Combo::default_hotkey());
+    assert!(Combo::parse("ctrl+alt+end").is_ok());
+    assert!(Combo::parse("a").is_ok());
+    assert!(Combo::parse("ctrl+shift").is_err(), "没有最终键");
+    assert!(Combo::parse("ctrl+ctrl+a").is_err(), "修饰键重复");
+    assert!(Combo::parse("ctrl+a+b").is_err(), "多个最终键");
+    assert!(Combo::parse("ctrl+nope").is_err());
+}
+
+// ---------------------------------------------------------------- 钩子分类
+
+const MARKER_MATCH: bool = true;
+
+#[test]
+fn own_injection_is_ignored_third_party_is_takeover() {
+    let mut state = HookState::default();
+    let combo = Combo::default_hotkey();
+    // 带注入标志、本实例标记：忽略。
+    assert_eq!(
+        state.classify(
+            RawEvent::KeyDown { vk: b'A'.into() },
+            true,
+            MARKER_MATCH,
+            &combo,
+            true
+        ),
+        Class::OwnInjection
+    );
+    // 带注入标志、不是本实例的标记：第三方注入，接管。
+    assert_eq!(
+        state.classify(
+            RawEvent::KeyDown { vk: b'A'.into() },
+            true,
+            false,
+            &combo,
+            true
+        ),
+        Class::Takeover
+    );
+    // 不带注入标志的真人按下：接管。
+    assert_eq!(
+        state.classify(RawEvent::MouseDown, false, false, &combo, true),
+        Class::Takeover
+    );
+    assert_eq!(
+        state.classify(RawEvent::Wheel, false, false, &combo, true),
+        Class::Takeover
+    );
+}
+
+#[test]
+fn key_up_is_never_takeover() {
+    let mut state = HookState::default();
+    let combo = Combo::default_hotkey();
+    assert_eq!(
+        state.classify(
+            RawEvent::KeyUp { vk: b'A'.into() },
+            false,
+            false,
+            &combo,
+            true
+        ),
+        Class::Ignore
+    );
+    assert_eq!(
+        state.classify(RawEvent::MouseUp, false, false, &combo, true),
+        Class::Ignore
+    );
+}
+
+#[test]
+fn takeover_only_while_the_lease_is_valid() {
+    let mut state = HookState::default();
+    let combo = Combo::default_hotkey();
+    assert_eq!(
+        state.classify(RawEvent::MouseDown, false, false, &combo, false),
+        Class::Ignore
+    );
+}
+
+#[test]
+fn mouse_movement_needs_to_pass_the_threshold() {
+    let mut state = HookState::default();
+    let combo = Combo::default_hotkey();
+    // 累计不到 8 像素不算。
+    assert_eq!(
+        state.classify(
+            RawEvent::MouseMove { dx: 3, dy: 2 },
+            false,
+            false,
+            &combo,
+            true
+        ),
+        Class::Ignore
+    );
+    // 再来一点，越过阈值即接管。
+    assert_eq!(
+        state.classify(
+            RawEvent::MouseMove { dx: 3, dy: 3 },
+            false,
+            false,
+            &combo,
+            true
+        ),
+        Class::Takeover
+    );
+    // 许可重新生效即重置累计。
+    state.lease_became_valid();
+    assert_eq!(
+        state.classify(
+            RawEvent::MouseMove { dx: 3, dy: 2 },
+            false,
+            false,
+            &combo,
+            true
+        ),
+        Class::Ignore
+    );
+}
+
+#[test]
+fn emergency_takes_precedence_over_takeover() {
+    let mut state = HookState::default();
+    let combo = Combo::default_hotkey(); // Ctrl+Shift+F12
+    let ctrl = 0x11u16;
+    let shift = 0x10u16;
+    let f12 = 0x6F + 12;
+    // 按住 Ctrl、Shift（真人，接管），再按 F12 → 急停，不论许可是否有效。
+    assert_eq!(
+        state.classify(RawEvent::KeyDown { vk: ctrl }, false, false, &combo, true),
+        Class::Takeover
+    );
+    assert_eq!(
+        state.classify(RawEvent::KeyDown { vk: shift }, false, false, &combo, true),
+        Class::Takeover
+    );
+    assert_eq!(
+        state.classify(RawEvent::KeyDown { vk: f12 }, false, false, &combo, false),
+        Class::Emergency
+    );
+    // 注入的急停也算（不论标记）。
+    let mut state = HookState::default();
+    state.classify(RawEvent::KeyDown { vk: ctrl }, true, true, &combo, false);
+    state.classify(RawEvent::KeyDown { vk: shift }, true, true, &combo, false);
+    assert_eq!(
+        state.classify(RawEvent::KeyDown { vk: f12 }, true, true, &combo, false),
+        Class::Emergency
+    );
+}
+
+// ---------------------------------------------------------------- 注入
+
+fn only_event(win32: &FakeWin32, index: usize) -> Vec<Event> {
+    win32.inner().sent[index].clone()
+}
+
+#[test]
+fn pressing_a_key_injects_a_scan_code_down() {
+    let win32 = FakeWin32::with_target(target(1));
+    let (mut backend, _rx) = backend(&win32);
+    let result = backend.press(&HeldInput::Key(HeldKey { scan_code: 0x11 }));
+    assert_eq!(result, Inject::Done);
+    assert_eq!(
+        only_event(&win32, 0),
+        [Event::KeyDown {
+            scan_code: 0x11,
+            extended: false
+        }]
+    );
+    // 扩展键带标志。
+    backend.press(&HeldInput::Key(HeldKey { scan_code: 0xE04B }));
+    assert_eq!(
+        only_event(&win32, 1),
+        [Event::KeyDown {
+            scan_code: 0x4B,
+            extended: true
+        }]
+    );
+}
+
+#[test]
+fn a_click_moves_then_presses_and_lifts() {
+    let win32 = FakeWin32::with_target(target(1));
+    let (mut backend, _rx) = backend(&win32);
+    let momentary = Momentary::Click {
+        x: 860,
+        y: 340,
+        button: MouseButton::Left,
+    };
+    assert_eq!(backend.begin_momentary(&momentary), Inject::Done);
+    let events = only_event(&win32, 0);
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[0], Event::MouseMoveAbs { .. }));
+    assert_eq!(
+        events[1],
+        Event::MouseDown {
+            button: PhysicalButton::Left
+        }
+    );
+    backend.end_momentary(&momentary);
+    assert_eq!(
+        only_event(&win32, 1),
+        [Event::MouseUp {
+            button: PhysicalButton::Left
+        }]
+    );
+}
+
+#[test]
+fn focus_lost_before_injection_sends_nothing() {
+    let win32 = Arc::new(FakeWin32 {
+        inner: Mutex::new(FakeInner {
+            targets: vec![None],
+            ..FakeInner::default()
+        }),
+    });
+    let (mut backend, _rx) = backend(&win32);
+    assert_eq!(
+        backend.press(&HeldInput::Key(HeldKey { scan_code: 0x11 })),
+        Inject::FocusLost
+    );
+    assert!(win32.inner().sent.is_empty());
+}
+
+#[test]
+fn focus_changed_after_injection_is_uncertain() {
+    // 注入前是窗口 1，注入后变成窗口 2。
+    let win32 = Arc::new(FakeWin32 {
+        inner: Mutex::new(FakeInner {
+            targets: vec![Some(target(1)), Some(target(2))],
+            ..FakeInner::default()
+        }),
+    });
+    let (mut backend, _rx) = backend(&win32);
+    assert_eq!(
+        backend.press(&HeldInput::Key(HeldKey { scan_code: 0x11 })),
+        Inject::FocusChanged
+    );
+}
+
+#[test]
+fn a_blocked_injection_reports_blocked() {
+    let win32 = Arc::new(FakeWin32 {
+        inner: Mutex::new(FakeInner {
+            targets: vec![Some(target(1))],
+            accept: Some(0), // 一个都不接受
+            ..FakeInner::default()
+        }),
+    });
+    let (mut backend, _rx) = backend(&win32);
+    assert_eq!(
+        backend.press(&HeldInput::Key(HeldKey { scan_code: 0x11 })),
+        Inject::Blocked
+    );
+}
+
+#[test]
+fn scroll_injects_a_move_and_a_wheel() {
+    let win32 = FakeWin32::with_target(target(1));
+    let (mut backend, _rx) = backend(&win32);
+    let action = Action::Scroll(Scroll {
+        id: 1,
+        x: 10,
+        y: 20,
+        notches: -2,
+    });
+    assert_eq!(backend.act(&action), Inject::Done);
+    let events = only_event(&win32, 0);
+    assert!(matches!(events[0], Event::MouseMoveAbs { .. }));
+    assert_eq!(events[1], Event::Wheel { notches: -2 });
+    // 点击与短按在真实后端不走 act（走瞬时按住）。
+    assert_eq!(
+        backend.act(&Action::Click(Click {
+            id: 2,
+            x: 0,
+            y: 0,
+            button: MouseButton::Left
+        })),
+        Inject::Done
+    );
+    assert_eq!(
+        backend.act(&Action::KeyPress(KeyPress {
+            id: 3,
+            scan_code: 0x1C
+        })),
+        Inject::Done
+    );
+    // 只注入了滚动那一次。
+    assert_eq!(win32.inner().sent.len(), 1);
+}
+
+// ---------------------------------------------------------------- 核验与请求
+
+#[test]
+fn verify_resends_ups_for_still_held_keys() {
+    let win32 = Arc::new(FakeWin32 {
+        inner: Mutex::new(FakeInner {
+            down_scans: vec![0x11],
+            down_buttons: vec![MouseButton::Left],
+            ..FakeInner::default()
+        }),
+    });
+    let items = verify_residual(win32.as_ref(), &[0x11, 0x1C], &[MouseButton::Left]);
+    // 只有读作按下的两项（0x1C 没按下不补）。
+    assert_eq!(items.len(), 2);
+    assert!(items.contains(&HeldInput::Key(HeldKey { scan_code: 0x11 })));
+    assert!(items.contains(&HeldInput::MouseButton(HeldMouseButton {
+        button: MouseButton::Left
+    })));
+    // 补发了抬起。
+    let sent = &win32.inner().sent;
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].contains(&Event::KeyUp {
+        scan_code: 0x11,
+        extended: false
+    }));
+    assert!(sent[0].contains(&Event::MouseUp {
+        button: PhysicalButton::Left
+    }));
+}
+
+#[test]
+fn verify_sends_nothing_when_nothing_is_held() {
+    let win32 = Arc::new(FakeWin32::default());
+    let items = verify_residual(win32.as_ref(), &[0x11], &[MouseButton::Left]);
+    assert!(items.is_empty());
+    assert!(win32.inner().sent.is_empty());
+}
+
+#[test]
+fn released_all_and_configured_request_verification() {
+    let win32 = FakeWin32::with_target(target(1));
+    let (mut backend, rx) = backend(&win32);
+    backend.released_all(ReleaseReason::EmergencyStop);
+    let request = rx.try_recv().unwrap();
+    assert_eq!(request.cause, ResidualCause::Release);
+    assert_eq!(request.reason, Some(ReleaseReason::EmergencyStop));
+    backend.configured(&core_protocol::messages::InputPolicy {
+        click_buttons: vec![MouseButton::Left],
+        press_keys: vec![0x1C],
+        scroll: false,
+        click_regions: vec![],
+        forbidden_zones: vec![],
+        press_duration_ms: 50,
+        max_rate: 1.0,
+        hold_keys: vec![0x11],
+        hold_buttons: vec![],
+        max_hold_ms: Some(1000),
+    });
+    let request = rx.try_recv().unwrap();
+    assert_eq!(request.cause, ResidualCause::CoreStart);
+    assert_eq!(request.reason, None);
+    let _ = Arc::clone(&win32);
+}

@@ -14,13 +14,24 @@ use std::time::{Duration, Instant};
 
 use core_protocol::messages::{
     Accepted, Action, ActionBlock, ActionOutcome, ActionReceiptParams, ActionSubmitResult,
-    CaptureState, CoreHealthParams, DropReason, Dropped, Executed, HeldInput, InputReleasedParams,
-    LeaseGrantParams, Producer, ProducerHeartbeatParams, RejectReason, Rejected, ReleaseReason,
+    CaptureState, CoreHealthParams, DropReason, Dropped, Executed, HeldInput, InputPolicy,
+    InputReleasedParams, InputResidualParams, LeaseGrantParams, Producer, ProducerHeartbeatParams,
+    RejectReason, Rejected, ReleaseReason, Uncertain,
 };
 
 use crate::frames::FrameStatus;
 use crate::lease::{Granted, Lease, Refusal};
-use crate::ledger::{HeldId, InputBackend, InputLedger};
+use crate::ledger::{HeldId, Inject, InputBackend, InputLedger, Momentary};
+use crate::policy::Policy;
+
+/// `input.configure` 已被接受的情况。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Configured {
+    /// 第一次设定，接受。
+    Accepted,
+    /// 本实例已设定过（回 -32006）。
+    Conflict,
+}
 
 /// 心跳不算数的原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +66,8 @@ pub(crate) struct Notices(pub(crate) Vec<Notice>);
 pub(crate) enum Notice {
     Released(InputReleasedParams),
     Receipt(ActionReceiptParams),
+    /// 真实后端核验出的残留（也发往操作员控制台），见 `docs/modules/realtime-core.md`。
+    Residual(InputResidualParams),
 }
 
 impl Notices {
@@ -69,7 +82,7 @@ impl Notices {
             .iter()
             .filter_map(|notice| match notice {
                 Notice::Released(released) => Some(released.reason),
-                Notice::Receipt(_) => None,
+                Notice::Receipt(_) | Notice::Residual(_) => None,
             })
             .collect()
     }
@@ -81,7 +94,7 @@ impl Notices {
             .iter()
             .filter_map(|notice| match notice {
                 Notice::Receipt(receipt) => Some(receipt),
-                Notice::Released(_) => None,
+                Notice::Released(_) | Notice::Residual(_) => None,
             })
             .collect()
     }
@@ -112,17 +125,22 @@ impl Current {
     }
 }
 
-/// 待执行的一步。
+/// 待执行的一步。一次性动作在有输入策略时作为瞬时按住注入、按住时长后抬起，同一步的下一个一次性动作
+/// 等它抬起（[`State::step`]）；因此一步可能跨多次调度，`held_done` 与 `done` 记下已完成的部分。
 #[derive(Debug)]
 struct Entry {
-    /// 生效时刻：`start_ns + offset_ns`。
+    /// 生效时刻：`start_ns + offset_ns`；等瞬时按住抬起时改成抬起时刻。
     at_ns: u64,
     /// 所属动作块的有效截止时刻；过了它这一步不再执行。
     deadline_ns: u64,
     block_seq: u64,
     base_frame: u64,
     held: Vec<HeldInput>,
-    actions: Vec<Action>,
+    actions: VecDeque<Action>,
+    /// 这一步的持续状态已按下。
+    held_done: bool,
+    /// 这一步已给出结果的一次性动作，等整步完成或释放时一并回执。
+    done: Vec<ActionOutcome>,
 }
 
 /// 当前在效的动作块。
@@ -152,6 +170,9 @@ impl Outcomes {
     }
 
     fn drop_all(&mut self, entry: &Entry, reason: DropReason) {
+        for outcome in &entry.done {
+            self.add(entry.block_seq, outcome.clone());
+        }
         for action in &entry.actions {
             self.add(entry.block_seq, dropped(action, reason));
         }
@@ -193,7 +214,9 @@ impl Plan {
                 block_seq: old.seq,
                 base_frame: block.base_frame,
                 held: Vec::new(),
-                actions: Vec::new(),
+                actions: VecDeque::new(),
+                held_done: false,
+                done: Vec::new(),
             });
         }
         for step in block.steps {
@@ -204,7 +227,9 @@ impl Plan {
                 block_seq: block.seq,
                 base_frame: block.base_frame,
                 held: step.held,
-                actions: step.actions,
+                actions: step.actions.into(),
+                held_done: false,
+                done: Vec::new(),
             });
         }
         self.entries = kept;
@@ -230,6 +255,24 @@ struct State {
     revoked_through: Option<u64>,
     stopping: bool,
     plan: Plan,
+    /// 输入策略；收到 `input.configure` 后有。
+    policy: Option<Policy>,
+    /// 是否收到过 `input.configure`（收到即不能再设定，回 -32006）。
+    configured: bool,
+    /// 真实后端：没有输入策略时拒绝含输入的动作块。
+    requires_policy: bool,
+    /// 过去 1 秒已执行的一次性动作的时刻，用于按 `max_rate` 限速。
+    rate: VecDeque<u64>,
+}
+
+/// 调度一步的进展。
+enum Step {
+    /// 这一步做完了。
+    Done,
+    /// 有瞬时按住还没抬起，等到 `at_ns` 再接着做这一步的其余动作。
+    Defer(u64),
+    /// 要释放全部输入并结束这一块；`revoke` 为真时同时本地撤权。
+    Release { reason: ReleaseReason, revoke: bool },
 }
 
 impl State {
@@ -263,6 +306,34 @@ impl State {
         self.release(reason, producer.as_ref(), Outcomes::default(), notices);
     }
 
+    /// 执行一步时触发的释放：`first` 是这一步已有的结果与其余动作的 `released`。`revoke` 为真时先本地
+    /// 撤权（接管、急停、注入被拦截、钩子失效），许可源须换发更大的令牌。
+    fn release_block(
+        &mut self,
+        reason: ReleaseReason,
+        revoke: bool,
+        first: Outcomes,
+        notices: &mut Notices,
+    ) {
+        if revoke {
+            self.lease.local_revoke();
+        }
+        let producer = self.current_producer();
+        self.release(reason, producer.as_ref(), first, notices);
+    }
+
+    /// 丢掉过去 1 秒之前的一次性动作记录。
+    fn prune_rate(&mut self, now: u64) {
+        let window = 1_000_000_000;
+        while let Some(&front) = self.rate.front() {
+            if now.saturating_sub(front) >= window {
+                self.rate.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
     /// 权威检查：输入许可有效；`producer` 是当前控制产出者且心跳有效；最新写入帧的帧龄不超过上限。
     /// 每次把一个输入交给后端之前调用；不成立时给出释放的原因。
     fn authority(
@@ -288,11 +359,14 @@ impl State {
         }
     }
 
-    /// 处理到 `now` 为止到期的一切：心跳超时、许可到期、持有输入时帧龄超限、到时的步与截止时刻。
+    /// 处理到 `now` 为止到期的一切：抬起到期的瞬时按住、心跳超时、许可到期、持有输入时帧龄超限、
+    /// 最长按住、到时的步与截止时刻。
     fn tick(&mut self, now: u64, frames: &FrameStatus, limits: &Limits, notices: &mut Notices) {
         if self.stopping {
             return;
         }
+        // 先抬起到期的瞬时按住：它不是失效，不释放全部；抬起后同一步的下一个一次性动作可以接着做。
+        self.ledger.lift_due(now);
         if let Some(current) = self.current.as_mut()
             && current.deadline.is_some_and(|deadline| now >= deadline)
         {
@@ -306,12 +380,26 @@ impl State {
         if !self.ledger.is_empty() && !frame_is_fresh(frames, now, limits) {
             self.release_current(ReleaseReason::FrameStale, notices);
         }
+        if self.max_hold_exceeded(now) {
+            self.release_current(ReleaseReason::MaxHold, notices);
+        }
         self.run_due_entries(now, frames, limits, notices);
         if let Some(active) = self.plan.active
             && now >= active.deadline_ns
         {
             self.release_current(ReleaseReason::DeadlineExpired, notices);
         }
+    }
+
+    /// 有输入策略、持续状态里最早一项按住超过 `max_hold` 时为真。
+    fn max_hold_exceeded(&self, now: u64) -> bool {
+        let Some(max_hold) = self.policy.as_ref().and_then(Policy::max_hold) else {
+            return false;
+        };
+        let max_hold = nanos(max_hold);
+        self.ledger
+            .earliest_held_ns()
+            .is_some_and(|pressed| now.saturating_sub(pressed) >= max_hold)
     }
 
     fn run_due_entries(
@@ -321,7 +409,10 @@ impl State {
         limits: &Limits,
         notices: &mut Notices,
     ) {
-        while let Some(front) = self.plan.entries.front() {
+        loop {
+            let Some(front) = self.plan.entries.front() else {
+                return;
+            };
             if front.at_ns > now {
                 return;
             }
@@ -330,82 +421,210 @@ impl State {
                 // 在效块的截止时刻已过：由截止时刻的释放结束它，这一步不再执行。
                 return;
             }
-            let Some(entry) = self.plan.entries.pop_front() else {
-                return;
-            };
+            let mut entry = self
+                .plan
+                .entries
+                .pop_front()
+                .expect("front just checked above");
             let late = now > entry.deadline_ns;
-            match self.execute(&entry, late, now, frames, limits) {
-                Ok(outcomes) => outcomes.emit(self.current_producer().as_ref(), notices),
-                Err((reason, outcomes)) => {
+            match self.step(&mut entry, late, now, frames, limits) {
+                Step::Done => {
                     let producer = self.current_producer();
-                    self.release(reason, producer.as_ref(), outcomes, notices);
+                    let mut outcomes = Outcomes::default();
+                    for outcome in entry.done {
+                        outcomes.add(entry.block_seq, outcome);
+                    }
+                    outcomes.emit(producer.as_ref(), notices);
+                }
+                Step::Defer(at) => {
+                    entry.at_ns = at;
+                    self.plan.entries.push_front(entry);
+                    return;
+                }
+                Step::Release { reason, revoke } => {
+                    // 这一步已有的结果加上其余动作的 released，由释放一并回执。
+                    let mut first = Outcomes::default();
+                    for outcome in &entry.done {
+                        first.add(entry.block_seq, outcome.clone());
+                    }
+                    for action in &entry.actions {
+                        first.add(entry.block_seq, dropped(action, DropReason::Released));
+                    }
+                    self.release_block(reason, revoke, first, notices);
                     return;
                 }
             }
         }
     }
 
-    /// 执行一步：先抬起不在持续状态里的项，再逐项按下、逐个执行一次性动作，每次交给后端之前都做权威
-    /// 检查。`late` 表示所属的旧块已过了截止时刻（调度线程醒得晚了）：只做抬起，动作回执 `superseded`。
-    fn execute(
+    /// 执行一步，结果累进 `entry.done`；返回这一步的进展。先抬起不在持续状态里的项，再逐项按下、逐个
+    /// 执行一次性动作，每次交给后端之前都做权威检查。`late` 表示所属的旧块已过了截止时刻（调度线程醒得
+    /// 晚了）：只做抬起，动作回执 `superseded`。
+    #[allow(
+        clippy::too_many_lines,
+        reason = "一步的执行是一条直线的流程，拆开反而难读"
+    )]
+    fn step(
         &mut self,
-        entry: &Entry,
+        entry: &mut Entry,
         late: bool,
         now: u64,
         frames: &FrameStatus,
         limits: &Limits,
-    ) -> Result<Outcomes, (ReleaseReason, Outcomes)> {
-        let mut outcomes = Outcomes::default();
+    ) -> Step {
         let Some(producer) = self.current_producer() else {
-            outcomes.drop_all(entry, DropReason::Released);
-            return Err((ReleaseReason::ProducerChanged, outcomes));
+            while let Some(action) = entry.actions.pop_front() {
+                entry.done.push(dropped(&action, DropReason::Released));
+            }
+            return Step::Release {
+                reason: ReleaseReason::ProducerChanged,
+                revoke: false,
+            };
         };
-        self.ledger.release_missing(&entry.held);
+        if !entry.held_done {
+            self.ledger.release_missing(&entry.held);
+            for input in &entry.held {
+                if self.ledger.holds(input) {
+                    continue;
+                }
+                if let Err(reason) = self.authority(&producer, now, frames, limits) {
+                    return drain_released(entry, reason, false);
+                }
+                match self.ledger.press(input.clone(), now) {
+                    Inject::Done => {}
+                    Inject::FocusLost | Inject::FocusChanged => {
+                        return drain_released(entry, ReleaseReason::FocusLost, false);
+                    }
+                    Inject::Blocked => {
+                        return drain_released(entry, ReleaseReason::InjectionBlocked, true);
+                    }
+                }
+            }
+            entry.held_done = true;
+        }
         if late {
-            outcomes.drop_all(entry, DropReason::Superseded);
-            return Ok(outcomes);
-        }
-        for input in &entry.held {
-            if self.ledger.holds(input) {
-                continue;
+            while let Some(action) = entry.actions.pop_front() {
+                entry.done.push(dropped(&action, DropReason::Superseded));
             }
-            if let Err(reason) = self.authority(&producer, now, frames, limits) {
-                outcomes.drop_all(entry, DropReason::Released);
-                return Err((reason, outcomes));
-            }
-            self.ledger.press(input.clone());
+            return Step::Done;
         }
-        let mut failed = None;
-        for action in &entry.actions {
-            let id = action_id(action);
-            let outcome = if failed.is_some() {
-                dropped(action, DropReason::Released)
-            } else if self
+        while !entry.actions.is_empty() {
+            // 瞬时按住还没抬起：同一步的下一个一次性动作等它抬起。
+            if self.ledger.has_transient()
+                && let Some(at) = self.ledger.next_lift()
+            {
+                return Step::Defer(at);
+            }
+            let action = entry.actions.pop_front().expect("not empty just checked");
+            let id = action_id(&action);
+            if self
                 .current
                 .as_ref()
                 .is_some_and(|current| current.executed.contains(&id))
             {
-                dropped(action, DropReason::Duplicate)
-            } else if has_coordinates(action) && frames.geometry_changed_since(entry.base_frame) {
-                dropped(action, DropReason::GeometryChanged)
-            } else if let Err(reason) = self.authority(&producer, now, frames, limits) {
-                failed = Some(reason);
-                dropped(action, DropReason::Released)
-            } else {
-                self.ledger.act(action);
-                if let Some(current) = self.current.as_mut() {
-                    current.executed.insert(id);
+                entry.done.push(dropped(&action, DropReason::Duplicate));
+                continue;
+            }
+            if has_coordinates(&action) && frames.geometry_changed_since(entry.base_frame) {
+                entry
+                    .done
+                    .push(dropped(&action, DropReason::GeometryChanged));
+                continue;
+            }
+            self.prune_rate(now);
+            if let Some(reason) = self.policy_drop(&action, frames) {
+                entry.done.push(dropped(&action, reason));
+                continue;
+            }
+            if let Err(reason) = self.authority(&producer, now, frames, limits) {
+                entry.done.push(dropped(&action, DropReason::Released));
+                return Step::Release {
+                    reason,
+                    revoke: false,
+                };
+            }
+            match self.inject(&action, now) {
+                Inject::Done => {
+                    entry.done.push(ActionOutcome::Executed(Executed {
+                        id,
+                        at_ns: mono_clock::now_ns(),
+                    }));
+                    if let Some(current) = self.current.as_mut() {
+                        current.executed.insert(id);
+                    }
+                    self.rate.push_back(now);
                 }
-                ActionOutcome::Executed(Executed {
-                    id,
-                    at_ns: mono_clock::now_ns(),
-                })
-            };
-            outcomes.add(entry.block_seq, outcome);
+                Inject::FocusChanged => {
+                    entry.done.push(ActionOutcome::Uncertain(Uncertain {
+                        id,
+                        at_ns: mono_clock::now_ns(),
+                    }));
+                    return Step::Release {
+                        reason: ReleaseReason::FocusLost,
+                        revoke: false,
+                    };
+                }
+                Inject::FocusLost => {
+                    entry.done.push(dropped(&action, DropReason::Released));
+                    return Step::Release {
+                        reason: ReleaseReason::FocusLost,
+                        revoke: false,
+                    };
+                }
+                Inject::Blocked => {
+                    entry.done.push(dropped(&action, DropReason::Released));
+                    return Step::Release {
+                        reason: ReleaseReason::InjectionBlocked,
+                        revoke: true,
+                    };
+                }
+            }
         }
-        match failed {
-            Some(reason) => Err((reason, outcomes)),
-            None => Ok(outcomes),
+        Step::Done
+    }
+
+    /// 执行时的输入策略核对（带坐标的落点、一次性动作的速率）；不通过时给出丢弃原因。没有输入策略时不限制。
+    /// 调用方须已按 `now` 调用过 [`Self::prune_rate`]。
+    fn policy_drop(&self, action: &Action, frames: &FrameStatus) -> Option<DropReason> {
+        let policy = self.policy.as_ref()?;
+        if let Some((x, y)) = coordinates(action) {
+            let geometry = frames.latest_geometry();
+            let allowed = geometry.is_some_and(|geometry| {
+                policy.point_allowed(x, y, geometry.width, geometry.height)
+            });
+            if !allowed {
+                return Some(DropReason::NotAllowed);
+            }
+        }
+        // 速率：过去 1 秒内的一次性动作数到了上限即丢弃。
+        (!policy.within_rate(self.rate.len())).then_some(DropReason::RateLimited)
+    }
+
+    /// 把一个一次性动作交给后端：有输入策略时点击与短按作为瞬时按住注入（按住 `press_duration`），
+    /// 滚动是单个事件；没有输入策略时都是单个事件（G0）。
+    fn inject(&mut self, action: &Action, now: u64) -> Inject {
+        match &self.policy {
+            Some(policy) => {
+                let lift_ns = now.saturating_add(nanos(policy.press_duration()));
+                match action {
+                    Action::Click(click) => self.ledger.begin_momentary(
+                        Momentary::Click {
+                            x: click.x,
+                            y: click.y,
+                            button: click.button,
+                        },
+                        lift_ns,
+                    ),
+                    Action::KeyPress(press) => self.ledger.begin_momentary(
+                        Momentary::Key {
+                            scan_code: press.scan_code,
+                        },
+                        lift_ns,
+                    ),
+                    Action::Scroll(_) | Action::MouseMove(_) => self.ledger.act(action),
+                }
+            }
+            None => self.ledger.act(action),
         }
     }
 }
@@ -432,11 +651,28 @@ fn has_coordinates(action: &Action) -> bool {
     matches!(action, Action::Click(_) | Action::Scroll(_))
 }
 
+/// 带坐标的动作的客户区落点（物理像素）。
+fn coordinates(action: &Action) -> Option<(u32, u32)> {
+    match action {
+        Action::Click(click) => Some((click.x, click.y)),
+        Action::Scroll(scroll) => Some((scroll.x, scroll.y)),
+        Action::KeyPress(_) | Action::MouseMove(_) => None,
+    }
+}
+
 fn dropped(action: &Action, reason: DropReason) -> ActionOutcome {
     ActionOutcome::Dropped(Dropped {
         id: action_id(action),
         reason,
     })
+}
+
+/// 把一步里剩下的动作都回执 `released`，返回要释放的进展。
+fn drain_released(entry: &mut Entry, reason: ReleaseReason, revoke: bool) -> Step {
+    while let Some(action) = entry.actions.pop_front() {
+        entry.done.push(dropped(&action, DropReason::Released));
+    }
+    Step::Release { reason, revoke }
 }
 
 /// 动作块的内容规则（不含产出者、序号与截止时刻）：至少一步；步的偏移不减，生效时刻不溢出、不晚于
@@ -510,11 +746,12 @@ fn nanos(duration: Duration) -> u64 {
 
 impl Control {
     /// `backend` 是输入后端；有它才有许可源：操作员许可连接，或只用于测试、与假后端同生同灭的
-    /// 测试许可源。
+    /// 测试许可源。`requires_policy` 为真（真实后端）时，没有输入策略即拒绝含输入的动作块。
     pub(crate) fn new(
         limits: Limits,
         frames: Arc<FrameStatus>,
         backend: Option<Box<dyn InputBackend>>,
+        requires_policy: bool,
     ) -> Self {
         let has_source = backend.is_some();
         Self {
@@ -526,6 +763,10 @@ impl Control {
                 revoked_through: None,
                 stopping: false,
                 plan: Plan::default(),
+                policy: None,
+                configured: false,
+                requires_policy,
+                rate: VecDeque::new(),
             }),
             changed: Condvar::new(),
             frames,
@@ -689,6 +930,9 @@ impl Control {
         if let Err(message) = check_block(&block) {
             return rejected(RejectReason::Invalid, message);
         }
+        if let Err(message) = Self::check_whitelist(state, &block) {
+            return rejected(RejectReason::NotAllowed, message);
+        }
         if let Some(Some(last)) = same_generation
             && block.seq <= last
         {
@@ -749,6 +993,68 @@ impl Control {
         }
         self.done(state);
         notices
+    }
+
+    /// `input.configure`：核对并存下输入策略，每个实例一次。设定过回 [`Configured::Conflict`]（-32006），
+    /// 不合规则回 `Err`（-32602）。接受时告诉输入后端白名单里的键与鼠标键，供真实后端核验残留。
+    pub(crate) fn configure(&self, params: &InputPolicy) -> Result<Configured, String> {
+        let mut state = self.lock();
+        if state.configured {
+            return Ok(Configured::Conflict);
+        }
+        let policy = Policy::parse(params)?;
+        state.policy = Some(policy);
+        state.configured = true;
+        state.ledger.configured(params);
+        self.done(state);
+        Ok(Configured::Accepted)
+    }
+
+    /// 提交时的输入策略核对：持续状态与一次性动作都须在白名单内（真实后端没有策略时拒绝含输入的块）。
+    fn check_whitelist(state: &State, block: &ActionBlock) -> Result<(), String> {
+        match &state.policy {
+            Some(policy) => {
+                for step in &block.steps {
+                    for held in &step.held {
+                        policy.allows_held(held).map_err(|error| error.0)?;
+                    }
+                    for action in &step.actions {
+                        policy.allows_action(action).map_err(|error| error.0)?;
+                    }
+                }
+                Ok(())
+            }
+            None if state.requires_policy => {
+                let has_input = block
+                    .steps
+                    .iter()
+                    .any(|step| !step.held.is_empty() || !step.actions.is_empty());
+                if has_input {
+                    Err("the real input backend has no input policy yet".into())
+                } else {
+                    Ok(())
+                }
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// 真实后端的本地撤权：接管、急停、钩子失效。吊销当前令牌并释放全部输入，许可源须换发更大的令牌。
+    /// 由钩子线程调用，通知经发送队列发出，不阻塞回调。
+    pub(crate) fn local_revoke(&self, reason: ReleaseReason) -> Notices {
+        let mut state = self.lock();
+        let mut notices = Notices::default();
+        if !state.stopping {
+            state.lease.local_revoke();
+            state.release_current(reason, &mut notices);
+        }
+        self.done(state);
+        notices
+    }
+
+    /// 许可现在是否有效：钩子据此判断是否算接管（许可无效时没有可接管的输入）。
+    pub(crate) fn lease_valid(&self) -> bool {
+        self.lock().lease.check(mono_clock::now_ns()).is_ok()
     }
 
     /// 与许可源的连接断开：此后没有许可，释放全部输入（`lease_source_lost`）。正在停止时什么也不做。
@@ -824,12 +1130,20 @@ impl Control {
                     .saturating_add(1)
             })
         });
+        let max_hold_at = state
+            .policy
+            .as_ref()
+            .and_then(Policy::max_hold)
+            .zip(state.ledger.earliest_held_ns())
+            .map(|(max_hold, pressed)| pressed.saturating_add(nanos(max_hold)));
         [
             state.current.as_ref().and_then(|c| c.deadline),
             state.lease.expires_at(),
             state.plan.entries.front().map(|e| e.at_ns),
             state.plan.active.map(|a| a.deadline_ns),
             frame_stale_at,
+            state.ledger.next_lift(),
+            max_hold_at,
         ]
         .into_iter()
         .flatten()

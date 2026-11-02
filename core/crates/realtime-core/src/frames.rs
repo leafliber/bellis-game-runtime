@@ -92,6 +92,11 @@ impl FrameStatus {
             .then(|| self.latest_capture_ns.load(Ordering::Acquire))
     }
 
+    /// 本实例最近写入帧的客户区几何（尺寸与 DPI）；还没写过帧时为 `None`。供输入策略的落点归一化。
+    pub(crate) fn latest_geometry(&self) -> Option<Geometry> {
+        self.lock().geometry.back().map(|&(_, geometry)| geometry)
+    }
+
     /// 基准帧之后客户区的尺寸或 DPI 是否变了。基准帧的几何查不到时也算变了：比本实例在当前帧环
     /// 写出的第一帧早（旧实例或挂接之前的帧）、比最近写入的一帧晚，或早于记下的最早一次变化。
     pub(crate) fn geometry_changed_since(&self, base_frame: u64) -> bool {

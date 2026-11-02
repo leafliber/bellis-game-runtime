@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use bellis_channel::ChannelCredentials;
 
+use crate::sendinput::Combo;
+
 /// 通道地址，Windows 上是命名管道，其它平台是 UDS 路径。
 pub const ENV_CHANNEL_PATH: &str = "BELLIS_CHANNEL_PATH";
 /// 会话密钥的 base64url 无填充编码。
@@ -33,11 +35,13 @@ pub const DEFAULT_MAX_FRAME_AGE: Duration = Duration::from_millis(500);
 /// 从发出 `core.hello` 到收到回应的时限，与通道握手的缺省时限相同。
 pub const HELLO_TIMEOUT: Duration = Duration::from_millis(2000);
 
-/// 输入后端。G0 只有只用于测试的假后端；真实后端（`SendInput`）在 G2 实现，现在 unsupported。
+/// 输入后端。假后端只用于测试；真实后端（`SendInput`）只在 Windows 上，只与生产许可源一起选出。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputBackendKind {
     /// 假输入后端：输入事件经测试设备连接交给测试一方。只用于测试。
     Fake,
+    /// 真实后端：用 `SendInput` 注入。只在 Windows 上、只与生产许可源一起。
+    SendInput,
 }
 
 /// 命令行参数给出的时限与输入后端。
@@ -51,6 +55,8 @@ pub struct Options {
     pub max_frame_age: Duration,
     /// 输入后端；`None` 表示没有，动作块照常校验，但没有许可，从不发出输入。
     pub input_backend: Option<InputBackendKind>,
+    /// 急停组合键；只在给出 `--emergency-hotkey` 时为 `Some`，只与真实后端一起给出。
+    pub emergency_hotkey: Option<Combo>,
 }
 
 impl Default for Options {
@@ -60,6 +66,7 @@ impl Default for Options {
             health_interval: DEFAULT_HEALTH_INTERVAL,
             max_frame_age: DEFAULT_MAX_FRAME_AGE,
             input_backend: None,
+            emergency_hotkey: None,
         }
     }
 }
@@ -67,7 +74,7 @@ impl Default for Options {
 /// 用法说明，参数不合法时打印。
 pub const USAGE: &str = "usage: realtime-core [--heartbeat-timeout-ms <ms>] \
                          [--health-interval-ms <ms>] [--max-frame-age-ms <ms>] \
-                         [--input-backend fake]";
+                         [--input-backend fake|sendinput] [--emergency-hotkey <combo>]";
 
 impl Options {
     /// 解析命令行参数（不含程序名）。
@@ -84,13 +91,19 @@ impl Options {
                 let name = args.next().ok_or_else(value)?;
                 options.input_backend = Some(match name.as_str() {
                     "fake" => InputBackendKind::Fake,
+                    "sendinput" => InputBackendKind::SendInput,
                     _ => {
                         return Err(format!(
-                            "input backend {name:?} is unsupported: G0 only has the fake backend \
-                             for tests; real input (SendInput) comes in G2"
+                            "input backend {name:?} is unsupported: use fake (tests only) or \
+                             sendinput (real input, Windows only)"
                         ));
                     }
                 });
+                continue;
+            }
+            if arg == "--emergency-hotkey" {
+                let combo = args.next().ok_or_else(value)?;
+                options.emergency_hotkey = Some(Combo::parse(&combo)?);
                 continue;
             }
             let slot = match arg.as_str() {
@@ -174,8 +187,8 @@ pub enum FakePermit {
 }
 
 /// 输入后端与许可源的组合，只由 [`InputSetup::select`] 构造。许可源只有一个：测试许可源只在
-/// [`InputSetup::Fake`] 里、且只在没有生产许可源时出现。真实后端（G2 第 2 步）加进来时只带
-/// [`PermitSource`]，所以它不能与测试许可源一起出现。
+/// [`InputSetup::Fake`] 里、且只在没有生产许可源时出现；真实后端（[`InputSetup::Real`]）只带
+/// [`PermitSource`]，不能与测试许可源一起出现，也不能同时给测试设备的凭据。
 #[derive(Debug)]
 pub enum InputSetup {
     /// 没有输入后端，也没有许可源：动作块照常校验与调度，但权威检查因没有许可从不通过，不发任何输入。
@@ -187,20 +200,35 @@ pub enum InputSetup {
         /// 许可从哪里来。
         permit: FakePermit,
     },
+    /// 真实后端（SendInput），只在 Windows 上，只与生产许可源一起。
+    Real {
+        /// 生产许可源。
+        source: PermitSource,
+        /// 急停组合键。
+        emergency: Combo,
+    },
 }
 
 impl InputSetup {
-    /// 按 `--input-backend`、测试设备的凭据与操作员许可连接的凭据选出组合。
+    /// 按 `--input-backend`、测试设备的凭据、操作员许可连接的凭据与急停组合键选出组合。
     ///
     /// # Errors
     ///
-    /// 以下情形返回说明：假后端没有测试设备的凭据；给了测试设备的凭据却不是假后端（测试许可源不能与
-    /// 其它后端或没有后端同时启用）；给了操作员许可连接的凭据却没有输入后端。
+    /// 以下情形返回说明：假后端没有测试设备的凭据；给了测试设备的凭据却不是假后端；给了操作员许可连接的
+    /// 凭据却没有输入后端；真实后端没有生产许可源、或同时给了测试设备的凭据、或不在 Windows 上；
+    /// 给了 `--emergency-hotkey` 却不是真实后端。
     pub fn select(
         backend: Option<InputBackendKind>,
         test_device: Option<ChannelCredentials>,
         operator: Option<ChannelCredentials>,
+        emergency: Option<Combo>,
     ) -> Result<Self, String> {
+        if emergency.is_some() && backend != Some(InputBackendKind::SendInput) {
+            return Err(
+                "--emergency-hotkey is only for the real backend (--input-backend sendinput)"
+                    .into(),
+            );
+        }
         match (backend, test_device, operator) {
             (None, None, None) => Ok(Self::None),
             (None, _, Some(_)) => Err(format!(
@@ -221,6 +249,22 @@ impl InputSetup {
                     None => FakePermit::TestLease,
                 },
             }),
+            (Some(InputBackendKind::SendInput), _, _) if !cfg!(windows) => Err(
+                "the real input backend (--input-backend sendinput) is only available on Windows"
+                    .into(),
+            ),
+            (Some(InputBackendKind::SendInput), Some(_), _) => Err(format!(
+                "the real input backend cannot take the test device credentials \
+                 ({ENV_TEST_DEVICE_PATH})"
+            )),
+            (Some(InputBackendKind::SendInput), None, None) => Err(format!(
+                "the real input backend needs a production lease source (the operator lease \
+                 connection {ENV_OPERATOR_PATH})"
+            )),
+            (Some(InputBackendKind::SendInput), None, Some(operator)) => Ok(Self::Real {
+                source: PermitSource::Operator(operator),
+                emergency: emergency.unwrap_or_else(Combo::default_hotkey),
+            }),
         }
     }
 
@@ -230,6 +274,10 @@ impl InputSetup {
         match self {
             Self::Fake {
                 permit: FakePermit::Source(PermitSource::Operator(operator)),
+                ..
+            }
+            | Self::Real {
+                source: PermitSource::Operator(operator),
                 ..
             } => Some(operator),
             Self::None
@@ -244,7 +292,7 @@ impl InputSetup {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_FRAME_AGE, ENV_CHANNEL_KEY, ENV_CHANNEL_PATH, ENV_OPERATOR_KEY,
+        Combo, DEFAULT_MAX_FRAME_AGE, ENV_CHANNEL_KEY, ENV_CHANNEL_PATH, ENV_OPERATOR_KEY,
         ENV_OPERATOR_PATH, ENV_ROLE, ENV_TEST_DEVICE_KEY, ENV_TEST_DEVICE_PATH, FakePermit,
         InputBackendKind, InputSetup, Launch, Options, PermitSource,
     };
@@ -295,10 +343,73 @@ mod tests {
     }
 
     #[test]
-    fn only_the_fake_input_backend_exists() {
-        for name in ["sendinput", "real", "FAKE", ""] {
+    fn input_backends_are_fake_and_sendinput() {
+        assert_eq!(
+            Options::parse(args(&["--input-backend", "sendinput"]))
+                .unwrap()
+                .input_backend,
+            Some(InputBackendKind::SendInput)
+        );
+        for name in ["real", "FAKE", ""] {
             let error = Options::parse(args(&["--input-backend", name])).unwrap_err();
             assert!(error.contains("unsupported"), "{error}");
+        }
+    }
+
+    #[test]
+    fn emergency_hotkey_parses_and_is_only_for_the_real_backend() {
+        let parsed = Options::parse(args(&[
+            "--input-backend",
+            "sendinput",
+            "--emergency-hotkey",
+            "ctrl+alt+end",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.input_backend, Some(InputBackendKind::SendInput));
+        assert!(parsed.emergency_hotkey.is_some());
+        // 坏组合键在解析时就报错。
+        assert!(Options::parse(args(&["--emergency-hotkey", "ctrl+shift"])).is_err());
+        // 给了急停组合键却不是真实后端：门禁拒绝。
+        let error = InputSetup::select(
+            Some(InputBackendKind::Fake),
+            Some(device()),
+            None,
+            Some(Combo::default_hotkey()),
+        )
+        .unwrap_err();
+        assert!(error.contains("emergency"), "{error}");
+    }
+
+    #[test]
+    fn the_real_backend_needs_a_production_source_and_no_test_device() {
+        // 没有生产许可源：拒绝。
+        let error =
+            InputSetup::select(Some(InputBackendKind::SendInput), None, None, None).unwrap_err();
+        if cfg!(windows) {
+            assert!(error.contains("production lease source"), "{error}");
+        } else {
+            assert!(error.contains("only available on Windows"), "{error}");
+        }
+        if cfg!(windows) {
+            // 真实后端与操作员许可连接一起选出。
+            let setup = InputSetup::select(
+                Some(InputBackendKind::SendInput),
+                None,
+                Some(operator()),
+                None,
+            )
+            .unwrap();
+            assert_eq!(setup.operator().unwrap().path, "operator-path");
+            assert!(matches!(setup, InputSetup::Real { .. }));
+            // 真实后端不能同时给测试设备的凭据。
+            let error = InputSetup::select(
+                Some(InputBackendKind::SendInput),
+                Some(device()),
+                Some(operator()),
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains(ENV_TEST_DEVICE_PATH), "{error}");
         }
     }
 
@@ -317,22 +428,22 @@ mod tests {
     /// 门禁：测试许可源只能与假后端一起启用，假后端也离不开测试设备。
     #[test]
     fn the_test_lease_source_only_comes_with_the_fake_backend() {
-        let setup = InputSetup::select(None, None, None).unwrap();
+        let setup = InputSetup::select(None, None, None, None).unwrap();
         assert!(matches!(setup, InputSetup::None));
         assert!(setup.operator().is_none());
-        match InputSetup::select(Some(InputBackendKind::Fake), Some(device()), None) {
+        match InputSetup::select(Some(InputBackendKind::Fake), Some(device()), None, None) {
             Ok(InputSetup::Fake {
                 test_device,
                 permit: FakePermit::TestLease,
             }) => assert_eq!(test_device.path, "device-path"),
             other => panic!("{other:?}"),
         }
-        let error = InputSetup::select(None, Some(device()), None).unwrap_err();
+        let error = InputSetup::select(None, Some(device()), None, None).unwrap_err();
         assert!(
             error.contains("only available with --input-backend fake"),
             "{error}"
         );
-        let error = InputSetup::select(Some(InputBackendKind::Fake), None, None).unwrap_err();
+        let error = InputSetup::select(Some(InputBackendKind::Fake), None, None, None).unwrap_err();
         assert!(error.contains(ENV_TEST_DEVICE_PATH), "{error}");
     }
 
@@ -343,6 +454,7 @@ mod tests {
             Some(InputBackendKind::Fake),
             Some(device()),
             Some(operator()),
+            None,
         )
         .unwrap();
         assert_eq!(setup.operator().unwrap().path, "operator-path");
@@ -358,13 +470,13 @@ mod tests {
         }
         // 没有输入后端：许可无处可用。
         for device in [None, Some(device())] {
-            let error = InputSetup::select(None, device, Some(operator())).unwrap_err();
+            let error = InputSetup::select(None, device, Some(operator()), None).unwrap_err();
             assert!(error.contains("needs an input backend"), "{error}");
             assert!(error.contains(ENV_OPERATOR_PATH), "{error}");
         }
         // 假后端仍离不开测试设备：假输入事件要交给它。
-        let error =
-            InputSetup::select(Some(InputBackendKind::Fake), None, Some(operator())).unwrap_err();
+        let error = InputSetup::select(Some(InputBackendKind::Fake), None, Some(operator()), None)
+            .unwrap_err();
         assert!(error.contains(ENV_TEST_DEVICE_PATH), "{error}");
     }
 
