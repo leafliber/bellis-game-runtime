@@ -19,6 +19,7 @@ from core_protocol.models import CoreHealthParams, InputReleasedParams, Producer
 from game_runtime.core_link import (
     CoreLink,
     CoreLinkOptions,
+    RestartPolicy,
     StopResult,
     StopStage,
     shutdown_runtime,
@@ -343,6 +344,92 @@ def test_killing_the_main_process_lets_the_core_release_and_exit(
                     stream.close()
 
 
+# GR-35 自动重启
+
+
+def restart_options(exe: Path) -> CoreLinkOptions:
+    return CoreLinkOptions(
+        exe,
+        heartbeat_interval=0.05,
+        heartbeat_timeout=0.3,
+        health_interval=0.05,
+        restart=RestartPolicy(backoff=(0.05, 0.1, 0.2), reset_after=60.0),
+    )
+
+
+def test_auto_restart_after_a_crash(core_exe: Path) -> None:
+    async def main() -> None:
+        recorder = Recorder()
+        restarts: list[int] = []
+        link = CoreLink(
+            restart_options(core_exe),
+            on_released=recorder.released,
+            on_health=recorder.on_health,
+            on_restart=restarts.append,
+        )
+        await link.start()
+        async with stopped_at_end(link):
+            await until(lambda: link.healthy)
+            first = link.pid
+            assert first is not None
+            # 崩溃（被强杀，非 0 退出）：自动重启，on_restart 报一次，新实例就绪。
+            kill(first)
+            await until(lambda: restarts == [1])
+            await until(lambda: link.running and link.pid not in (None, first))
+            await until(lambda: link.healthy)
+            # 重启后照常释放（core_start）再接受动作。
+            assert recorder.log.count("released core_start") >= 2
+
+    asyncio.run(main())
+
+
+def test_auto_restart_gives_up_after_the_backoff(core_exe: Path) -> None:
+    async def main() -> None:
+        recorder = Recorder()
+        restarts: list[int] = []
+        link = CoreLink(
+            restart_options(core_exe),  # 退避 3 次
+            on_released=recorder.released,
+            on_restart=restarts.append,
+        )
+        await link.start()
+        async with stopped_at_end(link):
+            # 连杀：每次都在 60 秒内，次数累积；用尽 3 次后不再重启。
+            for attempt in range(1, 4):
+                await until(lambda: link.healthy)
+                pid = link.pid
+                assert pid is not None
+                kill(pid)
+                await until(lambda a=attempt: restarts[-1:] == [a] if restarts else False)
+                await until(lambda: link.running)
+            await until(lambda: link.healthy)
+            pid = link.pid
+            assert pid is not None
+            kill(pid)
+            await until(lambda: not link.running)
+            # 次数用尽：不再重启。
+            await asyncio.sleep(0.6)
+            assert restarts == [1, 2, 3]
+            assert not link.running
+
+    asyncio.run(main())
+
+
+def test_a_clean_stop_does_not_auto_restart(core_exe: Path) -> None:
+    async def main() -> None:
+        restarts: list[int] = []
+        link = CoreLink(restart_options(core_exe), on_restart=restarts.append)
+        await link.start()
+        await until(lambda: link.healthy)
+        # 主进程要求的停止（0 退出）：不自动重启。
+        assert (await link.stop()).returncode == 0
+        await asyncio.sleep(0.4)
+        assert restarts == []
+        assert not link.running
+
+    asyncio.run(main())
+
+
 def test_options_are_checked() -> None:
     with pytest.raises(ValueError, match="必须为正"):
         CoreLinkOptions(Path("core"), heartbeat_interval=0.0)
@@ -363,3 +450,32 @@ def test_options_build_the_command_line() -> None:
         "--max-frame-age-ms",
         "500",
     ]
+
+
+def test_real_input_options_are_gated_and_build_the_command_line() -> None:
+    from game_runtime.channel import session_credentials
+
+    with session_credentials("opt") as operator:
+        # 真实后端须与操作员许可连接一起、不给测试设备。
+        with pytest.raises(ValueError, match="操作员许可连接"):
+            CoreLinkOptions(Path("core"), real_input=True)
+        with pytest.raises(ValueError, match="不能同时给测试设备"):
+            CoreLinkOptions(Path("core"), real_input=True, operator=operator, test_device=operator)
+        # 急停组合键只与真实后端一起给出。
+        with pytest.raises(ValueError, match="急停组合键"):
+            CoreLinkOptions(Path("core"), emergency_hotkey="ctrl+shift+f12")
+        options = CoreLinkOptions(
+            Path("core"),
+            real_input=True,
+            operator=operator,
+            emergency_hotkey="ctrl+alt+end",
+        )
+        assert options.argv()[-4:] == [
+            "--input-backend",
+            "sendinput",
+            "--emergency-hotkey",
+            "ctrl+alt+end",
+        ]
+        # 没给急停组合键时只加后端，交给实时核取缺省。
+        plain = CoreLinkOptions(Path("core"), real_input=True, operator=operator)
+        assert plain.argv()[-2:] == ["--input-backend", "sendinput"]

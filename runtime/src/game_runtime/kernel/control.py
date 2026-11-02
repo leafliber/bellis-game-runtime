@@ -26,7 +26,7 @@ class Submission(Protocol):
         """实时核接受还是拒绝了它。"""
         ...
 
-    async def outcomes(self) -> Mapping[int, models.Executed | models.Dropped]:
+    async def outcomes(self) -> Mapping[int, models.Executed | models.Dropped | models.Uncertain]:
         """等到每个一次性动作都有了结果（`action.receipt`），按动作身份给出。被拒绝的块与没有一次性
         动作的块立即返回空。`executed` 只表示已交给输入后端，不代表游戏中的效果已发生。"""
         ...

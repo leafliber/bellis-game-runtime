@@ -11,7 +11,7 @@ import contextlib
 import json
 import time
 from collections.abc import AsyncGenerator, Callable, Coroutine
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -124,6 +124,15 @@ class FakeCore:
         )
         self.peer.notify("input.released", params.model_dump(mode="json"))
 
+    def residual(self, cause: str, reason: str | None) -> None:
+        params = {
+            "cause": cause,
+            "reason": reason,
+            "items": [{"type": "key", "scan_code": 0x11}],
+            "checked_at_ns": 456,
+        }
+        self.peer.notify("input.residual", params)
+
     async def close(self) -> None:
         await self.peer.close()
 
@@ -216,9 +225,12 @@ async def bench(
     adapter: Adapter | None = None,
     *,
     options: ConsoleOptions | None = None,
+    start_delay: float = 0.0,
 ) -> AsyncGenerator[Bench]:
     clock = ManualClock()
     store = MemorySecretStore()
+    # 缺省不倒数（立即授予），倒数由专门的测试给出 start_delay。
+    options = replace(options or ConsoleOptions(), start_delay=start_delay)
     console = OperatorConsole(
         adapter or synthetic(*TWO_PRECONDITIONS),
         store=store,
@@ -379,11 +391,20 @@ def test_a_refused_renewal_pauses_the_session(data_dir: Path) -> None:
 
 
 def test_a_takeover_release_pauses_and_others_do_not(data_dir: Path) -> None:
-    """接管与急停的原因在 G2 第 2 步才有；这里以注入的原因集合核对转为暂停的规则。"""
+    """本地撤权的原因（接管、急停、注入被拦截、钩子失效）转为暂停；这里以注入的原因集合核对规则。"""
     options = ConsoleOptions(pause_on=frozenset({ReleaseReason.HEARTBEAT_TIMEOUT}))
 
     async def main() -> None:
-        assert frozenset() == PAUSE_ON
+        # 缺省的 PAUSE_ON 是真实后端本地撤权的那几种。
+        expected_pause_on = frozenset(
+            {
+                ReleaseReason.TAKEOVER,
+                ReleaseReason.EMERGENCY_STOP,
+                ReleaseReason.INJECTION_BLOCKED,
+                ReleaseReason.HOOK_LOST,
+            }
+        )
+        assert expected_pause_on == PAUSE_ON
         async with bench(data_dir, options=options) as b:
             core = await connect_core(b.console)
             await until(lambda: True if b.console.core_connected else None)
@@ -403,6 +424,123 @@ def test_a_takeover_release_pauses_and_others_do_not(data_dir: Path) -> None:
         assert [e["reason"] for e in paused] == ["released:heartbeat_timeout"]
         released = [e["reason"] for e in log if e["event"] == "input_released"]
         assert released == ["lease_revoked", "core_start", "heartbeat_timeout"]
+
+    run(main)
+
+
+def test_residual_is_shown_and_logged(data_dir: Path) -> None:
+    async def main() -> None:
+        async with bench(data_dir) as b:
+            core = await connect_core(b.console)
+            await until(lambda: True if b.console.core_connected else None)
+            await b.confirm_all()
+            await b.console.start()
+            await until(lambda: core.grants or None)
+            core.residual("release", "emergency_stop")
+            await until(
+                lambda: next(
+                    (
+                        e
+                        for e in session_events(b.console.log_path or Path())
+                        if e["event"] == "input_residual"
+                    ),
+                    None,
+                )
+            )
+            # 残留不改变状态。
+            assert b.console.state is SessionState.RUNNING
+            await core.close()
+        log = session_events(b.console.log_path or Path())
+        residual = [e for e in log if e["event"] == "input_residual"]
+        assert len(residual) == 1
+        assert residual[0]["cause"] == "release"
+        assert residual[0]["reason"] == "emergency_stop"
+        assert residual[0]["items"] == 1
+
+    run(main)
+
+
+# ---------------------------------------------------------------- 倒数
+
+
+def test_start_counts_down_then_grants(data_dir: Path) -> None:
+    async def main() -> None:
+        async with bench(data_dir, start_delay=3.0) as b:
+            core = await connect_core(b.console)
+            await until(lambda: True if b.console.core_connected else None)
+            await b.confirm_all()
+            await b.console.start()
+            # 倒数中：状态不变，还没授予，没起算时长上限。
+            assert b.console.counting_down
+            assert b.console.state is SessionState.WAITING
+            assert b.console.ends_at_ns is None
+            await asyncio.sleep(0.02)
+            assert core.grants == []
+            # 倒数结束才授予，时长上限从这一刻起算。
+            end = b.clock.now + 3_000 * MS
+            await b.clock.advance(3_000 * MS)
+            await until(lambda: core.grants or None)
+            assert b.console.state is SessionState.RUNNING
+            assert not b.console.counting_down
+            assert b.console.ends_at_ns == end + round(60 * 60 * 1e9)  # max_minutes 默认 60
+            await core.close()
+
+    run(main)
+
+
+def test_pause_and_end_cancel_the_countdown(data_dir: Path) -> None:
+    async def main() -> None:
+        async with bench(data_dir, start_delay=3.0) as b:
+            core = await connect_core(b.console)
+            await until(lambda: True if b.console.core_connected else None)
+            await b.confirm_all()
+            await b.console.start()
+            assert b.console.counting_down
+            # 暂停取消倒数，状态不变（仍 waiting），到时也不授予。
+            await b.console.pause()
+            assert not b.console.counting_down
+            assert b.console.state is SessionState.WAITING
+            await b.clock.advance(3_000 * MS)
+            await asyncio.sleep(0.02)
+            assert core.grants == []
+            # 可以再开始。
+            await b.console.start()
+            assert b.console.counting_down
+            await b.clock.advance(3_000 * MS)
+            await until(lambda: core.grants or None)
+            assert b.console.state is SessionState.RUNNING
+            # end 也取消倒数。
+            await b.console.pause()
+            await until(lambda: True if b.console.state is SessionState.PAUSED else None)
+            await b.console.start()
+            assert b.console.counting_down
+            await b.console.end("operator")
+            assert not b.console.counting_down
+            assert b.console.ended
+            await core.close()
+
+    run(main)
+
+
+def test_a_reconnected_core_while_running_grants_without_a_countdown(data_dir: Path) -> None:
+    async def main() -> None:
+        async with bench(data_dir, start_delay=3.0) as b:
+            core = await connect_core(b.console)
+            await until(lambda: True if b.console.core_connected else None)
+            await b.confirm_all()
+            await b.console.start()
+            await b.clock.advance(3_000 * MS)
+            first = await until(lambda: core.grants[0] if core.grants else None)
+            assert first.token == 1
+            # 实时核重连（重启后的新实例）：立即授予，不再倒数。
+            await core.close()
+            await until(lambda: True if not b.console.core_connected else None)
+            restarted = await connect_core(b.console)
+            fresh = await until(lambda: restarted.grants[0] if restarted.grants else None)
+            assert fresh.token == 2
+            assert not b.console.counting_down
+            assert b.console.state is SessionState.RUNNING
+            await restarted.close()
 
     run(main)
 

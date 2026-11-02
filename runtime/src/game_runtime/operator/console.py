@@ -39,11 +39,13 @@ from pydantic import BaseModel, ValidationError
 
 from core_protocol.methods import (
     OPERATOR_INPUT_RELEASED,
+    OPERATOR_INPUT_RESIDUAL,
     OPERATOR_LEASE_GRANT,
     OPERATOR_LEASE_REVOKE,
 )
 from core_protocol.models import (
     InputReleasedParams,
+    InputResidualParams,
     LeaseGrantParams,
     LeaseRevokeParams,
     ReleaseReason,
@@ -81,9 +83,18 @@ LEASE_TTL_NS: Final = 500_000_000
 """授予与续约时的有效期：现在 + 500 ms（Bellis D-34 的初值）。"""
 RENEW_INTERVAL_NS: Final = 250_000_000
 """续约的间隔：250 ms（Bellis D-34 的初值）。"""
-PAUSE_ON: Final[frozenset[ReleaseReason]] = frozenset()
-"""收到这些原因的 `input.released` 时转为暂停并吊销令牌：真人接管与急停。它们在 G2 第 2 步接真实输入
-后才有，现在为空。"""
+PAUSE_ON: Final[frozenset[ReleaseReason]] = frozenset(
+    {
+        ReleaseReason.TAKEOVER,
+        ReleaseReason.EMERGENCY_STOP,
+        ReleaseReason.INJECTION_BLOCKED,
+        ReleaseReason.HOOK_LOST,
+    }
+)
+"""收到这些原因的 `input.released` 时转为暂停并吊销令牌：真实后端本地撤权的那几种（真人接管、急停、
+注入被拦截、钩子失效）。交还控制只能由操作员按“开始”。"""
+DEFAULT_START_DELAY: Final = 3.0
+"""“开始”先倒数这么久再授予（秒），让操作员把游戏窗口切到前台（维护者 2026-11-02）。"""
 SUPERVISED: Final = "console.supervised-test"
 """最后一条确认项的 id。它不是适配包的前置条件，不进 `operator.session` 的 `confirmed`；id 里的 `.`
 不会与适配包的标识重名。"""
@@ -131,6 +142,8 @@ class EventKind(StrEnum):
 
     SESSION_STARTED = "session_started"
     CONFIRMATION = "confirmation"
+    COUNTDOWN = "countdown"
+    COUNTDOWN_CANCELLED = "countdown_cancelled"
     STARTED = "started"
     RESUMED = "resumed"
     PAUSED = "paused"
@@ -141,6 +154,7 @@ class EventKind(StrEnum):
     DISCONNECTED = "disconnected"
     REJECTED = "rejected"
     INPUT_RELEASED = "input_released"
+    INPUT_RESIDUAL = "input_residual"
     DECISION_OPENED = "decision_opened"
     DECISION_CHOSEN = "decision_chosen"
     DECISION_CLOSED = "decision_closed"
@@ -171,6 +185,8 @@ class ConsoleOptions:
     renew_interval_ns: int = RENEW_INTERVAL_NS
     rpc_timeout: float = 2.0
     pause_on: frozenset[ReleaseReason] = PAUSE_ON
+    start_delay: float = DEFAULT_START_DELAY
+    """“开始”先倒数这么久再授予（秒），0 即立即授予。倒数中 `pause`、`end` 或会话结束即取消。"""
 
     def __post_init__(self) -> None:
         if not self.max_minutes > 0:
@@ -179,6 +195,8 @@ class ConsoleOptions:
             raise ValueError("续约间隔须为正，且短于有效期")
         if self.rpc_timeout <= 0:
             raise ValueError("请求的时限须为正")
+        if self.start_delay < 0:
+            raise ValueError("倒数时长不能为负")
 
 
 def sessions_dir(data_dir: Path, adapter_id: str) -> Path:
@@ -277,6 +295,8 @@ class OperatorConsole:
         self._resolved: dict[str, int] = {}
         self._lease_task: asyncio.Task[None] | None = None
         self._cap_task: asyncio.Task[None] | None = None
+        self._countdown: asyncio.Task[None] | None = None
+        """“开始”的倒数任务；倒数中 `pause`、`end` 或会话结束即取消。"""
         self._background: set[asyncio.Task[None]] = set()
         self._server: ChannelServer | None = None
         self._credentials: ChannelCredentials | None = None
@@ -429,7 +449,7 @@ class OperatorConsole:
 
     async def _teardown(self) -> None:
         self._stop_lease()
-        for task in (self._cap_task, *self._background):
+        for task in (self._cap_task, self._countdown, *self._background):
             if task is not None:
                 task.cancel()
         for peer in (self._core, self._main):
@@ -465,8 +485,14 @@ class OperatorConsole:
         if item.precondition:
             self._publish()
 
+    @property
+    def counting_down(self) -> bool:
+        """“开始”正在倒数（还没授予）。"""
+        return self._countdown is not None
+
     async def start(self) -> None:
-        """开始或继续：换发新令牌并开始续约。第一次开始时起算时长上限。"""
+        """开始或继续：先倒数 `start_delay` 秒再换发令牌并授予（见[许可]）。倒数在后台进行，期间
+        `pause`、`end` 可取消，状态不变；倒数结束才进入 `running`、第一次开始起算时长上限。"""
         async with self._transition:
             match self._state:
                 case SessionState.ENDED:
@@ -477,21 +503,58 @@ class OperatorConsole:
                     raise ConsoleError("还有确认项没有回答")
                 case _:
                     pass
-            first = self._state is SessionState.WAITING
-            if first:
-                self._ends_at_ns = self._clock.now_ns() + round(self.options.max_minutes * 60e9)
-                self._cap_task = asyncio.get_running_loop().create_task(
-                    self._time_cap(self._ends_at_ns)
-                )
-            self._state = SessionState.RUNNING
-            self._emit(
-                EventKind.STARTED if first else EventKind.RESUMED, ends_at_ns=self._ends_at_ns
+            if self._countdown is not None:
+                raise ConsoleError("正在倒数")
+            delay = self.options.start_delay
+            if delay <= 0:
+                # 不倒数：立即授予。
+                self._grant_running()
+                return
+            self._emit(EventKind.COUNTDOWN, seconds=delay)
+            # 在这里（而不是任务里）定下到期时刻，不受任务何时开跑影响。
+            deadline = self._clock.now_ns() + round(delay * 1e9)
+            self._countdown = asyncio.get_running_loop().create_task(self._count_down(deadline))
+
+    async def _count_down(self, deadline_ns: int) -> None:
+        """倒数到 `deadline_ns` 后授予；被取消即不授予，状态不变。"""
+        try:
+            await self._clock.sleep_until(deadline_ns)
+        except asyncio.CancelledError:
+            return
+        async with self._transition:
+            if self._countdown is not asyncio.current_task():
+                return
+            self._countdown = None
+            if self._state in (SessionState.WAITING, SessionState.PAUSED):
+                self._grant_running()
+
+    def _grant_running(self) -> None:
+        """进入 `running` 并授予：第一次开始起算时长上限。调用方须持有 `_transition`。"""
+        first = self._ends_at_ns is None
+        if first:
+            self._ends_at_ns = self._clock.now_ns() + round(self.options.max_minutes * 60e9)
+            self._cap_task = asyncio.get_running_loop().create_task(
+                self._time_cap(self._ends_at_ns)
             )
-            self._publish()
-            self._begin_lease()
+        self._state = SessionState.RUNNING
+        self._emit(EventKind.STARTED if first else EventKind.RESUMED, ends_at_ns=self._ends_at_ns)
+        self._publish()
+        self._begin_lease()
+
+    def _cancel_countdown(self) -> bool:
+        """取消正在进行的倒数（`pause`、`end` 或会话结束）；返回是否取消了一个。"""
+        countdown, self._countdown = self._countdown, None
+        if countdown is not None and countdown is not asyncio.current_task():
+            countdown.cancel()
+            return True
+        return countdown is not None
 
     async def pause(self) -> None:
-        """暂停：吊销当前令牌。"""
+        """暂停：吊销当前令牌；倒数中即取消倒数（状态不变）。"""
+        if self._countdown is not None:
+            self._cancel_countdown()
+            self._emit(EventKind.COUNTDOWN_CANCELLED, reason="operator")
+            return
         if self._state is not SessionState.RUNNING:
             raise ConsoleError("没有在运行")
         await self._pause("operator")
@@ -533,6 +596,7 @@ class OperatorConsole:
         async with self._transition:
             if self.ended:
                 return
+            self._cancel_countdown()
             running = self._state is SessionState.RUNNING
             self._stop_lease()
             self._state = SessionState.ENDED
@@ -658,6 +722,9 @@ class OperatorConsole:
         peer.on_notification(
             OPERATOR_INPUT_RELEASED.name, lambda params: self._on_released(peer, params)
         )
+        peer.on_notification(
+            OPERATOR_INPUT_RESIDUAL.name, lambda params: self._on_residual(peer, params)
+        )
         self._core = peer
         peer.closed.add_done_callback(lambda _: self._detach_core(peer))
         self._emit(EventKind.CONNECTED, role="core")
@@ -715,8 +782,22 @@ class OperatorConsole:
             return
         self._emit(EventKind.INPUT_RELEASED, **_dump(released))
         if released.reason in self.options.pause_on and self._state is SessionState.RUNNING:
-            # 真人接管或急停：交还控制只能由操作员按“开始”。
+            # 真人接管、急停、注入被拦截或钩子失效：交还控制只能由操作员按“开始”。
             self._spawn(self._pause(f"released:{released.reason.value}"))
+
+    def _on_residual(self, peer: RpcPeer, params: dict[str, Any]) -> None:
+        if self._core is not peer:
+            return
+        residual = _parse(InputResidualParams, OPERATOR_INPUT_RESIDUAL.name, params)
+        if residual is None:
+            return
+        # 残留只显示并记入会话记录，不改变状态。
+        self._emit(
+            EventKind.INPUT_RESIDUAL,
+            cause=residual.cause.value,
+            reason=None if residual.reason is None else residual.reason.value,
+            items=len(residual.items),
+        )
 
     def _on_decision_opened(self, peer: RpcPeer, params: dict[str, Any]) -> None:
         if self._main is not peer:

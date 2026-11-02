@@ -13,6 +13,7 @@
 
 import asyncio
 import contextlib
+import dataclasses
 import sys
 import threading
 import time
@@ -172,6 +173,9 @@ class Rig:
     released: list[models.InputReleasedParams] = field(
         default_factory=list[models.InputReleasedParams]
     )
+    residuals: list[models.InputResidualParams] = field(
+        default_factory=list[models.InputResidualParams]
+    )
     health: list[models.CoreHealthParams] = field(default_factory=list[models.CoreHealthParams])
     action_ids: int = 0
 
@@ -220,7 +224,7 @@ class Rig:
         assert isinstance(submission.result, models.Accepted), submission.result
         await self.device.until(lambda d: True if ("key", scan_code) in d.held else None)
 
-    async def press(self) -> models.Executed | models.Dropped:
+    async def press(self) -> models.Executed | models.Dropped | models.Uncertain:
         action = self.next_id()
         submission = await self.submit(step(actions=[key_press(action, ENTER)]))
         assert isinstance(submission.result, models.Accepted), submission.result
@@ -269,11 +273,14 @@ async def rig(
     size: tuple[int, int] = (64, 48),
     source: FrameSource | None = None,
     on_event: Callable[[DeviceEvent], None] | None = None,
+    input_policy: models.InputPolicy | None = None,
 ) -> AsyncGenerator[Rig]:
     """拉起一套联调环境：控制台已打开、在等确认；主进程连上了操作员连接；实时核连上了控制台、测试设备与
     主进程，帧在流入帧环，产出者 step 代次 1 在发心跳。"""
     width, height = size
     store = MemorySecretStore()
+    # 联调测试不测倒数（倒数在 test_console 里单测）：立即授予。
+    options = dataclasses.replace(options or ConsoleOptions(), start_delay=0.0)
     console = OperatorConsole(adapter(), store=store, data_dir=data_dir, options=options)
     holder: list[Rig] = []
     console.add_listener(lambda event: holder[0].console_events.append(event) if holder else None)
@@ -301,9 +308,11 @@ async def rig(
                         ),
                         test_device=device.credentials,
                         operator=client.credentials,
+                        input_policy=input_policy,
                     ),
                     on_released=lambda r: holder[0].released.append(r),
                     on_health=lambda h: holder[0].health.append(h),
+                    on_residual=lambda r: holder[0].residuals.append(r),
                 )
                 grant = ControlGrant("step", "step#1", 1, lambda: True, link.submit)
                 current = Rig(console, client, link, device, display, presenter, grant)
@@ -668,6 +677,71 @@ def test_a_scripted_producer_advances_the_dialogue_only_while_running(
             actions = [e for e in r.console_events if e.kind is EventKind.ACTION]
             assert actions
             assert {e.fields["category"] for e in actions} <= {"navigate", "advance"}
+            assert r.device.anomalies == []
+
+    asyncio.run(main())
+
+
+# ---------------------------------------------------------------- 输入策略
+
+
+def norm_rect(left: float, top: float, right: float, bottom: float) -> models.NormRect:
+    return models.NormRect(left=left, top=top, right=right, bottom=bottom)
+
+
+def policy_for_tests() -> models.InputPolicy:
+    """只允许左键点击与短按回车、滚动，落点限客户区左上 1/4，按住 50 ms。"""
+    return models.InputPolicy.model_validate(
+        {
+            "click_buttons": ["left"],
+            "press_keys": [ENTER],
+            "scroll": True,
+            "click_regions": [norm_rect(0.0, 0.0, 0.5, 0.5).model_dump()],
+            "forbidden_zones": [],
+            "press_duration_ms": 50,
+            "max_rate": 10.0,
+            "hold_keys": [W],
+            "hold_buttons": [],
+            "max_hold_ms": 2000,
+        }
+    )
+
+
+def test_input_policy_is_enforced_through_the_real_core(core_exe: Path, data_dir: Path) -> None:
+    """主进程经 input.configure 交出输入策略，真实的实时核据它把关：提交时核对白名单，执行时核对
+    落点。假后端上没有残留（input.residual 只在真实后端）。"""
+
+    async def main() -> None:
+        async with rig(core_exe, data_dir, size=(100, 100), input_policy=policy_for_tests()) as r:
+            await r.confirm_and_start()
+            # 白名单外的键（右键点击的身份不在策略里）：提交即整块拒绝 not_allowed。
+            right = models.Action(
+                root=models.Click(id=r.next_id(), x=10, y=10, button=models.MouseButton.RIGHT)
+            )
+            submission = await r.submit(step(actions=[right]))
+            assert isinstance(submission.result, models.Rejected)
+            assert submission.result.reason is models.RejectReason.NOT_ALLOWED
+
+            # 落点在允许区外（右下）：执行时丢弃 not_allowed，不释放。
+            far = click_at(r.next_id(), 90, 90)
+            submission = await r.submit(step(actions=[far]))
+            assert isinstance(submission.result, models.Accepted), submission.result
+            outcome = (await asyncio.wait_for(submission.outcomes(), WAIT))[far.root.id]
+            assert outcome == models.Dropped(id=far.root.id, reason=models.DropReason.NOT_ALLOWED)
+
+            # 落点在允许区内：执行（假后端上点击作瞬时按住，先发 mouse_down）。
+            near = click_at(r.next_id(), 10, 10)
+            submission = await r.submit(step(actions=[near]))
+            assert isinstance(submission.result, models.Accepted), submission.result
+            got = (await asyncio.wait_for(submission.outcomes(), WAIT))[near.root.id]
+            assert isinstance(got, models.Executed)
+            await r.device.until(
+                lambda d: next(
+                    (True for e in d.events() if isinstance(e.event, models.FakeMouseDown)), None
+                )
+            )
+            # 假后端不做 GetAsyncKeyState 核验：没有 input.residual。
+            assert r.residuals == []
             assert r.device.anomalies == []
 
     asyncio.run(main())

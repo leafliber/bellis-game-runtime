@@ -16,6 +16,7 @@ from game_runtime.operator.client import (
 )
 from game_runtime.operator.console import (
     DEFAULT_MAX_MINUTES,
+    DEFAULT_START_DELAY,
     LEASE_TTL_NS,
     MAIN_ROLE,
     PAUSE_ON,
@@ -36,6 +37,7 @@ from game_runtime.operator.messages import SessionState
 
 __all__ = [
     "DEFAULT_MAX_MINUTES",
+    "DEFAULT_START_DELAY",
     "LEASE_TTL_NS",
     "MAIN_ROLE",
     "PAUSE_ON",

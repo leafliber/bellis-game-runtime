@@ -45,7 +45,9 @@ from core_protocol.methods import (
     CORE_HELLO,
     CORE_STOP,
     FRAME_RING_ATTACH,
+    INPUT_CONFIGURE,
     INPUT_RELEASED,
+    INPUT_RESIDUAL,
     PRODUCER_HEARTBEAT,
     PRODUCER_REVOKE,
     PROTOCOL_VERSION,
@@ -55,7 +57,9 @@ from core_protocol.models import (
     CoreHealthParams,
     CoreHelloParams,
     CoreHelloResult,
+    InputPolicy,
     InputReleasedParams,
+    InputResidualParams,
     Producer,
     ProducerHeartbeatParams,
     ProducerRevokeParams,
@@ -100,6 +104,28 @@ class CoreStartError(RuntimeError):
     """实时核没能就绪：启动失败、握手失败、就绪前退出或超时。"""
 
 
+DEFAULT_RESTART_BACKOFF: tuple[float, ...] = (1.0, 2.0, 4.0)
+"""GR-35 自动重启的退避（秒），至多这么多次。"""
+DEFAULT_RESTART_RESET: float = 60.0
+"""就绪后连续运行满这么久，重启次数清零（秒）。"""
+
+
+@dataclass(frozen=True, slots=True)
+class RestartPolicy:
+    """GR-35 崩溃后的自动重启。非 0 退出（panic、被强杀、运行中失败）后按 `backoff` 退避重启，至多
+    `len(backoff)` 次；就绪后连续运行满 `reset_after` 秒，次数清零。主进程要求的停止、0 退出与
+    参数不合法（2）不重启。"""
+
+    backoff: tuple[float, ...] = DEFAULT_RESTART_BACKOFF
+    reset_after: float = DEFAULT_RESTART_RESET
+
+    def __post_init__(self) -> None:
+        if not self.backoff or any(delay < 0 for delay in self.backoff):
+            raise ValueError("退避须非空且非负")
+        if self.reset_after <= 0:
+            raise ValueError("清零时长须为正")
+
+
 @dataclass(frozen=True, slots=True)
 class CoreLinkOptions:
     """核连接的配置，时限单位为秒。缺省值的依据见模块文档。"""
@@ -132,8 +158,18 @@ class CoreLinkOptions:
     None。"""
     operator: ChannelCredentials | None = None
     """操作员控制台本次会话的地址与密钥（`game_runtime.operator.OperatorClient.credentials`）。给出
-    时实时核连到控制台，许可只来自它。实时核须有输入后端，否则以参数不合法退出：真实后端在 G2 第 2
-    步，现在只能与 `test_device` 一起用。"""
+    时实时核连到控制台，许可只来自它。实时核须有输入后端，否则以参数不合法退出。"""
+    real_input: bool = False
+    """真实输入后端（SendInput）。为真时另加 `--input-backend sendinput` 与 `--emergency-hotkey`，
+    须同时给出 `operator`、不给 `test_device`，否则构造时报错（门禁同实时核）。只在 Windows 上。"""
+    emergency_hotkey: str | None = None
+    """急停组合键（如 `ctrl+shift+f12`、`ctrl+alt+end`）；只在 `real_input` 为真时交给实时核。
+    缺省由实时核取 Ctrl+Shift+F12。"""
+    input_policy: InputPolicy | None = None
+    """输入策略（动作白名单与静态禁区），在设定采集目标之后、第一次心跳之前以 `input.configure`
+    交出，重启的实例也再交一次。`None` 时不交（假后端的测试照旧不限制）。"""
+    restart: RestartPolicy | None = None
+    """GR-35 自动重启；`None` 时不自动重启（宿主自己 `start`）。"""
 
     def __post_init__(self) -> None:
         timeouts = (
@@ -151,6 +187,13 @@ class CoreLinkOptions:
             raise ValueError("心跳超时须大于心跳周期")
         if self.health_timeout <= self.health_interval:
             raise ValueError("健康超时须大于健康周期")
+        if self.real_input:
+            if self.operator is None:
+                raise ValueError("真实输入后端须与操作员许可连接一起给出")
+            if self.test_device is not None:
+                raise ValueError("真实输入后端不能同时给测试设备的凭据")
+        elif self.emergency_hotkey is not None:
+            raise ValueError("急停组合键只与真实输入后端一起给出")
 
     def argv(self) -> list[str]:
         """拉起实时核的参数列表。"""
@@ -163,7 +206,11 @@ class CoreLinkOptions:
             "--max-frame-age-ms",
             str(_millis(self.max_frame_age)),
         ]
-        if self.test_device is not None:
+        if self.real_input:
+            argv += ["--input-backend", "sendinput"]
+            if self.emergency_hotkey is not None:
+                argv += ["--emergency-hotkey", self.emergency_hotkey]
+        elif self.test_device is not None:
             argv += ["--input-backend", "fake"]
         return argv
 
@@ -196,7 +243,7 @@ class _Submission:
         self._expected: set[int] = {
             action.root.id for step in block.steps for action in step.actions
         }
-        self._outcomes: dict[int, models.Executed | models.Dropped] = {}
+        self._outcomes: dict[int, models.Executed | models.Dropped | models.Uncertain] = {}
         self._result: models.Accepted | models.Rejected | None = None
         self._done = done
 
@@ -206,7 +253,7 @@ class _Submission:
             raise RuntimeError("还没有收到 action.submit 的回应")
         return self._result
 
-    async def outcomes(self) -> Mapping[int, models.Executed | models.Dropped]:
+    async def outcomes(self) -> Mapping[int, models.Executed | models.Dropped | models.Uncertain]:
         await asyncio.shield(self._done)
         return dict(self._outcomes)
 
@@ -255,6 +302,8 @@ class _Instance:
     peer: RpcPeer | None = None
     hello_at_ns: int | None = None
     """接受 `core.hello`、回应之前的 `time.perf_counter_ns()`。"""
+    ready_at_ns: int | None = None
+    """收到 `input.released(core_start)`、实例就绪的 `time.perf_counter_ns()`；用于自动重启清零。"""
     tasks: list[asyncio.Task[None]] = field(default_factory=list[asyncio.Task[None]])
     closing: asyncio.Task[None] | None = None
 
@@ -273,14 +322,23 @@ class CoreLink:
         *,
         on_released: Callable[[InputReleasedParams], None] | None = None,
         on_health: Callable[[CoreHealthParams], None] | None = None,
+        on_residual: Callable[[InputResidualParams], None] | None = None,
+        on_restart: Callable[[int], None] | None = None,
     ) -> None:
         self._options = options
         self._on_released = on_released
         self._on_health = on_health
+        self._on_residual = on_residual
+        self._on_restart = on_restart
         self._grant_source: Callable[[], ControlGrant | None] | None = None
         self._instance: _Instance | None = None
         self._instances = 0
         self._clean = True
+        self._stopping = False
+        """`stop` 已被调用：此后不自动重启。"""
+        self._restart_attempt = 0
+        """连续重启的次数，就绪满 `reset_after` 秒后清零。"""
+        self._restart_task: asyncio.Task[None] | None = None
         self._released: dict[int, asyncio.Future[None]] = {}
         self._heartbeat_seq = 0
         self._heartbeat_generation: int | None = None
@@ -364,6 +422,8 @@ class CoreLink:
         # 上一个实例退出之后 `_instance` 才清空：帧环同一时刻只挂接给一个实时核。
         if self._instance is not None:
             raise RuntimeError("实时核已在运行")
+        # 新的一次启动：再次打开自动重启（上次 stop 关掉了它）。
+        self._stopping = False
         capture = self._options.capture
         if capture is not None and self._frames is None:
             self._frames = FrameRing.create(
@@ -459,16 +519,34 @@ class CoreLink:
                 raise CoreStartError(
                     f"实时核 {number} 没有接受音频环或音频目标：{error}"
                 ) from error
+        if self._options.input_policy is not None:
+            try:
+                await self._configure_input(instance, self._options.input_policy)
+            except (ChannelError, RpcError) as error:
+                await self._stop_instance(instance)
+                raise CoreStartError(f"实时核 {number} 没有接受输入策略：{error}") from error
         instance.tasks.append(loop.create_task(self._send_heartbeats(instance)))
         instance.tasks.append(loop.create_task(self._watch_health(instance)))
+
+    async def _configure_input(self, instance: _Instance, policy: InputPolicy) -> None:
+        """在设定采集目标之后、第一次心跳之前交出输入策略（`input.configure`）。"""
+        peer = instance.peer
+        if peer is None or not peer.connection.is_open:
+            raise ChannelError("closed", "核连接未建立")
+        await peer.request(INPUT_CONFIGURE.name, _dump(policy), timeout=self._options.rpc_timeout)
+        logger.info("实时核 %d 已接受输入策略", instance.number)
 
     async def stop(self) -> StopResult:
         """按 R-06 的顺序停止实时核：`core.stop` → 关 stdin → 强制终止；
         实时核退出后销毁帧环与音频环。
 
         没有在运行时返回上次的退出码。强制终止后仍未确认退出时保留两个环。返回时已退出实例的连接、
-        监听与凭据都已关闭。
+        监听与凭据都已关闭。此后不再自动重启。
         """
+        self._stopping = True
+        if self._restart_task is not None:
+            self._restart_task.cancel()
+            self._restart_task = None
         instance = self._instance
         if instance is None:
             if self._exited is not None:
@@ -686,6 +764,9 @@ class CoreLink:
         )
         peer.on_notification(CORE_HEALTH.name, lambda params: self._on_health_message(params))
         peer.on_notification(ACTION_RECEIPT.name, self._on_receipt_message)
+        peer.on_notification(
+            INPUT_RESIDUAL.name, lambda params: self._on_residual_message(instance, params)
+        )
         instance.peer = peer
         peer.closed.add_done_callback(
             lambda _: logger.info("实时核 %d 的核连接已断开", instance.number)
@@ -732,8 +813,22 @@ class CoreLink:
             self._release_through(None)
             if not instance.ready.done():
                 instance.ready.set_result(None)
+                instance.ready_at_ns = time.perf_counter_ns()
         if self._on_released is not None:
             self._on_released(released)
+
+    def _on_residual_message(self, instance: _Instance, params: dict[str, Any]) -> None:
+        residual = _parse(InputResidualParams, INPUT_RESIDUAL.name, params)
+        if residual is None or instance.hello_at_ns is None:
+            return
+        logger.info(
+            "实时核 %d 核验出残留（%s）：%d 项仍按住，已补发抬起",
+            instance.number,
+            residual.cause,
+            len(residual.items),
+        )
+        if self._on_residual is not None:
+            self._on_residual(residual)
 
     def _on_health_message(self, params: dict[str, Any]) -> None:
         health = _parse(CoreHealthParams, CORE_HEALTH.name, params)
@@ -799,9 +894,60 @@ class CoreLink:
             self._last_health_at_ns = None
             self._heartbeat_generation = None
             self._fail_submissions(ChannelError("closed", f"实时核 {instance.number} 已退出"))
+            self._maybe_restart(instance, returncode)
         for task in instance.tasks:
             task.cancel()
         instance.closing = asyncio.get_running_loop().create_task(self._close(instance))
+
+    def _maybe_restart(self, instance: _Instance, returncode: int) -> None:
+        """GR-35：非 0 退出且不是主进程要求的停止、参数不合法（2）时，按退避自动重启。就绪后连续运行
+        满 `reset_after` 秒即先清零重启次数。"""
+        policy = self._options.restart
+        if policy is None or self._stopping or returncode in (0, 2):
+            return
+        # 就绪后运行够久即清零。
+        if instance.ready_at_ns is not None:
+            ran = time.perf_counter_ns() - instance.ready_at_ns
+            if ran >= policy.reset_after * 1e9:
+                self._restart_attempt = 0
+        if self._restart_attempt >= len(policy.backoff):
+            logger.error(
+                "实时核 %d 非 0 退出（%d），重启已用尽 %d 次，停止并上报",
+                instance.number,
+                returncode,
+                len(policy.backoff),
+            )
+            return
+        delay = policy.backoff[self._restart_attempt]
+        self._restart_attempt += 1
+        attempt = self._restart_attempt
+        logger.warning(
+            "实时核 %d 非 0 退出（%d），%g 秒后第 %d 次重启",
+            instance.number,
+            returncode,
+            delay,
+            attempt,
+        )
+        self._restart_task = asyncio.get_running_loop().create_task(self._restart(delay, attempt))
+
+    async def _restart(self, delay: float, attempt: int) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if self._stopping or self._instance is not None:
+            return
+        if self._on_restart is not None:
+            try:
+                self._on_restart(attempt)
+            except Exception:
+                logger.exception("on_restart 出错")
+        try:
+            await self.start()
+        except CoreStartError as error:
+            # 这次没起来：由退出回调接着排下一次退避（起失败时实例已终止，回调会触发
+            # _maybe_restart）；起不了线程等其它情形直接上报。
+            logger.warning("自动重启第 %d 次失败：%s", attempt, error)
 
     async def _close(self, instance: _Instance) -> None:
         if instance.peer is not None:
