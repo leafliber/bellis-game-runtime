@@ -43,8 +43,9 @@ WAIT = 5.0
 
 
 def link_options(exe: Path) -> CoreLinkOptions:
+    # 这些测试自己杀掉、自己重启实时核：关掉自动重启（它在下文的 GR-35 测试里单测）。
     return CoreLinkOptions(
-        exe, heartbeat_interval=0.05, heartbeat_timeout=0.3, health_interval=0.05
+        exe, heartbeat_interval=0.05, heartbeat_timeout=0.3, health_interval=0.05, restart=None
     )
 
 
@@ -428,6 +429,13 @@ def test_a_clean_stop_does_not_auto_restart(core_exe: Path) -> None:
         assert not link.running
 
     asyncio.run(main())
+
+
+def test_auto_restart_is_on_by_default() -> None:
+    """GR-35 的自动重启缺省开着：退避 1、2、4 秒，就绪满 60 秒清零。"""
+    assert CoreLinkOptions(Path("core")).restart == RestartPolicy(
+        backoff=(1.0, 2.0, 4.0), reset_after=60.0
+    )
 
 
 def test_options_are_checked() -> None:

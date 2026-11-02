@@ -43,6 +43,7 @@ def link_options(exe: Path, capture: CaptureConfig) -> CoreLinkOptions:
         heartbeat_timeout=0.3,
         health_interval=0.05,
         capture=capture,
+        restart=None,  # 杀掉后由测试自己重启
     )
 
 

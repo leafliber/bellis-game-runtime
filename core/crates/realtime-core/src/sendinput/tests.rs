@@ -527,3 +527,35 @@ fn released_all_and_configured_request_verification() {
     assert_eq!(request.reason, None);
     let _ = Arc::clone(&win32);
 }
+
+// ---------------------------------------------------------------- 采集目标
+
+#[test]
+fn the_real_backend_refuses_a_fake_display_target() {
+    use core_protocol::messages::{CaptureTarget, FakeTarget, FrameRingAttachParams, WindowTarget};
+
+    let fake = CaptureTarget::Fake(FakeTarget {
+        surface: FrameRingAttachParams {
+            name: "x".into(),
+            size_bytes: 0,
+            layout_version: 1,
+            slot_count: 2,
+            slot_stride: 0,
+            max_width: 1,
+            max_height: 1,
+        },
+    });
+    let window = CaptureTarget::Window(WindowTarget {
+        process_name: "game.exe".into(),
+        window_class: None,
+        title: Some("Game".into()),
+    });
+    // 真实后端：假显示面没有可注入的窗口（回 -32003），窗口目标照常。
+    let real = super::TargetWindow::new(true);
+    assert!(!real.accepts(&fake));
+    assert!(real.accepts(&window));
+    // 没有真实后端时两种都接受。
+    let other = super::TargetWindow::new(false);
+    assert!(other.accepts(&fake));
+    assert!(other.accepts(&window));
+}

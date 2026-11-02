@@ -29,9 +29,24 @@ use crate::ledger::{Inject, InputBackend, Momentary};
 #[derive(Default)]
 pub(crate) struct TargetWindow {
     selector: Mutex<Option<WindowSelector>>,
+    /// 以真实后端运行：注入要有窗口，`capture.set_target` 的假显示面回 -32003。
+    real: bool,
 }
 
 impl TargetWindow {
+    /// `real` 为真表示以真实后端运行。
+    pub(crate) fn new(real: bool) -> Self {
+        Self {
+            selector: Mutex::new(None),
+            real,
+        }
+    }
+
+    /// 以真实后端运行时采集目标必须是窗口：假显示面没有可注入的窗口。
+    pub(crate) fn accepts(&self, target: &core_protocol::messages::CaptureTarget) -> bool {
+        !(self.real && matches!(target, core_protocol::messages::CaptureTarget::Fake(_)))
+    }
+
     /// 设定当前目标窗口的识别规则；`None` 表示没有窗口（假显示面）。
     pub(crate) fn set(&self, selector: Option<WindowSelector>) {
         if let Ok(mut held) = self.selector.lock() {

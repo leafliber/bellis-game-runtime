@@ -168,8 +168,9 @@ class CoreLinkOptions:
     input_policy: InputPolicy | None = None
     """输入策略（动作白名单与静态禁区），在设定采集目标之后、第一次心跳之前以 `input.configure`
     交出，重启的实例也再交一次。`None` 时不交（假后端的测试照旧不限制）。"""
-    restart: RestartPolicy | None = None
-    """GR-35 自动重启；`None` 时不自动重启（宿主自己 `start`）。"""
+    restart: RestartPolicy | None = field(default_factory=RestartPolicy)
+    """GR-35 自动重启，缺省退避 1、2、4 秒；`None` 时不自动重启（宿主自己 `start`，只用于自己驱动
+    重启的测试）。"""
 
     def __post_init__(self) -> None:
         timeouts = (
@@ -900,34 +901,30 @@ class CoreLink:
         instance.closing = asyncio.get_running_loop().create_task(self._close(instance))
 
     def _maybe_restart(self, instance: _Instance, returncode: int) -> None:
-        """GR-35：非 0 退出且不是主进程要求的停止、参数不合法（2）时，按退避自动重启。就绪后连续运行
-        满 `reset_after` 秒即先清零重启次数。"""
+        """GR-35：运行中（已就绪）的实例非 0 退出，且不是主进程要求的停止、参数不合法（2）时，按退避
+        自动重启。就绪后连续运行满 `reset_after` 秒即先清零重启次数。就绪之前的失败由 `start` 以
+        `CoreStartError` 交给调用方，不在这里重启。"""
         policy = self._options.restart
         if policy is None or self._stopping or returncode in (0, 2):
             return
-        # 就绪后运行够久即清零。
-        if instance.ready_at_ns is not None:
-            ran = time.perf_counter_ns() - instance.ready_at_ns
-            if ran >= policy.reset_after * 1e9:
-                self._restart_attempt = 0
+        if instance.ready_at_ns is None:
+            return
+        if time.perf_counter_ns() - instance.ready_at_ns >= policy.reset_after * 1e9:
+            self._restart_attempt = 0
+        self._schedule_restart(f"实时核 {instance.number} 非 0 退出（{returncode}）")
+
+    def _schedule_restart(self, why: str) -> None:
+        """按下一档退避排一次重启；次数用尽即停止并上报。"""
+        policy = self._options.restart
+        if policy is None:
+            return
         if self._restart_attempt >= len(policy.backoff):
-            logger.error(
-                "实时核 %d 非 0 退出（%d），重启已用尽 %d 次，停止并上报",
-                instance.number,
-                returncode,
-                len(policy.backoff),
-            )
+            logger.error("%s，自动重启已用尽 %d 次，停止并上报", why, len(policy.backoff))
             return
         delay = policy.backoff[self._restart_attempt]
         self._restart_attempt += 1
         attempt = self._restart_attempt
-        logger.warning(
-            "实时核 %d 非 0 退出（%d），%g 秒后第 %d 次重启",
-            instance.number,
-            returncode,
-            delay,
-            attempt,
-        )
+        logger.warning("%s，%g 秒后第 %d 次自动重启", why, delay, attempt)
         self._restart_task = asyncio.get_running_loop().create_task(self._restart(delay, attempt))
 
     async def _restart(self, delay: float, attempt: int) -> None:
@@ -945,9 +942,10 @@ class CoreLink:
         try:
             await self.start()
         except CoreStartError as error:
-            # 这次没起来：由退出回调接着排下一次退避（起失败时实例已终止，回调会触发
-            # _maybe_restart）；起不了线程等其它情形直接上报。
-            logger.warning("自动重启第 %d 次失败：%s", attempt, error)
+            # 这次没能就绪：接着排下一档退避（就绪前的失败不经 _maybe_restart）。期间已另排了一次
+            # （例如就绪后又被杀）时不重复。
+            if not self._stopping and self._restart_task is asyncio.current_task():
+                self._schedule_restart(f"自动重启第 {attempt} 次没能就绪：{error}")
 
     async def _close(self, instance: _Instance) -> None:
         if instance.peer is not None:

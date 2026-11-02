@@ -290,6 +290,7 @@ def link_options(
             target=display.target, max_width=surface.max_width, max_height=surface.max_height
         ),
         test_device=None if device is None else device.credentials,
+        restart=None,  # 杀掉后由测试自己重启
     )
 
 

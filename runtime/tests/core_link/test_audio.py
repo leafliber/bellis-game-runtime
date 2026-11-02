@@ -56,6 +56,7 @@ def link_options(exe: Path, audio: AudioConfig) -> CoreLinkOptions:
         heartbeat_timeout=0.3,
         health_interval=0.05,
         audio=audio,
+        restart=None,  # 杀掉后由测试自己重启
     )
 
 
