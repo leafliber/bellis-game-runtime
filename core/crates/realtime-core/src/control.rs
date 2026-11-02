@@ -67,6 +67,10 @@ pub(crate) enum Notice {
     Released(InputReleasedParams),
     Receipt(ActionReceiptParams),
     /// 真实后端核验出的残留（也发往操作员控制台），见 `docs/modules/realtime-core.md`。
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "只由 Windows 上真实后端的核验线程构造")
+    )]
     Residual(InputResidualParams),
 }
 
@@ -1041,6 +1045,10 @@ impl Control {
 
     /// 真实后端的本地撤权：接管、急停、钩子失效。吊销当前令牌并释放全部输入，许可源须换发更大的令牌。
     /// 由钩子线程调用，通知经发送队列发出，不阻塞回调。
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "只由 Windows 上真实后端的钩子线程调用")
+    )]
     pub(crate) fn local_revoke(&self, reason: ReleaseReason) -> Notices {
         let mut state = self.lock();
         let mut notices = Notices::default();
@@ -1053,6 +1061,10 @@ impl Control {
     }
 
     /// 许可现在是否有效：钩子据此判断是否算接管（许可无效时没有可接管的输入）。
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "只由 Windows 上真实后端的钩子线程调用")
+    )]
     pub(crate) fn lease_valid(&self) -> bool {
         self.lock().lease.check(mono_clock::now_ns()).is_ok()
     }
