@@ -93,7 +93,7 @@ if sys.platform == "win32":
 
     _HOOKPROC = ctypes.CFUNCTYPE(wintypes.LPARAM, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 
-    class TestHook:
+    class UpHook:
         """本进程的低层键盘钩子：记下看到 W 抬起的时刻，供量释放时延。在自己的线程上跑消息循环。"""
 
         def __init__(self) -> None:
@@ -177,7 +177,7 @@ if sys.platform == "win32":
     def async_down(vk: int) -> bool:
         return bool(_user32.GetAsyncKeyState(vk) & 0x8000)
 
-    def test_policy() -> models.InputPolicy:
+    def make_policy() -> models.InputPolicy:
         full = {"left": 0.0, "top": 0.0, "right": 1.0, "bottom": 1.0}
         return models.InputPolicy.model_validate(
             {
@@ -277,7 +277,7 @@ if sys.platform == "win32":
         assert find_hwnd() is None, "已经有一个合成游戏窗口，先关掉它"
         launcher = Path(sys.executable).parent / "synthetic-game.exe"
         adapter = load_adapter(GAMES_DIR / "synthetic-game")
-        hook = TestHook()
+        hook = UpHook()
         hook.start()
         shell: subprocess.Popen[bytes] | None = None
 
@@ -303,7 +303,7 @@ if sys.platform == "win32":
                         real_input=True,
                         operator=client.credentials,
                         capture=CaptureConfig(target=RULE, max_width=1280, max_height=720),
-                        input_policy=test_policy(),
+                        input_policy=make_policy(),
                     ),
                     on_released=lambda r: rig.released.append(r) if rig else None,
                     on_residual=lambda r: rig.residuals.append(r) if rig else None,
