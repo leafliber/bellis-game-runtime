@@ -11,11 +11,8 @@
 )]
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use capture::WindowSelector;
 use core_protocol::messages::{
@@ -183,6 +180,13 @@ mod vk {
     pub(super) const SHIFT: u16 = 0x10;
     pub(super) const ALT: u16 = 0x12;
     pub(super) const WIN: u16 = 0x5B;
+    pub(super) const RWIN: u16 = 0x5C;
+    pub(super) const LSHIFT: u16 = 0xA0;
+    pub(super) const RSHIFT: u16 = 0xA1;
+    pub(super) const LCONTROL: u16 = 0xA2;
+    pub(super) const RCONTROL: u16 = 0xA3;
+    pub(super) const LALT: u16 = 0xA4;
+    pub(super) const RALT: u16 = 0xA5;
     pub(super) const END: u16 = 0x23;
     pub(super) const HOME: u16 = 0x24;
     pub(super) const INSERT: u16 = 0x2D;
@@ -190,6 +194,19 @@ mod vk {
     pub(super) const ESCAPE: u16 = 0x1B;
     pub(super) const PAUSE: u16 = 0x13;
     pub(super) const SCROLL_LOCK: u16 = 0x91;
+}
+
+/// 把分左右的修饰键归成不分左右的键码：低层键盘钩子报 `VK_LCONTROL`、`VK_RSHIFT` 等，组合键存的是
+/// `VK_CONTROL`、`VK_SHIFT` 等。其它键原样返回。
+#[must_use]
+pub(crate) fn normalize_vk(code: u16) -> u16 {
+    match code {
+        vk::LSHIFT | vk::RSHIFT => vk::SHIFT,
+        vk::LCONTROL | vk::RCONTROL => vk::CONTROL,
+        vk::LALT | vk::RALT => vk::ALT,
+        vk::RWIN => vk::WIN,
+        other => other,
+    }
 }
 
 fn modifier_vk(name: &str) -> Option<u16> {
@@ -306,12 +323,14 @@ pub(crate) enum RawEvent {
     Wheel,
     /// 鼠标移动，`dx`、`dy` 是屏幕物理像素的位移。
     MouseMove { dx: i32, dy: i32 },
+    /// 其它消息：不触发任何动作，也不计入自检。
+    Other,
 }
 
 /// 钩子对一个事件的判定。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Class {
-    /// 本实例的注入，忽略（但计入自检）。
+    /// 本实例注入的键、鼠标键（按下与抬起）或滚轮：忽略，计入自检。本实例注入的移动判为 `Ignore`，不计。
     OwnInjection,
     /// 真人输入或第三方注入：接管（只在许可有效时算数，由调用方核对）。
     Takeover,
@@ -347,9 +366,10 @@ impl HookState {
         combo: &Combo,
         lease_valid: bool,
     ) -> Class {
-        // 先更新按住的键，急停组合键据此判断（不论是否注入）。
+        // 先更新按住的键，急停组合键据此判断（不论是否注入）；修饰键不分左右。
         match event {
             RawEvent::KeyDown { vk } => {
+                let vk = normalize_vk(vk);
                 let emergency = combo.triggered(vk, &self.down);
                 self.down.insert(vk);
                 if emergency {
@@ -357,25 +377,26 @@ impl HookState {
                 }
             }
             RawEvent::KeyUp { vk } => {
-                self.down.remove(&vk);
-                return Class::Ignore; // 抬起不算接管
+                self.down.remove(&normalize_vk(vk));
             }
-            RawEvent::MouseUp => return Class::Ignore,
             _ => {}
         }
-        // 本实例的注入只计入自检，不算接管。
+        // 本实例的注入不算接管。键、鼠标键的按下与抬起、滚轮计入自检；移动不计（与注入一侧的计数一致）。
         if injected && own {
-            return Class::OwnInjection;
+            return match event {
+                RawEvent::MouseMove { .. } | RawEvent::Other => Class::Ignore,
+                _ => Class::OwnInjection,
+            };
         }
         // 第三方注入与真人输入：接管只在许可有效时算数。
         let human = match event {
+            // 抬起不算接管；其它消息不触发任何动作。
+            RawEvent::KeyUp { .. } | RawEvent::MouseUp | RawEvent::Other => false,
             // 没有注入标志的真人移动：累计越过阈值才算（避开抖动）。
             RawEvent::MouseMove { dx, dy } if !injected => {
                 self.movement += i64::from(dx.unsigned_abs()) + i64::from(dy.unsigned_abs());
                 self.movement > MOVE_THRESHOLD_PX
             }
-            // 抬起到这里已提前返回，不会到这。
-            RawEvent::KeyUp { .. } | RawEvent::MouseUp => false,
             // 真人按下、滚轮，或带注入标志的第三方移动与按下。
             _ => true,
         };
@@ -399,10 +420,44 @@ pub(crate) trait Win32: Send + Sync {
     fn virtual_desktop(&self) -> Desktop;
     /// 鼠标左右键是否交换（`SM_SWAPBUTTON`）。
     fn buttons_swapped(&self) -> bool;
-    /// 注入一批带会话标记的事件，返回被接受的事件数（少于给出的即被拦截）。
+    /// 注入一批带会话标记的事件，返回被接受的事件数（少于给出的即被拦截）。真实实现同时按
+    /// [`self_check_count`] 记下钩子自检要看到的事件数。
     fn send(&self, events: &[Event]) -> u32;
     /// 某个键或鼠标键现在是否按下（`GetAsyncKeyState` 的高位）。读物理鼠标键，不随左右键交换。
     fn is_down(&self, key: VerifyKey) -> bool;
+}
+
+/// 钩子自检要计的事件数：SendInput 按顺序接受了前 `sent` 个事件，其中键、鼠标键与滚轮的个数。移动不计：
+/// 移到光标已在的位置时钩子是否看得到没有核实；钩子一侧同样不计本实例的移动。
+#[must_use]
+pub(crate) fn self_check_count(events: &[Event], sent: u32) -> u64 {
+    let counted = events
+        .iter()
+        .take(sent as usize)
+        .filter(|event| !matches!(event, Event::MouseMoveAbs { .. }))
+        .count();
+    counted as u64
+}
+
+/// 钩子自检的状态：上一轮读到的注入数，与已经报过、不再追究的未经过的事件数。
+#[derive(Debug, Default)]
+pub(crate) struct SelfCheck {
+    last_injected: u64,
+    excused: u64,
+}
+
+impl SelfCheck {
+    /// 每 100 ms 一轮。`injected` 是到现在为止要计的注入事件数（[`self_check_count`]），`seen` 是钩子看到的
+    /// 本实例事件数。上一轮时已注入的到这一轮还没全部经过钩子即返回真（判钩子失效）；同一批没有经过的
+    /// 只报一次，之后注入的照常核对。
+    pub(crate) fn tick(&mut self, injected: u64, seen: u64) -> bool {
+        let lost = self.last_injected > seen.saturating_add(self.excused);
+        if lost {
+            self.excused = self.last_injected - seen;
+        }
+        self.last_injected = injected;
+        lost
+    }
 }
 
 // ---------------------------------------------------------------- 核验残留
@@ -454,11 +509,10 @@ pub(crate) struct VerifyKeys {
 }
 
 /// 真实输入后端：用 `SendInput` 注入，注入前核对前台、注入后再核对一次，被拦截即 `Blocked`。释放后与收到
-/// 输入策略时请核验线程核验残留。泛型于 [`Win32`]，便于用替身测试。
+/// 输入策略时请核验线程核验残留。泛型于 [`Win32`]，便于用替身测试。钩子自检的注入计数由 [`Win32::send`]
+/// 的实现记（核验线程补发的抬起也经它），见 [`self_check_count`]。
 pub(crate) struct SendInputBackend {
     win32: Arc<dyn Win32>,
-    /// 注入过的事件数，供钩子自检（本实例的注入应在 100 ms 内经过自己的钩子）。
-    injected: Arc<AtomicU64>,
     verify: Sender<VerifyRequest>,
     verify_keys: Arc<Mutex<VerifyKeys>>,
 }
@@ -466,13 +520,11 @@ pub(crate) struct SendInputBackend {
 impl SendInputBackend {
     pub(crate) fn new(
         win32: Arc<dyn Win32>,
-        injected: Arc<AtomicU64>,
         verify: Sender<VerifyRequest>,
         verify_keys: Arc<Mutex<VerifyKeys>>,
     ) -> Self {
         Self {
             win32,
-            injected,
             verify,
             verify_keys,
         }
@@ -486,8 +538,6 @@ impl SendInputBackend {
         };
         let events = build(before, self.win32.virtual_desktop());
         let sent = self.win32.send(&events);
-        self.injected
-            .fetch_add(events.len() as u64, Ordering::Release);
         if (sent as usize) < events.len() {
             return Inject::Blocked;
         }
@@ -499,8 +549,7 @@ impl SendInputBackend {
 
     /// 抬起类的事件：安全方向，不核对前台，直接注入。
     fn inject_up(&self, events: &[Event]) {
-        let sent = self.win32.send(events);
-        self.injected.fetch_add(sent.into(), Ordering::Release);
+        self.win32.send(events);
     }
 }
 

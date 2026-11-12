@@ -11,7 +11,6 @@
     reason = "断言某次没有注入任何事件，用 is_empty 最直白"
 )]
 
-use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -21,8 +20,9 @@ use core_protocol::messages::{
 };
 
 use super::{
-    Class, Combo, Desktop, Event, HookState, PhysicalButton, RawEvent, Target, VerifyKey,
-    VerifyKeys, Win32, absolute, physical_button, verify_residual,
+    Class, Combo, Desktop, Event, HookState, PhysicalButton, RawEvent, SelfCheck, Target,
+    VerifyKey, VerifyKeys, Win32, absolute, normalize_vk, physical_button, self_check_count,
+    verify_residual,
 };
 use crate::ledger::{Inject, InputBackend, Momentary};
 use crate::sendinput::SendInputBackend;
@@ -115,7 +115,6 @@ fn backend(win32: &Arc<FakeWin32>) -> (SendInputBackend, mpsc::Receiver<super::V
     let (tx, rx) = mpsc::channel();
     let backend = SendInputBackend::new(
         Arc::clone(win32) as Arc<dyn Win32>,
-        Arc::new(AtomicU64::new(0)),
         tx,
         Arc::new(Mutex::new(VerifyKeys::default())),
     );
@@ -321,6 +320,158 @@ fn emergency_takes_precedence_over_takeover() {
         state.classify(RawEvent::KeyDown { vk: f12 }, true, true, &combo, false),
         Class::Emergency
     );
+}
+
+#[test]
+fn emergency_accepts_left_and_right_modifiers() {
+    // 低层钩子报的是分左右的键码：VK_LCONTROL（0xA2）、VK_RSHIFT（0xA1）。
+    let combo = Combo::default_hotkey();
+    let (lctrl, rctrl, rshift, f12) = (0xA2u16, 0xA3u16, 0xA1u16, 0x6F + 12);
+    let mut state = HookState::default();
+    state.classify(RawEvent::KeyDown { vk: lctrl }, false, false, &combo, false);
+    state.classify(
+        RawEvent::KeyDown { vk: rshift },
+        false,
+        false,
+        &combo,
+        false,
+    );
+    assert_eq!(
+        state.classify(RawEvent::KeyDown { vk: f12 }, false, false, &combo, false),
+        Class::Emergency
+    );
+    // 抬起左 Ctrl 后再按 F12 不是急停；换右 Ctrl 按住又是。
+    state.classify(RawEvent::KeyUp { vk: f12 }, false, false, &combo, false);
+    state.classify(RawEvent::KeyUp { vk: lctrl }, false, false, &combo, false);
+    assert_eq!(
+        state.classify(RawEvent::KeyDown { vk: f12 }, false, false, &combo, false),
+        Class::Ignore
+    );
+    state.classify(RawEvent::KeyUp { vk: f12 }, false, false, &combo, false);
+    state.classify(RawEvent::KeyDown { vk: rctrl }, false, false, &combo, false);
+    assert_eq!(
+        state.classify(RawEvent::KeyDown { vk: f12 }, false, false, &combo, false),
+        Class::Emergency
+    );
+    // Alt 与 Win 同样归一。
+    let combo = Combo::parse("alt+win+end").unwrap();
+    let mut state = HookState::default();
+    state.classify(RawEvent::KeyDown { vk: 0xA5 }, false, false, &combo, false); // VK_RMENU
+    state.classify(RawEvent::KeyDown { vk: 0x5C }, false, false, &combo, false); // VK_RWIN
+    assert_eq!(
+        state.classify(RawEvent::KeyDown { vk: 0x23 }, false, false, &combo, false),
+        Class::Emergency
+    );
+}
+
+#[test]
+fn normalize_vk_folds_only_the_sided_modifiers() {
+    assert_eq!(normalize_vk(0xA0), 0x10);
+    assert_eq!(normalize_vk(0xA1), 0x10);
+    assert_eq!(normalize_vk(0xA2), 0x11);
+    assert_eq!(normalize_vk(0xA3), 0x11);
+    assert_eq!(normalize_vk(0xA4), 0x12);
+    assert_eq!(normalize_vk(0xA5), 0x12);
+    assert_eq!(normalize_vk(0x5C), 0x5B);
+    assert_eq!(normalize_vk(0x5B), 0x5B);
+    assert_eq!(normalize_vk(0x7B), 0x7B, "F12 不变");
+    assert_eq!(normalize_vk(0x57), 0x57, "W 不变");
+}
+
+#[test]
+fn own_injected_ups_and_buttons_count_for_the_self_check() {
+    // 本实例注入的键与鼠标键的按下与抬起、滚轮都计入自检，许可有效与否都一样，从不算接管。
+    let combo = Combo::default_hotkey();
+    let mut state = HookState::default();
+    for event in [
+        RawEvent::KeyDown { vk: 0x57 },
+        RawEvent::KeyUp { vk: 0x57 },
+        RawEvent::MouseDown,
+        RawEvent::MouseUp,
+        RawEvent::Wheel,
+    ] {
+        for lease_valid in [true, false] {
+            assert_eq!(
+                state.classify(event, true, MARKER_MATCH, &combo, lease_valid),
+                Class::OwnInjection,
+                "{event:?}"
+            );
+        }
+    }
+    // 本实例注入的移动不计入自检（与注入一侧一致），也不算接管。
+    assert_eq!(
+        state.classify(
+            RawEvent::MouseMove { dx: 500, dy: 500 },
+            true,
+            MARKER_MATCH,
+            &combo,
+            true
+        ),
+        Class::Ignore
+    );
+    // 第三方注入的抬起不算接管。
+    assert_eq!(
+        state.classify(RawEvent::MouseUp, true, false, &combo, true),
+        Class::Ignore
+    );
+}
+
+#[test]
+fn other_messages_never_trigger_anything() {
+    let combo = Combo::default_hotkey();
+    let mut state = HookState::default();
+    for (injected, own) in [(false, false), (true, false), (true, true)] {
+        assert_eq!(
+            state.classify(RawEvent::Other, injected, own, &combo, true),
+            Class::Ignore
+        );
+    }
+}
+
+// ---------------------------------------------------------------- 钩子自检
+
+#[test]
+fn the_self_check_counts_accepted_events_but_not_moves() {
+    let click = [
+        Event::MouseMoveAbs { x: 1, y: 2 },
+        Event::MouseDown {
+            button: PhysicalButton::Left,
+        },
+    ];
+    assert_eq!(self_check_count(&click, 2), 1, "只计按下，不计移动");
+    assert_eq!(self_check_count(&click, 1), 0, "只接受了移动");
+    assert_eq!(self_check_count(&click, 0), 0, "被拦截，一个也没注入");
+    let ups = [
+        Event::KeyUp {
+            scan_code: 0x11,
+            extended: false,
+        },
+        Event::MouseUp {
+            button: PhysicalButton::Left,
+        },
+        Event::Wheel { notches: 1 },
+    ];
+    assert_eq!(self_check_count(&ups, 3), 3);
+    assert_eq!(self_check_count(&ups, 2), 2);
+}
+
+#[test]
+fn the_self_check_reports_missing_events_once() {
+    let mut check = SelfCheck::default();
+    // 第一轮：之前没有注入。
+    assert!(!check.tick(2, 0));
+    // 第二轮：上一轮时的 2 个都经过了钩子，又注入了 1 个。
+    assert!(!check.tick(3, 2));
+    // 第三轮：上一轮时的 3 个只看到 2 个：判失效。
+    assert!(check.tick(3, 2));
+    // 同一批没有经过的只报一次。
+    assert!(!check.tick(3, 2));
+    assert!(!check.tick(5, 2));
+    // 之后注入的 2 个照常经过：不报。
+    assert!(!check.tick(5, 4));
+    // 之后注入的又有没经过的：再报。
+    assert!(!check.tick(6, 4));
+    assert!(check.tick(6, 4));
 }
 
 // ---------------------------------------------------------------- 注入

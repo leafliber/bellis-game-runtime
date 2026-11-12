@@ -12,10 +12,12 @@ WGC 进入帧环，据帧是否变化判断点击/短按是否生效。
 
 核对并打印：
 - 点击菜单“开始”与在对话里短按回车的生效率（画面在约 1 秒内变化）；
-- 只在本测试里给一个允许按住键 W 的输入策略：按住后分别触发暂停、控制台退出、许可过期与急停组合键，
-  量从触发到本进程低层钩子看到注入的 W 抬起的时延；
+- 只在本测试里给一个允许按住键 W 的输入策略：按住后分别触发暂停与控制台退出，量从触发到本进程低层
+  钩子看到注入的 W 抬起的时延（许可过期没有在这里触发）；
 - 释放后 `GetAsyncKeyState` 核验没有残留按住的键；
-- 本进程自己以 SendInput 注入一个键，被判为接管（`takeover`）并释放。
+- 本进程自己以 SendInput 注入一个键，被判为接管（`takeover`）并释放；
+- 暂停中本进程注入左 Ctrl、左 Shift 加 F12，被判为急停（`emergency_stop`）。
+- 点击能生效也说明实时核自己的点击没有被判为接管、没有因钩子自检报 `hook_lost`。
 """
 
 import sys
@@ -51,6 +53,10 @@ if sys.platform == "win32":
     W_VK = 0x57
     """W 的虚拟键码，本进程的钩子据它认出注入的抬起。"""
     ENTER_SCAN = 0x1C
+    LCTRL_SCAN = 0x1D
+    LSHIFT_SCAN = 0x2A
+    F12_SCAN = 0x58
+    """缺省急停组合键 Ctrl+Shift+F12 的扫描码：注入的是左侧修饰键。"""
     CHANGE_TIMEOUT = 1.0
     RULE = WindowRule(process_name="python.exe", window_class="TkTopLevel", title=WINDOW_TITLE)
 
@@ -152,10 +158,11 @@ if sys.platform == "win32":
         _anonymous_ = ("u",)
         _fields_ = (("type", wintypes.DWORD), ("u", _U))
 
-    def third_party_key(scan: int) -> None:
-        """本进程以 SendInput 注入一个键的按下与抬起（不是实时核的会话标记）：实时核应判为接管。"""
-        events = (_INPUT * 2)()
-        for index, up in enumerate((False, True)):
+    def third_party_keys(*scans: int) -> None:
+        """本进程以 SendInput 依次按下这些键、再倒序抬起（扫描码，不是实时核的会话标记）。"""
+        order = [(scan, False) for scan in scans] + [(scan, True) for scan in reversed(scans)]
+        events = (_INPUT * len(order))()
+        for index, (scan, up) in enumerate(order):
             events[index].type = INPUT_KEYBOARD
             events[index].ki = _KEYBDINPUT(
                 wVk=0,
@@ -164,7 +171,7 @@ if sys.platform == "win32":
                 time=0,
                 dwExtraInfo=None,
             )
-        _user32.SendInput(2, ctypes.byref(events), ctypes.sizeof(_INPUT))
+        _user32.SendInput(len(order), ctypes.byref(events), ctypes.sizeof(_INPUT))
 
     def find_hwnd() -> int | None:
         hwnd = _user32.FindWindowW("TkTopLevel", WINDOW_TITLE)
@@ -330,6 +337,11 @@ if sys.platform == "win32":
                 presses = [await rig.press_enter() for _ in range(5)]
                 rate = (int(clicked) + sum(int(p) for p in presses)) / 6
                 print(f"\n点击/短按生效率：{rate:.2f}（点击开始 {clicked}，回车 {presses}）")
+                # 实时核自己的点击与短按不算接管，也都经过了自己的钩子（自检每 100 ms 一轮）。
+                await asyncio.sleep(0.3)
+                own = (ReleaseReason.TAKEOVER, ReleaseReason.HOOK_LOST)
+                unexpected = [r.reason for r in rig.released if r.reason in own]
+                assert not unexpected, f"实时核自己的输入引起了释放：{unexpected}"
 
                 # 2) 按住 W，量各触发到钩子看到抬起的时延。
                 async def hold_then(trigger: Callable[[], object], label: str) -> None:
@@ -354,19 +366,20 @@ if sys.platform == "win32":
                 # 3) 第三方注入（本进程自己注入）判为接管。
                 await rig.hold_w()
                 before_releases = len(rig.released)
-                third_party_key(ENTER_SCAN)
-                await until(
-                    lambda: next(
-                        (
-                            r
-                            for r in rig.released[before_releases:]
-                            if r.reason is ReleaseReason.TAKEOVER
-                        ),
-                        None,
-                    )
-                )
+                third_party_keys(ENTER_SCAN)
+                await until(lambda: released_since(rig, before_releases, ReleaseReason.TAKEOVER))
                 print("第三方注入被判为接管（takeover）")
                 assert not async_down(W_VK)
+
+                # 3b) 急停组合键：控制台已转为暂停（许可无效，不算接管），本进程注入左 Ctrl、
+                # 左 Shift 加 F12。低层钩子报的是 VK_LCONTROL、VK_LSHIFT，实时核归一后判为急停。
+                await until(lambda: True if not client.may_autoplay else None)
+                before_releases = len(rig.released)
+                third_party_keys(LCTRL_SCAN, LSHIFT_SCAN, F12_SCAN)
+                await until(
+                    lambda: released_since(rig, before_releases, ReleaseReason.EMERGENCY_STOP)
+                )
+                print("左 Ctrl + 左 Shift + F12 被判为急停（emergency_stop）")
 
                 # 4) 许可过期（控制台退出）后释放与 GetAsyncKeyState 核验。
                 await console.start()
@@ -387,6 +400,9 @@ if sys.platform == "win32":
                 shell.terminate()
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     shell.wait(5)
+
+    def released_since(rig: Rig, start: int, reason: ReleaseReason) -> bool | None:
+        return True if any(r.reason is reason for r in rig.released[start:]) else None
 
     def self_ring_ready(link: CoreLink) -> bool | None:
         ring: FrameRing | None = link.frames

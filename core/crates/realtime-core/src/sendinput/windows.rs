@@ -34,16 +34,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetForegroundWindow, GetMessageW, GetSystemMetrics, HC_ACTION, IsIconic,
-    IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
+    MSLLHOOKSTRUCT, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use super::{
-    Class, Combo, Desktop, Event, HookState, PhysicalButton, RawEvent, Target, TargetWindow,
-    VerifyKey, VerifyKeys, VerifyRequest, Win32, verify_residual,
+    Class, Combo, Desktop, Event, HookState, PhysicalButton, RawEvent, SelfCheck, Target,
+    TargetWindow, VerifyKey, VerifyKeys, VerifyRequest, Win32, self_check_count, verify_residual,
 };
 use crate::control::{Control, Notice, Notices};
 use crate::ledger::InputBackend;
@@ -55,10 +56,15 @@ const VERIFY_DELAY: Duration = Duration::from_millis(50);
 /// 钩子自检的周期（100 ms）：本实例注入的事件应在这之内经过自己的钩子。
 const SELF_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// 真实的 Win32 层：注入、前台核对、绝对坐标、按键状态。持有本实例的会话标记与目标窗口。
+/// 等两个低层钩子装上的时限：钩子线程装好（或装失败）即回报，超时按装不上处理。
+const HOOK_INSTALL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 真实的 Win32 层：注入、前台核对、绝对坐标、按键状态。持有本实例的会话标记与目标窗口，并记下钩子
+/// 自检要看到的注入事件数（所有注入都经 [`Win32::send`]，含核验线程补发的抬起）。
 struct RealWin32 {
     marker: usize,
     target: Arc<TargetWindow>,
+    injected: Arc<AtomicU64>,
 }
 
 /// `SendInput` 的 `dwExtraInfo` 用指针大小的整数；本实例的会话标记放在它里面。
@@ -213,7 +219,10 @@ impl Win32 for RealWin32 {
     }
 
     fn send(&self, events: &[Event]) -> u32 {
-        send_events(events, self.marker)
+        let sent = send_events(events, self.marker);
+        self.injected
+            .fetch_add(self_check_count(events, sent), Ordering::Release);
+        sent
     }
 
     fn is_down(&self, key: VerifyKey) -> bool {
@@ -275,7 +284,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             WM_KEYUP | WM_SYSKEYUP => RawEvent::KeyUp {
                 vk: info.vkCode as u16,
             },
-            _ => RawEvent::KeyUp { vk: 0 },
+            _ => RawEvent::Other,
         };
         let injected = info.flags.0 & LLKHF_INJECTED.0 != 0;
         let own = injected && info.dwExtraInfo == globals.marker;
@@ -294,13 +303,16 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         let message = wparam.0 as u32;
         let raw = match message {
-            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => RawEvent::MouseDown,
-            WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => RawEvent::MouseUp,
-            WM_MOUSEWHEEL => RawEvent::Wheel,
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
+                RawEvent::MouseDown
+            }
+            WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => RawEvent::MouseUp,
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => RawEvent::Wheel,
             WM_MOUSEMOVE => mouse_move(info),
-            _ => RawEvent::MouseUp,
+            _ => RawEvent::Other,
         };
-        let injected = info.flags & LLKHF_INJECTED.0 != 0;
+        // 鼠标钩子的注入标志是 LLMHF_INJECTED（1），不是键盘的 LLKHF_INJECTED（0x10）。
+        let injected = info.flags & LLMHF_INJECTED != 0;
         let own = injected && info.dwExtraInfo == globals.marker;
         classify_and_dispatch(globals, raw, injected, own);
     }
@@ -343,14 +355,33 @@ fn classify_and_dispatch(globals: &HookGlobals, raw: RawEvent, injected: bool, o
     }
 }
 
-/// 装上两个低层钩子并跑消息循环；返回时表示装钩子失败（由调用方处理）。
-fn run_hook_loop() -> io::Result<()> {
+/// 在本线程上装两个低层钩子，经 `ready` 回报装上与否；装上了就跑消息循环（回调在这个线程上执行），
+/// 循环结束时卸载。装不上时卸掉已装的那个并返回。
+fn run_hook_loop(ready: &Sender<io::Result<()>>) {
     // SAFETY: 回调是本模块的 `extern "system"` 函数；低层钩子不需要模块句柄。
-    let keyboard = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) }
-        .map_err(|error| io::Error::other(format!("SetWindowsHookExW(WH_KEYBOARD_LL): {error}")))?;
+    let keyboard = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) }
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = ready.send(Err(io::Error::other(format!(
+                "SetWindowsHookExW(WH_KEYBOARD_LL): {error}"
+            ))));
+            return;
+        }
+    };
     // SAFETY: 同上。
-    let mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) }
-        .map_err(|error| io::Error::other(format!("SetWindowsHookExW(WH_MOUSE_LL): {error}")))?;
+    let mouse = match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) } {
+        Ok(handle) => handle,
+        Err(error) => {
+            // SAFETY: 卸载刚装上的键盘钩子。
+            let _ = unsafe { UnhookWindowsHookEx(keyboard) };
+            let _ = ready.send(Err(io::Error::other(format!(
+                "SetWindowsHookExW(WH_MOUSE_LL): {error}"
+            ))));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(()));
     let mut message = MSG::default();
     // SAFETY: 标准的消息循环；GetMessageW 填入本地 MSG。
     while unsafe { GetMessageW(&raw mut message, None, 0, 0) }.as_bool() {}
@@ -359,7 +390,6 @@ fn run_hook_loop() -> io::Result<()> {
         let _ = UnhookWindowsHookEx(keyboard);
         let _ = UnhookWindowsHookEx(mouse);
     }
-    Ok(())
 }
 
 /// 真实后端构造后要起的线程所需的东西，由 [`build_backend`] 交出，再由 [`start`] 用它起线程。
@@ -370,6 +400,20 @@ pub(crate) struct Wiring {
     verify_rx: Receiver<VerifyRequest>,
     verify_keys: Arc<Mutex<VerifyKeys>>,
     worker_rx: Receiver<Class>,
+}
+
+/// 起钩子线程，等它回报两个钩子都装上；装失败或 [`HOOK_INSTALL_TIMEOUT`] 内没有回报即返回错误。
+fn spawn_hook_thread() -> io::Result<()> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("input-hook".into())
+        .spawn(move || run_hook_loop(&ready_tx))?;
+    match ready_rx.recv_timeout(HOOK_INSTALL_TIMEOUT) {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::other(
+            "the low-level hooks were not installed in time",
+        )),
+    }
 }
 
 /// 构造真实后端：生成会话标记、装上低层钩子（装不上即返回错误，`session` 据此以 1 退出：没有接管检测
@@ -387,7 +431,11 @@ pub(crate) fn build_backend(
     let injected = Arc::new(AtomicU64::new(0));
     let seen = Arc::new(AtomicU64::new(0));
     let verify_keys = Arc::new(Mutex::new(VerifyKeys::default()));
-    let win32: Arc<dyn Win32> = Arc::new(RealWin32 { marker, target });
+    let win32: Arc<dyn Win32> = Arc::new(RealWin32 {
+        marker,
+        target,
+        injected: Arc::clone(&injected),
+    });
     let (verify_tx, verify_rx) = mpsc::channel::<VerifyRequest>();
     let (worker_tx, worker_rx) = mpsc::channel::<Class>();
     HOOK.set(HookGlobals {
@@ -400,14 +448,11 @@ pub(crate) fn build_backend(
     })
     .ok();
     // 装钩子的消息循环线程：装不上即判失败。
-    let installed = Arc::new(AtomicBool::new(false));
-    spawn_hook_thread(&installed)?;
-    if !wait_installed(&installed) {
-        return Err(io::Error::other("failed to install the low-level hooks"));
-    }
+    spawn_hook_thread().map_err(|error| {
+        io::Error::other(format!("failed to install the low-level hooks: {error}"))
+    })?;
     let backend = Box::new(super::SendInputBackend::new(
         Arc::clone(&win32),
-        Arc::clone(&injected),
         verify_tx,
         Arc::clone(&verify_keys),
     ));
@@ -533,31 +578,6 @@ fn spawn_lease_poller(control: &Arc<Control>, lease_valid: &Arc<AtomicBool>) -> 
     Ok(())
 }
 
-fn spawn_hook_thread(installed: &Arc<AtomicBool>) -> io::Result<()> {
-    let installed = Arc::clone(installed);
-    thread::Builder::new()
-        .name("input-hook".into())
-        .spawn(move || match run_hook_loop() {
-            Ok(()) => installed.store(true, Ordering::Release),
-            Err(error) => {
-                log!("failed to install low-level hooks: {error}");
-                installed.store(false, Ordering::Release);
-            }
-        })?;
-    Ok(())
-}
-
-fn wait_installed(installed: &Arc<AtomicBool>) -> bool {
-    // 钩子装上后回调里会设 true；给它一点时间，装失败时 run_hook_loop 立即返回并留 false。
-    for _ in 0..100 {
-        if installed.load(Ordering::Acquire) {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    installed.load(Ordering::Acquire)
-}
-
 fn spawn_self_check(
     control: &Arc<Control>,
     post: &Post,
@@ -573,18 +593,16 @@ fn spawn_self_check(
     thread::Builder::new()
         .name("input-self-check".into())
         .spawn(move || {
-            let mut last_injected = 0u64;
+            let mut check = SelfCheck::default();
             loop {
                 thread::sleep(SELF_CHECK_INTERVAL);
                 let sent = injected.load(Ordering::Acquire);
                 let passed = seen.load(Ordering::Acquire);
                 // 本实例注入的事件应在 100 ms 内经过自己的钩子；上一轮的注入到这一轮还没被看到即判失效。
-                if last_injected > passed {
-                    log!("self-check: own injections did not pass the hook; reinstalling");
+                if check.tick(sent, passed) {
+                    log!("self-check: own injections did not pass the hook; hooks may be lost");
                     post(control.local_revoke(core_protocol::messages::ReleaseReason::HookLost));
-                    // 重新装钩子：当前实现靠下一次钩子回调恢复 seen 的推进，这里记日志并继续。
                 }
-                last_injected = sent;
             }
         })?;
     Ok(())
