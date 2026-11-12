@@ -514,7 +514,11 @@ def test_a_restarted_core_gets_a_bigger_fresh_token(core_exe: Path, data_dir: Pa
 
 
 def test_the_operator_lease_connection_gate(core_exe: Path, tmp_path: Path) -> None:
-    """操作员许可连接离不开输入后端（2）；假后端离不开测试设备（2）；连不上控制台即以 1 退出。"""
+    """操作员许可连接离不开输入后端（2）；假后端离不开测试设备（2）；连不上控制台即以 1 退出。
+
+    Windows 上另以真实后端启动：它先装上低层钩子再连控制台，所以连不上时报的是连不上控制台，而不是
+    装不上钩子。没有许可也没有输入策略，不发任何输入。
+    """
 
     async def exit_code(argv: list[str], *, device: bool) -> tuple[int, str]:
         with (
@@ -555,6 +559,11 @@ def test_the_operator_lease_connection_gate(core_exe: Path, tmp_path: Path) -> N
         code, log = await exit_code(["--input-backend", "fake"], device=True)
         assert code == 1, log
         assert "cannot connect to the operator console" in log
+        if sys.platform == "win32":
+            code, log = await exit_code(["--input-backend", "sendinput"], device=False)
+            assert code == 1, log
+            assert "low-level hooks" not in log, log
+            assert "cannot connect to the operator console" in log, log
 
     asyncio.run(main())
 
