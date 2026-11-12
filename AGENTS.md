@@ -42,7 +42,7 @@
 | 只跑操作员控制台作许可源经假输入后端、合成游戏与实时核的联调，以及操作员许可连接的门禁、输入策略经真实实时核在假后端上把关（会先编译 `realtime-core`） | `uv run pytest runtime/tests/core_link/test_operator.py` |
 | 只跑真实输入后端的 Rust 单元测试：替身 Win32 层的注入与前台核对、绝对坐标、钩子分类与急停组合键、残留核验、输入策略的提交时与执行时核对、按住时长与本地撤权、真实后端的门禁 | `cargo test -p realtime-core` |
 | 只跑 GR-35 自动重启与真实输入门禁的 `CoreLink` 测试：非 0 退出按退避重启并报 `on_restart`、次数用尽即停止、0 退出不重启，以及 `real_input`、`emergency_hotkey` 的门禁与命令行 | `uv run pytest runtime/tests/core_link/test_link.py` |
-| 合成游戏的窗口上以真实输入后端实测 GS-02 的真机测试，打印点击/短按生效率与暂停、控制台退出、急停的释放时延（需要 Windows 交互桌面，不在 `uv run check` 中；会移动鼠标并点击、按键作用在合成游戏窗口上，先关掉已打开的合成游戏窗口） | `uv run pytest -m manual runtime/tests/core_link/test_input_window.py -s` |
+| 合成游戏的窗口上以真实输入后端实测 GS-02 的真机测试，打印点击/短按生效率与暂停、控制台退出的释放时延，核对自己的输入不判接管、第三方注入判接管、急停组合键判急停（需要 Windows 交互桌面，不在 `uv run check` 中；会移动鼠标并点击、按键作用在合成游戏窗口上，先关掉已打开的合成游戏窗口） | `uv run pytest -m manual runtime/tests/core_link/test_input_window.py -s` |
 | 经 stdin 管道运行真实的 `uv run operate synthetic-game`、用真实凭据管理器的真机测试（只在 Windows 上，不在 `uv run check` 中；写入并删除当前用户的 `operator-session` 条目，条目已存在时跳过） | `uv run pytest -m manual runtime/tests/operator/test_operate_window.py -s` |
 | 格式化 | `uv run ruff format`；`cargo fmt --all` |
 | 改了 `core/crates/core-protocol` 后重新生成 `protocol/` 的生成物 | `uv run generate` |
