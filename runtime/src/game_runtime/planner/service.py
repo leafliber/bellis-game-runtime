@@ -339,6 +339,17 @@ class Planner:
             self._bad_ending(event.capture_ns)
         self._schedule_summary()
 
+    def observed_text(self, scene: SceneUpdate) -> str | None:
+        observation = self._observing
+        if (
+            scene.observation_scope is self._scene_scope
+            and observation is not None
+            and observation.frame_number <= scene.frame.frame_number
+            and observation.transform_version == scene.frame.transform_version
+        ):
+            return observation.text
+        return None
+
     def on_scene(self, update: SceneUpdate) -> None:
         if self._closed:
             return
@@ -752,6 +763,7 @@ class Planner:
         data.update(
             {
                 "goal": root,
+                "constraints": [] if self._submitted is None else list(self._submitted.constraints),
                 "completed_steps": self._completed_count,
                 "recent_completed": list(self._recent_completed),
                 "rois": [name for name, roi in self._adapter.rois.items() if roi.rect is not None],

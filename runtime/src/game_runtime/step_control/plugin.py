@@ -10,12 +10,18 @@ from game_runtime.kernel import CONTROL_SUBMIT, Manifest, Plugin, PluginContext,
 from game_runtime.models import VLM
 from game_runtime.narrative import NARRATIVE
 from game_runtime.ocr import OCR
-from game_runtime.operator import Clock, OperatorClient, messages
+from game_runtime.operator import Clock, messages
 from game_runtime.scene import SCENE
 from game_runtime.step_control.contracts import PLANNER, POLICY, PlannerPort, Policy
 from game_runtime.step_control.controller import StepConfig, StepController
 from game_runtime.step_control.pacing import DEFAULT_PACING, ReadingPacing
-from game_runtime.step_control.supervision import OperatorGoalRelay, PlannerBinding, SessionProgress
+from game_runtime.step_control.supervision import (
+    OperatorGoalRelay,
+    PlannerBinding,
+    PlaySession,
+    SemanticPlay,
+    SessionProgress,
+)
 from game_runtime.voice_activity import VOICE_ACTIVITY
 
 _INTERRUPTS: Final = frozenset(
@@ -74,13 +80,14 @@ class SessionSignals:
 
 
 def step_plugin_for(
-    operator: OperatorClient,
+    operator: PlaySession,
     policy: Policy | None,
     signals: SessionSignals,
     clock: Clock,
     core_ready: Callable[[], bool],
     *,
     model_policy: Callable[[PluginContext[StepConfig]], Policy] | None = None,
+    semantic: SemanticPlay | None = None,
 ) -> type[Plugin[StepConfig]]:
     if (policy is None) == (model_policy is None):
         raise ValueError("须指定固定策略或模型策略工厂，二选一")
@@ -140,6 +147,7 @@ def step_plugin_for(
                 signals.operator_goal,
                 signals.planner_binding,
                 reading,
+                semantic=semantic,
             )
             self.controller = controller
             signals.controller = controller

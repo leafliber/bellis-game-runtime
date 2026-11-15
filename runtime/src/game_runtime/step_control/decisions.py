@@ -78,6 +78,8 @@ class PendingDecision:
     opened_frame: int
     selected: int | None = None
     selected_at_ns: int = 0
+    selected_source: Literal["director", "vote"] | None = None
+    selected_traceparent: str | None = None
     last_timing_frame: int = 0
     executed_at_ns: int | None = None
 
@@ -89,7 +91,15 @@ class PendingDecision:
         if deadline is not None and self.deadline_ns is not None:
             self.deadline_ns = min(deadline, self.deadline_ns)
 
-    def accept(self, resolved: messages.DecisionResolved, now_ns: int, margin_ns: int) -> None:
+    def accept(
+        self,
+        resolved: messages.DecisionResolved,
+        now_ns: int,
+        margin_ns: int,
+        *,
+        source: Literal["director", "vote"] | None = None,
+        traceparent: str | None = None,
+    ) -> bool:
         if (
             resolved.id == self.id
             and self.selected is None
@@ -98,6 +108,10 @@ class PendingDecision:
         ):
             self.selected = resolved.index
             self.selected_at_ns = now_ns
+            self.selected_source = source
+            self.selected_traceparent = traceparent
+            return True
+        return False
 
     def choose(
         self, now_ns: int, margin_ns: int

@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from game_runtime.adapter import AdapterError
 from game_runtime.adapter.load import describe
 from game_runtime.core_link import CoreLinkOptions
+from game_runtime.game_bridge.session import BellisConfig
 from game_runtime.kernel import ResolvedEntry, State, read_patch, read_profile, resolve_profile
 from game_runtime.local_data import LocalDataError
 from game_runtime.operator import OperatorError
@@ -27,6 +28,7 @@ async def _run(
     store: SecretStore,
     *,
     real_input: bool,
+    bellis: BellisConfig | None = None,
 ) -> int:
     async with supervise(
         game,
@@ -36,6 +38,7 @@ async def _run(
         store=store,
         real_input=real_input,
         profile=entries,
+        bellis=bellis,
     ) as run:
         for entry in run.kernel.snapshot():
             if entry.enabled and entry.state is not State.ACTIVE:
@@ -43,10 +46,13 @@ async def _run(
                     f"{reason.code}（{reason.subject}）" for reason in entry.reasons
                 )
                 print(f"{entry.id} {entry.state} {details}", file=sys.stderr, flush=True)
-        if run.controller is None:
+        if run.controller is None and bellis is None:
             print("逐步控制未激活", file=sys.stderr, flush=True)
             return 2
-        print("已连接操作员控制台，输入许可由控制台管理。", flush=True)
+        if bellis is None:
+            print("已连接操作员控制台，输入许可由控制台管理。", flush=True)
+        else:
+            print("已启动 Bellis 语义桥，输入许可由实时核直连 Bellis 取得。", flush=True)
         await run.wait_ended()
         return 0
 
@@ -54,7 +60,7 @@ async def _run(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="supervise",
-        description="Run a model play session with a separate operator console.",
+        description="Run supervised model play with the operator console or Bellis.",
     )
     parser.add_argument("game", help="adapter id (a directory under games/)")
     parser.add_argument("--profile", type=Path, required=True, help="profile JSON file")
@@ -64,8 +70,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--core", type=Path, help="an already built realtime-core executable")
     parser.add_argument("--data-dir", type=Path, help="local data directory (absolute)")
     parser.add_argument("--real-input", action="store_true", help="enable supervised Windows input")
+    parser.add_argument("--bellis", action="store_true", help="connect to the active Bellis host")
+    parser.add_argument(
+        "--confirm-precondition",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="confirm a verified adapter prerequisite for this Bellis session (repeatable)",
+    )
     parser.add_argument("--verbose", action="store_true", help="log at INFO level")
     args = parser.parse_args(argv)
+    if args.bellis and not args.real_input:
+        parser.error("--bellis requires an explicit --real-input backend")
+    if args.confirm_precondition and not args.bellis:
+        parser.error("--confirm-precondition requires --bellis")
     setup_output(args.verbose)
     try:
         profile = resolve_profile(
@@ -74,6 +92,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         data_dir = data_dir_option(args.data_dir)
         store = CredentialManagerStore()
         core = args.core or build_realtime_core()
+        if args.bellis:
+            return asyncio.run(
+                _run(
+                    args.game,
+                    profile,
+                    core,
+                    data_dir,
+                    store,
+                    real_input=args.real_input,
+                    bellis=BellisConfig(
+                        CredentialManagerStore("bellis"), frozenset(args.confirm_precondition)
+                    ),
+                )
+            )
         return asyncio.run(
             _run(args.game, profile, core, data_dir, store, real_input=args.real_input)
         )
