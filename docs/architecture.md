@@ -162,7 +162,7 @@ Game Runtime 为 Bellis 提供游戏能力：采集画面与声音、读懂画�
 
 | 目录 | 内容 |
 | --- | --- |
-| `core/` | Rust cargo 工作区：实时核与核协议类型 |
+| `core/` | Rust cargo 工作区，包含实时核、核协议类型与游戏桥控制类型 |
 | `runtime/` | Python uv 项目：主进程与插件 |
 | `games/<id>/` | 游戏适配包：声明文件与钩子（GR-31） |
 | `tools/` | 离线工具与合成游戏夹具 |

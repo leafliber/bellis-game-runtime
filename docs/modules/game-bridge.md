@@ -34,7 +34,9 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 - 锁定清单为 `vendor/bellis-protocol/manifest.json`：记录上游仓库、完整提交号、每个副本的源路径与 SHA-256。Schema、Pydantic 模型与控制连接 fixture 均取自同一个已合入提交的 Git blob，保留原始字节；本仓库的格式化工具不改动副本。更新时一起替换这三份文件与清单。`uv run check` 离线核对文件集合、来源路径与摘要；它不联网验证提交是否已合入，更新者须在复制前确认。
 - Python 接收端先用锁定模型提供的 `parse_game_bridge_json` 解码原始 JSON，再校验信封、载荷、角色与方向；不能先用普通 JSON 解码丢失 `-0`、小数或指数形式的整数字段信息。模型和 fixture 只是契约，不能代替实时核对有效许可、帧与输入策略的核验。
 - 握手比较主版本，不兼容时 Bellis 的游戏桥插件停在 WAITING 并说明原因。
-- 控制连接上的消息在实时核中的 Rust 类型，首选用 typify 从锁定的 JSON Schema 生成，不可行时手写，并以锁定的 Schema 与 Bellis 的 fixture 在完整检查中双向校验。
+- 控制连接的 Rust 类型在 `core/crates/game-bridge-protocol`。typify 0.8.0 生成的 `GameLeaseRenewParams` 未保留 `token` 和 `expiresAtMs` 的上界，现用手写类型。完整检查的 pytest 项逐条核对锁定夹具，从 Schema 派生字段边界样本，并把 Rust 和冻结 Pydantic 模型各自编码的消息送给对端校验。
+- Rust 解码入口按控制角色拆成 Bellis 请求、实时核通知和实时核应答，逐字段从原始 JSON 读取。应答由调用方提供同一连接的在途请求，编号匹配后按请求方法验证。版本不同的 `game.describe` 应答只读取公共主版本，`error.data` 保留任意 JSON。
+- `MonotonicMs` 把实时核的系统单调纳秒向下取整为协议毫秒，并将绝对截止时刻乘回纳秒。离线互通检查用 Node 的 `process.hrtime.bigint()` 核对时钟域。握手顺序、运行会话、到期和释放由控制连接与输入代理处理。[Bellis 时间与标识](https://github.com/leafliber/bellis/blob/4274d54cce2da97a29fad1e7e19e31d60e3c95c5/docs/modules/game-bridge.md#时间与标识)
 
 ## 消息
 
