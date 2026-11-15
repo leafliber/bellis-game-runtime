@@ -471,6 +471,31 @@ def test_a_misread_character_in_the_name_is_the_same_speaker() -> None:
     ]
 
 
+def test_run_local_name_index_joins_two_weak_readings_without_changing_raw_name() -> None:
+    feed = Feed()
+    feed.box("先核对这段合成文字。", speaker="林夏小满", marker=True)
+    feed.other()
+    feed.box("另一段正在显示", speaker="林夏小漫", speaker_confidence=0.62)
+    feed.box("另一段正在显示，随后结束。", speaker="林厦小满", speaker_confidence=0.55, marker=True)
+    assert len(feed.records) == 2
+    current = feed.records[-1]
+    assert current.speaker == "林夏小漫"
+    assert feed.tracker.canonical_speaker(current) == "林夏小满"
+    assert current.completeness is Completeness.COMPLETE
+
+
+def test_run_local_name_index_keeps_ambiguous_names_distinct() -> None:
+    feed = Feed()
+    for name in ("林夏小满", "林夏小蛮"):
+        feed.box("先核对。", speaker=name, marker=True)
+        feed.other()
+    feed.box("这一段", speaker="林夏小漫", speaker_confidence=0.6)
+    feed.box("这一段已经结束。", speaker="林夏小满", marker=True)
+    assert len(feed.records) == 4
+    assert feed.tracker.canonical_speaker(feed.records[2]) == "林夏小漫"
+    assert feed.tracker.canonical_speaker(feed.records[3]) == "林夏小满"
+
+
 def test_a_name_of_only_punctuation_is_read() -> None:
     """“？？？”是读到了的名字：与“？”是同一个，与有字的名字不同。"""
     feed = Feed()

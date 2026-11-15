@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
+from game_runtime.adapter import ScreenType
+
 REVISION_TOLERANCE: Final = 4
 """同一句的容差：当前句的比较文本有 n 个字时，文字容许的编辑距离为 ⌊n / 4⌋；名字较长一方有 m
 个字时为 max(1, ⌊m / 4⌋)。"""
@@ -70,6 +72,20 @@ class NarrativeRecord:
     @property
     def closed(self) -> bool:
         return self.closed_frame is not None
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenRecord:
+    """已接受的画面观察，按原帧归入本机剧情时间线。"""
+
+    session: int
+    scope: int
+    frame_number: int
+    capture_ns: int
+    transform_version: int
+    screen_type: ScreenType
+    confidence: float
+    text: str
 
 
 @dataclass(frozen=True, slots=True)

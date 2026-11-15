@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from game_runtime.adapter import ScreenType
 from game_runtime.narrative import (
     SCHEMA_VERSION,
     Completeness,
@@ -18,8 +19,10 @@ from game_runtime.narrative import (
     NarrativeStore,
     NarrativeStoreError,
     Scope,
+    ScreenRecord,
     read_cutscenes,
     read_discontinuities,
+    read_observations,
     read_records,
     read_scopes,
     read_sessions,
@@ -95,7 +98,29 @@ def test_the_store_lives_in_the_local_data_dir_per_game(data_dir: Path) -> None:
     assert store.path == data_dir / "narrative" / "synthetic-game.sqlite3"
     assert store_path(data_dir, "witch-trial") == data_dir / "narrative" / "witch-trial.sqlite3"
     assert store.path.is_file()
-    assert user_version(store.path) == SCHEMA_VERSION == 3
+    assert user_version(store.path) == SCHEMA_VERSION == 4
+
+
+def test_observations_upgrade_a_v3_store_and_follow_session_retention(data_dir: Path) -> None:
+    original = open_store(data_dir)
+    path, previous = original.path, original.session
+    original.write([record(previous, 1)])
+    original.close()
+    connection = sqlite3.connect(path)
+    connection.executescript("DROP TABLE observations; PRAGMA user_version = 3;")
+    connection.close()
+
+    store = open_store(data_dir)
+    note = ScreenRecord(store.session, 1, 42, 55, 2, ScreenType.DIALOGUE, 0.75, "合成观察")
+    assert store.write_observation(note)
+    assert not store.write_observation(dataclasses.replace(note, text="重复帧"))
+    assert read_observations(path, store.session) == [note]
+    assert read_records(path, previous) == [record(previous, 1)]
+    store.close()
+    assert user_version(path) == 4
+
+    open_store(data_dir, keep=1).close()
+    assert read_observations(path, note.session) == []
 
 
 def test_records_are_written_and_read_back(data_dir: Path) -> None:
