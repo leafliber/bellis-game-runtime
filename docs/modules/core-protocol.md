@@ -118,7 +118,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 
 - 以 Rust 类型为源（`core/crates/core-protocol`，serde，拒绝未知字段），schemars 生成 JSON Schema 2020-12，再由 datamodel-code-generator 生成 Pydantic 模型，见[生成与核对](#生成与核对)。
 - 消息走 `bellis-channel/1` 帧，内容为 JSON-RPC 2.0（同 Bellis D-21）。实时核是通道客户端，主进程是服务端；两边都可以发请求与通知。
-- 握手校验协议版本；两端同仓库同发布，仍然校验。
+- 核协议当前版本为 2。握手校验版本，主进程、实时核与操作员控制台应使用同一发布中的生成物。
 
 核连接承载：动作块、控制产出者心跳与代次、执行回执、输入已释放的确认、实时核健康，以及帧环与音频环的挂接、采集目标、音频目标与正常停止。输入许可不经核连接：主进程只能让输入停下，不能让输入继续；许可的语义见[输入许可](#输入许可)，G0 唯一的许可源在只用于测试的[测试设备连接](#测试设备连接)上。
 
@@ -143,10 +143,10 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 ### 会话
 
 1. 实时核通过通道认证后先发 `core.hello`；主进程核对协议版本，不相等即以 -32001 回错并断开。握手完成前双方不发其它消息。
-2. 实时核随即发 `input.released(core_start)`（启动时已先释放全部输入），之后才处理任何产出者消息；主进程收到它才算实时核就绪。实时核立即发第一条 `core.health`，此后按周期发。
+2. 实时核随即发 `input.released(core_start)`，初始状态为 `unverified`。主进程用它判断进程已就绪。真实输入还须等输入策略到达和该次核验成功。实时核立即发第一条 `core.health`，此后按周期发。
 3. 主进程先发 `frame_ring.attach`，再发 `capture.set_target`；配置了音频时接着发 `audio_ring.attach` 与 `audio.set_target`；之后才开始发心跳（主进程一侧见帧环与音频环各自的挂接：[帧环](#读写规则)、[音频环](#音频环的读写规则)）。
 4. 当前控制产出者定期发 `producer.heartbeat`，以 `action.submit` 提交动作块；实时核以 `action.receipt` 报一次性动作的结果，每次释放全部输入后发 `input.released`。
-5. 更换控制产出者（[QUIESCING](plugin-kernel.md#生命周期)）：停止提交动作块 → `producer.revoke`，等到它的回应，即输入已释放的确认 → 撤销注册。
+5. 更换控制产出者（[QUIESCING](plugin-kernel.md#生命周期)）：停止提交动作块 → `producer.revoke` → 等释放确认 → 撤销注册。真实输入须等该请求返回的释放编号完成物理核验。
 6. 正常停止：主进程发 `core.stop`；实时核释放全部输入，发 `input.released`，回应写出后退出。这是 Bellis R-06 停止顺序中的 RPC 一步。
 
 心跳周期 100 ms、心跳超时 500 ms，`core.health` 周期 1 秒、主进程判定失联 3 秒，动作允许的帧龄 500 ms，都可配置；依据与真实输入下的实测（PENDING，G2）见[时限](realtime-core.md#时限)。
@@ -163,11 +163,12 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `input.configure` | 主进程 → 实时核 | 请求 | `InputPolicy` → `Empty` | 交出输入策略：动作白名单与静态禁区 |
 | `producer.heartbeat` | 主进程 → 实时核 | 通知 | `ProducerHeartbeatParams` | 控制产出者心跳 |
 | `action.submit` | 主进程 → 实时核 | 请求 | `ActionBlock` → `ActionSubmitResult` | 提交[动作块](#动作块) |
-| `producer.revoke` | 主进程 → 实时核 | 请求 | `ProducerRevokeParams` → `Empty` | 作废代次；回应即输入已释放的确认 |
+| `producer.revoke` | 主进程 → 实时核 | 请求 | `ProducerRevokeParams` → `ProducerRevokeResult` | 作废代次并返回对应的释放编号 |
 | `core.stop` | 主进程 → 实时核 | 请求 | `Empty` → `Empty` | 正常停止 |
 | `action.receipt` | 实时核 → 主进程 | 通知 | `ActionReceiptParams` | 执行回执 |
-| `input.released` | 实时核 → 主进程 | 通知 | `InputReleasedParams` | 输入已释放的确认 |
-| `input.residual` | 实时核 → 主进程 | 通知 | `InputResidualParams` | 真实后端核验时仍读作按住、已补发抬起的项 |
+| `input.released` | 实时核 → 主进程 | 通知 | `InputReleasedParams` | 释放处理回执 |
+| `input.residual` | 实时核 → 主进程 | 通知 | `InputResidualParams` | 真实后端读作按住的项与补发提交结果 |
+| `input.verification` | 实时核 → 主进程 | 通知 | `InputVerificationParams` | 真实后端对一次释放的物理核验结果 |
 | `core.health` | 实时核 → 主进程 | 通知 | `CoreHealthParams` | 实时核健康，也是主进程判断实时核存活的依据 |
 
 输入许可的消息不在核连接上，见[测试设备连接](#测试设备连接)。
@@ -240,7 +241,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - 心跳或动作块的代次不大于已作废的代次，或小于当前代次：拒绝。代次等于当前代次而身份不同：拒绝。
 - 代次大于当前代次：先释放全部输入（`producer_changed`），再以它为当前代次。没有当前产出者时（启动后、当前代次被作废后）直接以它为当前代次，不需要释放。以动作块切换的新代次还没有心跳，心跳到达之前它的动作不发（权威检查的第二个条件）；主进程在一个代次的第一块之前先发一次心跳（[提交动作块](plugin-kernel.md#提交动作块)）。
 - `producer.heartbeat` 的 `seq` 在同一代次内严格递增，不递增的心跳不算数；新代次的 `seq` 从它的第一次心跳算起。心跳超时即释放全部输入（`heartbeat_timeout`）并待命：产出者仍是当前的，同一代次 `seq` 递增的心跳到达后重新计时。
-- `producer.revoke` 作废 `generation` 及更早的全部代次，之后这些代次的心跳与动作块都被拒绝；当前代次在其中时先释放全部输入（`generation_revoked`），此后没有当前产出者。实时核在释放完成后才回应，回应即这些代次的输入已释放的确认。
+- `producer.revoke` 作废 `generation` 及更早的全部代次，之后这些代次的心跳与动作块都被拒绝。当前代次在其中时发出全部抬起请求（`generation_revoked`）并回执。回应的 `release_id` 是该次释放的编号。真实后端已无产出者时也可关联最后一次释放，从此期间没有新的按下。没有可关联释放时编号为 `null`。物理确认来自同编号的 `input.verification`。
 
 **`action.submit`** 的 params 见[动作块](#动作块)。params 解析不了（未知字段、类型或范围不对）回参数无效（-32602）；能解析的按动作块的规则校验，result 是联合类型 `ActionSubmitResult`：
 
@@ -258,18 +259,20 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `dropped`（`Dropped`） | `id`、`reason` | 没有执行：`superseded`（新的动作块已取代本块未执行的部分）、`duplicate`（同一身份在本代次已执行过）、`released`（到时实时核已释放输入，原因见 `input.released`）、`geometry_changed`（带坐标的动作：基准帧之后客户区的尺寸或 DPI 变了，或基准帧的几何已查不到，见[坐标与几何](#坐标与几何)）、`not_allowed`（落点不在输入策略的 `click_regions` 内或在 `forbidden_zones` 内）、`rate_limited`（超过输入策略的 `max_rate`），后两者见[输入策略](realtime-core.md#输入策略) |
 | `uncertain`（`Uncertain`） | `id`、`at_ns` | 真实后端已注入，但注入过程中前台窗口变了，游戏是否收到不确定；实时核随即释放全部输入（`focus_lost`），不重试，见[注入](realtime-core.md#注入) |
 
-**`input.released`**：实时核每次释放全部输入后发出，不论释放前是否持有输入。有操作员许可连接时也在那条连接上发出（[操作员许可连接](#操作员许可连接)）。核连接断开时已无法发出，只记日志（以假后端运行时测试设备也能看到，见[测试设备连接](#测试设备连接)）；stdin 读到 EOF 时连接若还在就发出，随即以 0 退出（[生命线与 panic](realtime-core.md#生命线与-panic)）。
+**`input.released`** 在实时核处理完一次全部释放请求后发出，即使账目为空。有操作员许可连接时也转发给控制台。核连接断开后可查日志与旁路记录（[生命线与 panic](realtime-core.md#生命线与-panic)）。
 
 | 字段 | 含义 |
 | --- | --- |
 | `reason` | 见下表 |
+| `release_id` | 实时核实例内递增的释放编号，从 1 开始 |
 | `producer` | 释放时的当前控制产出者；没有时为 `null` |
-| `released_at_ns` | 释放完成的时刻 |
+| `released_at_ns` | 抬起请求处理完毕的时刻 |
+| `verification` | `unverified` 表示暂无物理核验证据，`up_failed` 表示系统拒绝了至少一项抬起 |
 
 | 原因 | 何时 |
 | --- | --- |
 | `core_start` | 启动时先释放 |
-| `generation_revoked` | 当前代次被 `producer.revoke` 作废 |
+| `generation_revoked` | 当前代次被 `producer.revoke` 或[采集源变更](realtime-core.md#采集主循环)作废 |
 | `producer_changed` | 出现更高的代次，切换前先释放 |
 | `heartbeat_timeout` | 当前产出者的心跳超时；权威检查时这一代次没有有效心跳（超时后待命，或还没有心跳）也是它 |
 | `deadline_expired` | 到截止时刻没有新的动作块 |
@@ -282,7 +285,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `takeover` | 真实后端：许可有效时钩子看到真人输入或第三方注入；同时在本地撤权（[接管与急停](realtime-core.md#接管与急停)） |
 | `emergency_stop` | 真实后端：按下急停组合键；同时在本地撤权 |
 | `injection_blocked` | 真实后端：SendInput 注入的事件少于给出的；同时在本地撤权 |
-| `hook_lost` | 真实后端：本实例的注入没有经过自己的钩子，钩子已失效；同时在本地撤权，随后重新装钩子 |
+| `hook_lost` | 真实后端钩子失效，本实例撤权并拒绝后续许可 |
 | `max_hold` | 持续状态里的一项按住超过输入策略的 `max_hold_ms` |
 | `stop` | 收到 `core.stop` |
 | `core_connection_lost` | 生命线：核连接断开。主进程收不到，见日志与测试设备 |
@@ -290,14 +293,25 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 
 权威检查不成立时的原因按[权威规则](../architecture.md#权威)三个条件的顺序取第一个不成立的：许可（`lease_*`、`no_lease`）、产出者与心跳（`heartbeat_timeout`、`producer_changed`）、帧龄（`frame_stale`）；以真实后端运行时其后是前台（`focus_lost`）。
 
-**`input.residual`**：只在真实后端上。释放全部输入之后、以及收到输入策略时，实时核以 `GetAsyncKeyState` 核验输入策略里的键与鼠标键，仍读作按住的项已补发抬起，以这条通知报出；没有残留不发。有操作员许可连接时也在那条连接上发出。规则见[持键账目与释放](realtime-core.md#持键账目与释放)。
+**`input.residual`** 只在真实后端读到仍按住的项时发出，并转发给操作员控制台。规则见[持键账目与释放](realtime-core.md#持键账目与释放)。
 
 | 字段 | 含义 |
 | --- | --- |
 | `cause` | `release`（释放全部输入之后的核验，`reason` 同那次 `input.released`）或 `core_start`（新实例收到输入策略时的核验，旧实例可能留下了按住的键） |
+| `release_id` | 对应的释放编号 |
 | `reason` | `cause` 为 `release` 时那次释放的原因，否则为 `null` |
 | `items` | 读作按住的项，联合类型 `HeldInput` 的 `key` 与 `mouse_button`，至少一项 |
+| `repair_accepted` | 系统是否接受了全部补发抬起事件 |
 | `checked_at_ns` | 读按键状态的时刻 |
+
+**`input.verification`** 报对应释放编号的核验结果。匹配键是连接所属的实时核实例与 `release_id`。证据的时点为 `checked_at_ns`，后续输入或释放有自己的时序。
+
+| `result` | 含义 |
+| --- | --- |
+| `verified` | 在可读取的输入桌面上观察到输入策略里的键与鼠标键均未按住 |
+| `residual` | 补发后仍读到残留，或系统拒绝补发的抬起 |
+| `unavailable` | 按键状态无法读取，或本实例已有已知物理释放故障 |
+| `superseded` | 这次核验已被更新的释放取代 |
 
 **`core.health`**
 
@@ -320,7 +334,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | --- | --- |
 | `producer` | 产出者身份与代次；实时核拒绝其它产出者和旧代次的动作块 |
 | `seq` | 动作块序号，同一代次内严格递增 |
-| `base_frame` | 基准帧号：产出者做决定时依据的帧，坐标按这一帧的客户区解释 |
+| `base_frame` | 产出者做决定时依据的帧。真实后端拒绝基准帧超出本次采集范围的含输入块（`not_allowed`）。坐标按这一帧的客户区解释 |
 | `start_ns` | 起始时刻，与帧环同一时钟 |
 | `deadline_ns` | 有效截止时刻：到时还没有新的动作块，实时核即释放 |
 | `steps` | 按时间排列的控制步，至少一步 |
@@ -336,7 +350,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 - 坐标是基准帧客户区的物理像素；`scan_code` 是 Set 1 扫描码，扩展键在高字节带 `0xE0`；`button` 为 `left`、`right` 或 `middle`；`notches` 正数向前；`dx`、`dy` 是鼠标计数，正数向右、向下。点击与短按的按住时长、轴名的白名单由游戏适配包给出。
 - **持续状态**（按住的键、轴）每块完整给出，缺项按释放处理，不沿用旧值。同一步中同一键、鼠标键或轴只能出现一次，轴的取值在 [-1, 1]。
 - **一次性动作**（点击、短按、滚动、相对位移）按身份在同一代次内去重：已执行过的身份回执 `duplicate`，重传不重复执行、不延长持续时间；被取代或因释放而没执行的不算执行过。块内身份不得重复。
-- 新接受的动作块从它的起始时刻起取代上一块未执行的部分（回执 `superseded`），上一块此前的步照常执行；上一块的截止时刻早于新块的起始时刻时，上一块的持续状态在它的截止时刻抬起（不算释放全部，不发 `input.released`）。到达时时刻已过的步立即执行；截止时刻之后不再执行任何步。
+- 新接受的块从起始时刻取代旧块余下的内容（回执 `superseded`）。旧块截止早于新块起始时，旧块的持续状态在其截止时抬起。调度醒来时已过期的旧块只处理抬起，丢弃尚未执行的动作。
 - 到截止时刻没有新的动作块：释放全部输入（`deadline_expired`），这一块结束。
 - 权威检查不成立而释放时，这一块随之结束：其余动作回执 `released`，之后的步不再执行，要继续须提交新的动作块。
 - 不合以上规则、步的时刻晚于截止时刻、`start_ns + offset_ns` 溢出或没有步的动作块整块拒绝（`invalid`）。
@@ -371,7 +385,8 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | 到了到期时刻 | 过期，释放全部输入（`lease_expired`）。调度线程按到期时刻定时，不等下一个动作 |
 | 吊销：令牌不小于有效许可的令牌 | 吊销，释放全部输入（`lease_revoked`）；此后这个令牌及更早的令牌都不能再授予 |
 | 与许可源的连接断开 | 此后没有许可，释放全部输入（`lease_source_lost`） |
-| 本地撤权：真实后端上的接管、急停、注入被拦截、钩子失效 | 同吊销当前令牌，释放全部输入（原因为 `takeover`、`emergency_stop`、`injection_blocked`、`hook_lost`），此后这个令牌及更早的令牌都不能再授予；许可源须换发更大的令牌（[接管与急停](realtime-core.md#接管与急停)） |
+| 本地撤权：真实后端上的接管、急停、注入被拦截 | 吊销当前令牌并释放输入，许可源须换发更大的令牌（[接管与急停](realtime-core.md#接管与急停)） |
+| 钩子失效，或物理释放失败 | 吊销许可，此实例拒绝后续令牌（-32004） |
 | 没有许可源（没有输入后端） | 从无许可（`no_lease`），不发任何输入 |
 
 许可源只有一个：给了操作员许可连接时，测试许可源不构造（[测试设备连接](#测试设备连接)的门禁）。
@@ -392,6 +407,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `operator_lease.revoke` | 控制台 → 实时核 | 请求 | `LeaseRevokeParams` → `Empty` | 吊销 `token` 及更早的令牌；释放完成后才回应 |
 | `input.released` | 实时核 → 控制台 | 通知 | `InputReleasedParams` | 每次释放全部输入后发出，同核连接的 [`input.released`](#消息集) |
 | `input.residual` | 实时核 → 控制台 | 通知 | `InputResidualParams` | 真实后端核验出残留时发出，同核连接的 [`input.residual`](#消息集) |
+| `input.verification` | 实时核 → 控制台 | 通知 | `InputVerificationParams` | 真实后端核验结果，同核连接的 [`input.verification`](#消息集) |
 
 `LeaseGrantParams`、`LeaseRevokeParams` 也是 `test_lease.grant`、`test_lease.revoke` 的 params。
 
@@ -464,7 +480,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | 偏移 | 字段 | 类型 | 含义 |
 | --- | --- | --- | --- |
 | 0 | `seq` | 原子 u64 | seqlock 序号：奇数表示正在写，偶数表示稳定 |
-| 8 | `frame_number` | u64 | 帧号，从 1 起在本帧环内严格递增；槽号为 `(frame_number − 1) mod slot_count` |
+| 8 | `frame_number` | u64 | 从 1 起编号并严格递增，可跳号。槽号为 `(frame_number − 1) mod slot_count` |
 | 16 | `capture_ns` | u64 | 采集时刻，与核协议的 `_ns` 时刻同一时钟 |
 | 24 | `transform_version` | u64 | 窗口与 DPI 变换版本，窗口移动、缩放或 DPI 变化时加一 |
 | 32 | `width` | u32 | 帧宽，不超过 `max_width` |
@@ -483,7 +499,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 
 - **写一帧**：把槽的 `seq` 置为下一个奇数（偶数加一，崩溃后遗留的奇数加二），随后一道释放栅栏；写槽头部其余字段与像素，像素去掉行尾的填充，槽的行跨度为 `width × 4`；把 `seq` 加一成为偶数（释放）；最后把 `write_seq` 置为该帧号（释放）。比最大尺寸大或本身不合规则（帧号为 0、宽或高为 0、行跨度小于 `width × 4`、像素不足）的帧不写，帧环不受影响。
 - **读最新一帧**：读 `write_seq`（获取）得到帧号，为 0 即还没有帧；读该帧槽的 `seq`（获取），为奇数即撕裂；复制槽头部，`frame_number` 不是所求帧号即撕裂；槽头部不合布局（尺寸超过最大值、行跨度小于 `width × 4` 或像素放不进槽、像素格式不是 BGRA8）时重读 `seq`，变了算撕裂，没变即报帧环损坏；复制像素，一道获取栅栏后重读 `seq`，与先前不等即撕裂。撕裂就从读 `write_seq` 起重试，有上限（主进程缺省 8 次），都撕裂时这次读取失败，稍后再读。
-- **帧号**：帧号 = 续写基数 + 采集源的帧号。挂接时续写基数取头部的 `write_seq`，所以实时核重启后帧号续写、不回退；采集源的帧号不再增大（新建了采集源，帧号从 1 重新数起）时，续写基数改为已写出的最大帧号。同一采集源相邻两帧的帧号之差减一仍是其间丢弃的帧数（[采集源接口](realtime-core.md#采集源接口)）。客户区原点与 DPI 不进帧环。
+- **帧号**：帧号 = 续写基数 + 采集源的帧号。挂接时续写基数取头部 `write_seq` 与本实例已写出的最大帧号中较大的值，保证重启或换环时旧编号不会在当前采集中重复。采集源的帧号回退时，续写基数改为已写出的最大帧号。同一采集源相邻两帧的帧号之差减一仍是其间丢弃的帧数（[采集源接口](realtime-core.md#采集源接口)）。客户区原点与 DPI 不进帧环。
 
 **挂接。** 主进程一侧由 `CoreLink`（`runtime/src/game_runtime/core_link/`）实现：
 
