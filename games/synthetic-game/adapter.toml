@@ -216,6 +216,7 @@ screen = "dialogue"
 speaker = "speaker"
 text = "dialogue"
 continue_signature = "dialogue-continue"
+advance = "click-text"
 
 # 阅读节奏是可选的覆盖（docs/modules/game-adapter.md 的“阅读节奏”），这里作为格式的样例写全。
 [pacing]

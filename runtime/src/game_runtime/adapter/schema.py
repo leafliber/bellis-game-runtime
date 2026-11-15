@@ -509,6 +509,8 @@ class DialogueBox(_Model):
     continue_signature: Ident | None = None
     """继续标记的签名：指向同一画面（不写 `screen` 时指向一个对话类的画面），本帧命中即继续标记
     可见；游戏没有继续标记时不写。"""
+    advance: Literal["click-text"] | None = None
+    """签名确认的对白画面可用左键点击当前完整句中可唯一定位的一行。"""
 
     @model_validator(mode="after")
     def _distinct(self) -> Self:
@@ -652,6 +654,12 @@ class Adapter(_Model):
             for field, name in (("speaker", box.speaker), ("text", box.text)):
                 if name is not None and name not in self.rois:
                     yield f"{where}.{field}：没有声明 ROI {name}"
+            if box.advance is not None:
+                roi = self.rois.get(box.text)
+                if roi is None or roi.rect is None:
+                    yield f"{where}.advance：须标定对白文字 ROI"
+                if MouseButton.LEFT not in self.whitelist.click_buttons:
+                    yield f"{where}.advance：动作白名单须允许左键"
             if box.continue_signature is not None:
                 signature = signatures.get(box.continue_signature)
                 if signature is None:

@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
@@ -13,12 +13,20 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core_protocol import models
 from game_runtime.adapter import Adapter, ScreenType
-from game_runtime.adapter.schema import DecisionTimer
+from game_runtime.adapter.schema import DecisionTimer, DialogueBox
 from game_runtime.channel import ChannelError
 from game_runtime.kernel import ControlGrant, ControlRevokedError
+from game_runtime.narrative import NarrativeRecord
 from game_runtime.ocr import OcrResult, OcrService
 from game_runtime.operator import Clock, OperatorClient, SessionState, messages
-from game_runtime.scene import SceneService, SceneUpdate, ScreenSource, Stability, Verdict
+from game_runtime.scene import (
+    SceneService,
+    SceneUpdate,
+    ScreenObservation,
+    ScreenSource,
+    Stability,
+    Verdict,
+)
 from game_runtime.step_control.contracts import (
     Category,
     Click,
@@ -45,6 +53,7 @@ from game_runtime.step_control.decisions import (
     PendingDecision,
     timer_deadline,
 )
+from game_runtime.step_control.pacing import ReadingPacing, ReadingWaitError, line_revision
 from game_runtime.step_control.risk import (
     STOPPED,
     ActionRefusedError,
@@ -76,6 +85,7 @@ class StepConfig(BaseModel):
     cutscene_timeout: Seconds = 600.0
     snap_radius: Annotated[int, Field(ge=1, le=256)] = 48
     max_rejections: Annotated[int, Field(ge=1, le=20)] = 3
+    fast_paths: bool = True
 
 
 def _ns(seconds: float) -> int:
@@ -98,6 +108,7 @@ class StepController:
         progress: SessionProgress,
         operator_goal: OperatorGoalRelay,
         planner_binding: PlannerBinding,
+        reading: ReadingPacing,
     ) -> None:
         self.adapter = adapter
         self.scene = scene
@@ -109,6 +120,7 @@ class StepController:
         self.config = config
         self._core_ready = core_ready
         self._planner = planner
+        self._reading = reading
         self._planner_binding = planner_binding
         self._planner_paused = False
         self._planner_planning = False
@@ -231,6 +243,10 @@ class StepController:
                 task = asyncio.current_task()
                 if task is not None and task.cancelling():
                     raise
+            except ReadingWaitError as wait:
+                self._plan.clear()
+                self._last_proposed = None
+                self._record(StepStatus.WAITING, str(wait), self.scene.latest)
             except ActionRefusedError as error:
                 self._plan.clear()
                 latest = self.scene.latest
@@ -284,6 +300,20 @@ class StepController:
                     planner.on_observation(event)
         except Exception:
             logger.exception("逐步控制回执未交给 planner")
+
+    def _accept_observation(
+        self, update: SceneUpdate, observation: ScreenObservation, text: str | None
+    ) -> bool:
+        if not self.scene.observe(update, observation):
+            return False
+        if text is not None:
+            frame = update.frame
+            self._planner_event(
+                ObservationReceipt(
+                    frame.frame_number, frame.transform_version, frame.capture_ns, text, observation
+                )
+            )
+        return True
 
     def _goal_feedback(
         self, kind: Literal["completed", "step-limit", "timeout", "rejected"], detail: str = ""
@@ -391,13 +421,71 @@ class StepController:
         return age <= _ns(self.config.max_frame_age)
 
     def _waiting_time(self) -> bool:
-        interval = 1 / self.adapter.whitelist.max_rate
-        if self.adapter.pacing is not None:
-            interval = max(interval, self.adapter.pacing.min_action_interval)
+        interval = max(
+            1 / self.adapter.whitelist.max_rate, self._reading.params.min_action_interval
+        )
         return (
             self._last_action_ns is not None
             and self.clock.now_ns() - self._last_action_ns < _ns(interval)
         )
+
+    def _dialogue_box(self, update: SceneUpdate) -> DialogueBox | None:
+        if update.screen_state.classification.screen_type is not ScreenType.DIALOGUE:
+            return None
+        screen = update.state.screen
+        explicit = next((box for box in self.adapter.dialogue_boxes if box.screen == screen), None)
+        return explicit or next(
+            (box for box in self.adapter.dialogue_boxes if box.screen is None), None
+        )
+
+    async def _dialogue_read(self, update: SceneUpdate, box: DialogueBox) -> OcrResult:
+        if self.adapter.rois[box.text].rect is None:
+            raise ReadingWaitError("dialogue-roi-unavailable")
+        read = await self.ocr.recognize(update.frame, box.text)
+        verify_ocr(update, read)
+        return read
+
+    def _dialogue_ready(
+        self, update: SceneUpdate, box: DialogueBox, read: OcrResult
+    ) -> NarrativeRecord:
+        record = self._reading.require_ready(update, box, self.clock.now_ns())
+        if text_key(read.text) != text_key(record.text):
+            raise ReadingWaitError("dialogue-text-changed")
+        return record
+
+    async def _advance_dialogue(
+        self, update: SceneUpdate, box: DialogueBox, initial: NarrativeRecord, revision: int
+    ) -> None:
+        if (initial.session, initial.occurrence) == self._progress.fast_dialogue_line:
+            raise ReadingWaitError("dialogue-awaiting-next-line")
+        read = await self._dialogue_read(update, box)
+        here = self.scene.with_ocr(update, (read,))
+        if here is None:
+            raise ActionRefusedError("scene-changed")
+        record = self._dialogue_ready(here, box, read)
+        if line_revision(initial) != line_revision(record):
+            raise ReadingWaitError("dialogue-text-changed")
+        lines = here.screen_state.text_targets
+        counts = Counter(text_key(line.text) for line in lines)
+        line = next(
+            (line for line in lines if line.text.strip() and counts[text_key(line.text)] == 1), None
+        )
+        if line is None:
+            raise ReadingWaitError("dialogue-target-ambiguous")
+        proposal = StepProposal(
+            Category.ADVANCE,
+            Click(TextTarget(text=line.text, roi=box.text)),
+            ExpectedEffect(EffectKind.TEXT_DISAPPEARED, text=line.text, roi=box.text),
+        )
+        rect = line.box
+        found = Located(
+            ((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2), line, (read,)
+        )
+        speaker = "" if record.speaker is None else f"{record.speaker}："
+        observation = ScreenObservation(screen_type=ScreenType.DIALOGUE, confidence=1.0)
+        if not self._accept_observation(here, observation, f"{speaker}{record.text}"[:600]):
+            raise ActionRefusedError("scene-changed")
+        await self._issue_with_retry(here, proposal, found, revision, fast_dialogue=record)
 
     def _restart_permitted(self, update: SceneUpdate) -> bool:
         ending = self._progress.ending
@@ -550,6 +638,18 @@ class StepController:
             self._last_proposed = update.observation_scope
             await self._open_from_scene(update, revision)
             return
+        box = self._dialogue_box(update)
+        if box is not None and not at_limit:
+            record = self._reading.require_ready(update, box, self.clock.now_ns())
+            if (
+                self.config.fast_paths
+                and box.advance == "click-text"
+                and update.screen_state.classification.source is ScreenSource.SIGNATURE
+                and (goal is None or not goal.completion_by_agent)
+            ):
+                self._plan.clear()
+                await self._advance_dialogue(update, box, record, revision)
+                return
         if self._plan and update.observation_scope is not self._verified_scope:
             self._plan.clear()
         continuing = bool(self._plan)
@@ -561,21 +661,11 @@ class StepController:
             inputs = self._inputs(context)
             original_session = (self.operator.session_id, self.operator.session)
             plan = await self.propose(inputs)
-            if plan.observation is not None:
-                if not self.scene.observe(update, plan.observation):
-                    self._reject("scene-changed", update)
-                    return
-                if plan.observation_text is not None:
-                    frame = update.frame
-                    self._planner_event(
-                        ObservationReceipt(
-                            frame.frame_number,
-                            frame.transform_version,
-                            frame.capture_ns,
-                            plan.observation_text,
-                            plan.observation,
-                        )
-                    )
+            if plan.observation is not None and not self._accept_observation(
+                update, plan.observation, plan.observation_text
+            ):
+                self._reject("scene-changed", update)
+                return
             latest = self.scene.latest
             if latest is None or latest.observation_scope is not update.observation_scope:
                 self._reject("scene-changed", update)
@@ -700,15 +790,7 @@ class StepController:
                 else:
                     raise ActionRefusedError("decision-evidence-missing")
                 return
-            status = await self._issue(here, proposal, found, revision)
-            if status is StepStatus.NO_EFFECT and found.line is not None:
-                # 同一帧段、到时仍无效果，且动作可吸附时才允许再定位一次。
-                fresh = await self._retry_frame(here, revision)
-                if fresh is not None:
-                    retry = await self._locate(fresh, proposal)
-                    retry_frame = self._current(fresh, retry, revision)
-                    if not assess(self.adapter, retry_frame, proposal, retry):
-                        status = await self._issue(retry_frame, proposal, retry, revision)
+            status = await self._issue_with_retry(here, proposal, found, revision)
             if status is not StepStatus.VERIFIED or proposal.expected.kind in {
                 EffectKind.CHANGED,
                 EffectKind.UNCHANGED,
@@ -720,6 +802,29 @@ class StepController:
         except ActionRefusedError as error:
             self._plan.clear()
             self._reject(str(error), update, proposal.category)
+
+    async def _issue_with_retry(
+        self,
+        here: SceneUpdate,
+        proposal: StepProposal,
+        found: Located,
+        revision: int,
+        *,
+        fast_dialogue: NarrativeRecord | None = None,
+    ) -> StepStatus:
+        status = await self._issue(here, proposal, found, revision, fast_dialogue=fast_dialogue)
+        if status is not StepStatus.NO_EFFECT or found.line is None:
+            return status
+        fresh = await self._retry_frame(here, revision)
+        if fresh is None:
+            return status
+        retry = await self._locate(fresh, proposal)
+        retry_frame = self._current(fresh, retry, revision)
+        if assess(self.adapter, retry_frame, proposal, retry):
+            return status
+        return await self._issue(
+            retry_frame, proposal, retry, revision, fast_dialogue=fast_dialogue
+        )
 
     def _require_authority(self, revision: int) -> None:
         if revision != self._revision or not self._allowed():
@@ -771,6 +876,7 @@ class StepController:
                 return None
             if (
                 current is not None
+                and current.frame.frame_number > base.frame.frame_number
                 and current.state.stability is Stability.STABLE
                 and self._fresh(current)
                 and not self._waiting_time()
@@ -1080,6 +1186,7 @@ class StepController:
         *,
         decision: PendingDecision | None = None,
         restart: bool = False,
+        fast_dialogue: NarrativeRecord | None = None,
     ) -> StepStatus:
         auto_choice = decision is not None and decision.evidence.proposed is None
         if (
@@ -1095,6 +1202,18 @@ class StepController:
         ):
             raise ActionRefusedError("effect-already-present")
         here = self._current(update, found, revision)
+        box = self._dialogue_box(here)
+        reading: NarrativeRecord | None = None
+        if box is not None:
+            read = next((item for item in found.reads if item.roi == box.text), None)
+            if read is None:
+                read = await self._dialogue_read(here, box)
+                here = self._current(here, found, revision)
+            reading = self._dialogue_ready(here, box, read)
+        if fast_dialogue is not None and (
+            reading is None or line_revision(reading) != line_revision(fast_dialogue)
+        ):
+            raise ReadingWaitError("dialogue-text-changed")
         if restart and not self._restart_permitted(here):
             raise ActionRefusedError("restart-not-authorized")
         if assess(
@@ -1125,6 +1244,9 @@ class StepController:
         category = Category.SELECT if decision is not None else proposal.category
         self._last_action_ns = started
         self._progress.steps += 1
+        previous_dialogue_line = self._progress.fast_dialogue_line
+        if fast_dialogue is not None:
+            self._progress.fast_dialogue_line = fast_dialogue.session, fast_dialogue.occurrence
         if restart:
             self._progress.restart_attempt_revision = self._operator_goal.revision
         self._choice_submitting = decision is not None
@@ -1146,7 +1268,9 @@ class StepController:
                         )
                     receipt = (await sent.outcomes()).get(self._next_id)
                     if isinstance(receipt, models.Dropped):
-                        status, detail = StepStatus.REJECTED, receipt.reason.value
+                        detail = receipt.reason.value
+                        if receipt.reason is not models.DropReason.DUPLICATE:
+                            status = StepStatus.REJECTED
                     elif isinstance(receipt, models.Executed):
                         if decision is not None:
                             decision.executed_at_ns = receipt.at_ns
@@ -1176,6 +1300,9 @@ class StepController:
             detail = "execution-verification-failed"
             logger.exception("无法确认已提交动作的效果")
         if status is StepStatus.REJECTED:
+            if fast_dialogue is not None:
+                # 首次明确未执行可重试。若这是无效果后的重发，原提交仍保留。
+                self._progress.fast_dialogue_line = previous_dialogue_line
             self._reject(detail, here, category)
         else:
             self._record(status, detail, here, category, started)

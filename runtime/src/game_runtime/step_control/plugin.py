@@ -8,12 +8,15 @@ from core_protocol.models import InputReleasedParams, ReleaseReason
 from game_runtime.adapter import GAME_ADAPTER
 from game_runtime.kernel import CONTROL_SUBMIT, Manifest, Plugin, PluginContext, Tier
 from game_runtime.models import VLM
+from game_runtime.narrative import NARRATIVE
 from game_runtime.ocr import OCR
 from game_runtime.operator import Clock, OperatorClient, messages
 from game_runtime.scene import SCENE
 from game_runtime.step_control.contracts import PLANNER, POLICY, PlannerPort, Policy
 from game_runtime.step_control.controller import StepConfig, StepController
+from game_runtime.step_control.pacing import DEFAULT_PACING, ReadingPacing
 from game_runtime.step_control.supervision import OperatorGoalRelay, PlannerBinding, SessionProgress
+from game_runtime.voice_activity import VOICE_ACTIVITY
 
 _INTERRUPTS: Final = frozenset(
     {
@@ -89,7 +92,14 @@ def step_plugin_for(
             version="1",
             tier=Tier.CRITICAL,
             provides=(POLICY.ref,),
-            inject=(GAME_ADAPTER.ref, SCENE.ref, OCR.ref, *policy_dependencies),
+            inject=(
+                GAME_ADAPTER.ref,
+                SCENE.ref,
+                OCR.ref,
+                *policy_dependencies,
+                f"{NARRATIVE.ref}?",
+                f"{VOICE_ACTIVITY.ref}?",
+            ),
             permissions=(CONTROL_SUBMIT,),
             config=StepConfig,
         )
@@ -102,12 +112,21 @@ def step_plugin_for(
             if grant is None:
                 raise RuntimeError("逐步控制需要内核选定控制产出者")
             scene = ctx.service(SCENE)
+            adapter = ctx.service(GAME_ADAPTER)
 
             def planner() -> PlannerPort | None:
                 return ctx.optional(PLANNER) if model_policy is None else ctx.service(PLANNER)
 
+            reading = ReadingPacing(
+                adapter.pacing or DEFAULT_PACING,
+                lambda: ctx.optional(NARRATIVE),
+                lambda: ctx.optional(VOICE_ACTIVITY),
+            )
+            ctx.register(reading.close)
+            if adapter.dialogue_boxes:
+                reading.follow()
             controller = StepController(
-                ctx.service(GAME_ADAPTER),
+                adapter,
                 scene,
                 ctx.service(OCR),
                 grant,
@@ -120,6 +139,7 @@ def step_plugin_for(
                 signals.progress,
                 signals.operator_goal,
                 signals.planner_binding,
+                reading,
             )
             self.controller = controller
             signals.controller = controller

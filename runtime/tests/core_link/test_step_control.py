@@ -9,6 +9,7 @@ from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from pydantic import BaseModel, JsonValue
@@ -23,6 +24,7 @@ from game_runtime.frame_ring.fake import FakeDisplay
 from game_runtime.frames import AdmissionPolicy
 from game_runtime.kernel import (
     ControlGrant,
+    ControlRevokedError,
     Manifest,
     NoConfig,
     Plugin,
@@ -45,10 +47,11 @@ from game_runtime.models import (
     Purpose,
     VlmConfig,
 )
+from game_runtime.narrative import NARRATIVE_WRITE, NarrativePlugin, RoiPixels
 from game_runtime.ocr import OCR, FrameLike, OcrConfig, OcrLine, OcrResult, OcrService
 from game_runtime.ocr.fake import ScriptedRecognizer
 from game_runtime.operator import ConsoleEvent, ConsoleOptions, EventKind, OperatorConsole
-from game_runtime.scene import ScreenObservation, store_template
+from game_runtime.scene import SceneUpdate, ScreenObservation, store_template
 from game_runtime.secret_store import MemorySecretStore
 from game_runtime.step_control import (
     PLANNER,
@@ -74,7 +77,13 @@ from game_runtime.step_control import (
     TextTarget,
     supervise,
 )
-from game_runtime.voice_activity import VoiceActivityPlugin
+from game_runtime.voice_activity import (
+    VOICE_ACTIVITY,
+    VoiceActivityPlugin,
+    VoiceHub,
+    VoiceState,
+    VoiceStatus,
+)
 from game_runtime.voice_activity.fake import EnergyModel
 from synthetic_game import Click as GameClick
 from synthetic_game import GameConfig, Key, ManualClock, SyntheticGame, Truth
@@ -102,16 +111,20 @@ def contains(outer: PixelRect, inner: PixelRect) -> bool:
 
 
 class World:
-    def __init__(self, adapter: Adapter) -> None:
+    def __init__(self, adapter: Adapter, text_cps: float = 500) -> None:
         self.adapter = adapter
         self.clock = ManualClock()
         self.game = SyntheticGame(
-            GameConfig(WIDTH, HEIGHT, text_cps=500, choice_seconds=3.2),
+            GameConfig(WIDTH, HEIGHT, text_cps=text_cps, choice_seconds=3.2),
             self.clock,
         )
         self.reads: dict[int, tuple[OcrLine, ...]] = {}
+        self.capture_by_frame: dict[int, int] = {}
         self.presenting = False
+        self.advance_game_clock = True
         self.ignore_choice = False
+        self.ignore_dialogue_inputs = 0
+        self.next_submission_fault: Literal["rejected", "dropped", "revoked"] | None = None
         self.bad_timer = False
         self.timer_override: str | None = None
         self.first_choice_label: str | None = None
@@ -172,7 +185,8 @@ class World:
         last = time.perf_counter()
         while True:
             now = time.perf_counter()
-            self.clock.advance(now - last)
+            if self.advance_game_clock:
+                self.clock.advance(now - last)
             last = now
             if self.presenting:
                 frame = self.game.frame()
@@ -196,14 +210,35 @@ class World:
             self.presenting = False
         if self.ignore_choice and screen in (GameScene.CHOICE, GameScene.TIMED_CHOICE):
             return
+        if screen is GameScene.DIALOGUE and self.ignore_dialogue_inputs:
+            self.ignore_dialogue_inputs -= 1
+            return
         self.game.handle(action)
 
 
 def ocr_for(world: World) -> type[Plugin[OcrConfig]]:
     class TestOcrService(OcrService):
         def _read(self, frame: FrameLike, rect: PixelRect) -> tuple[OcrLine, ...]:
-            lines = world.reads.get(frame.capture_ns, ()) if isinstance(frame, RingFrame) else ()
-            return tuple(line for line in lines if contains(rect, line.box))
+            if isinstance(frame, RingFrame):
+                lines = world.reads.get(frame.capture_ns, ())
+                return tuple(line for line in lines if contains(rect, line.box))
+            if isinstance(frame, RoiPixels):
+                lines = world.reads.get(world.capture_by_frame.get(frame.frame_number, 0), ())
+                region = world.rect(frame.roi)
+                return tuple(
+                    replace(
+                        line,
+                        box=PixelRect(
+                            line.box.left - region.left,
+                            line.box.top - region.top,
+                            line.box.right - region.left,
+                            line.box.bottom - region.top,
+                        ),
+                    )
+                    for line in lines
+                    if contains(region, line.box)
+                )
+            return ()
 
         def read_lines(self, frame: FrameLike, rect: PixelRect) -> list[str]:
             return [line.text for line in self._read(frame, rect)]
@@ -324,6 +359,18 @@ def planner_for(planner: Callable[[], RecordingPlanner]) -> type[Plugin[NoConfig
     return FixturePlanner
 
 
+def voice_for(voice: VoiceHub) -> type[Plugin[NoConfig]]:
+    class FixtureVoice(Plugin[NoConfig]):
+        manifest = Manifest(
+            id="fixture-voice", version="1", tier=Tier.ORDINARY, provides=(VOICE_ACTIVITY.ref,)
+        )
+
+        async def activate(self, ctx: PluginContext[NoConfig]) -> None:
+            ctx.provide(VOICE_ACTIVITY, voice)
+
+    return FixtureVoice
+
+
 @dataclass
 class Rig:
     run: SupervisedRun
@@ -336,6 +383,16 @@ class Rig:
         while self.console.pending_confirmation is not None:
             await self.console.answer(True)
         await self.console.start()
+
+    def follow_idle_voice(self, voice: VoiceHub) -> Callable[[], None]:
+        controller = self.run.controller
+        assert controller is not None
+
+        def publish(update: SceneUpdate) -> None:
+            at_ns = update.frame.capture_ns
+            voice.publish([], VoiceStatus(VoiceState.IDLE, None, at_ns, at_ns))
+
+        return controller.scene.subscribe(publish)
 
     def closed(self, by: str, index: int | None) -> bool | None:
         return (
@@ -371,6 +428,10 @@ async def rig(
     planner: RecordingPlanner | Callable[[], RecordingPlanner] | None = None,
     decision_margin: float = 0.75,
     profile: Sequence[ResolvedEntry] | None = None,
+    reading: bool = False,
+    fast_paths: bool = True,
+    voice: VoiceHub | None = None,
+    text_cps: float = 500,
 ) -> AsyncGenerator[Rig]:
     source = GAMES_DIR / "synthetic-game" / "adapter.toml"
     directory = root / "games" / "synthetic-game"
@@ -379,11 +440,15 @@ async def rig(
     if restricted:
         risk += '\nforbidden_zones = ["menu-start"]'
     content = source.read_text(encoding="utf-8").replace("[risk]\n", f"[risk]\n{risk}\n")
+    if not reading and profile is None:
+        # 单独策略的非阅读用例独立验证授权、决策与效果。
+        before, rest = content.split("[[dialogue_boxes]]", 1)
+        content = before + "[pacing]" + rest.split("[pacing]", 1)[1]
     if freeze_test:
         content = content.replace("press_duration = 0.05", "press_duration = 0.30")
     (directory / "adapter.toml").write_text(content, encoding="utf-8")
     adapter = load_adapter(directory)
-    world = World(adapter)
+    world = World(adapter, text_cps)
     data = root / "data"
     for template in anchor_templates():
         store_template(data, adapter.id, template.png)
@@ -396,6 +461,31 @@ async def rig(
     console.add_listener(events.append)
     await console.open()
     loop = asyncio.get_running_loop()
+    add_narrative = reading and profile is None
+    narrative_plugins = (NarrativePlugin,) if add_narrative else ()
+    narrative_entries = (
+        (
+            ResolvedEntry(
+                id="narrative",
+                plugin="narrative",
+                config={"data_dir": str(data), "ocr_interval": 0.05, "complete_after": 1.0},
+                disabled=False,
+                grant=frozenset({NARRATIVE_WRITE}),
+            ),
+        )
+        if add_narrative
+        else ()
+    )
+    voice_plugins = () if voice is None else (voice_for(voice),)
+    voice_entries = (
+        ()
+        if voice is None
+        else (
+            ResolvedEntry(
+                id="voice", plugin="fixture-voice", config={}, disabled=False, grant=frozenset()
+            ),
+        )
+    )
 
     def input_event(event: DeviceEvent) -> None:
         loop.call_soon_threadsafe(world.input, event)
@@ -415,6 +505,18 @@ async def rig(
                 for action in step.actions:
                     if isinstance(action.root, models.Click):
                         world.submitted_click = (action.root.x, action.root.y)
+            fault, world.next_submission_fault = world.next_submission_fault, None
+            match fault:
+                case "rejected":
+                    # 重复动作身份使实时核在提交时拒绝整块。
+                    steps = (*steps, *steps)
+                case "dropped":
+                    # 坐标动作依赖的基准帧不存在，实时核接受动作块但不会执行。
+                    base_frame = 0
+                case "revoked":
+                    raise ControlRevokedError("合成用例在发送前报告代次失效")
+                case None:
+                    pass
             return await super().submit(
                 grant, steps, base_frame=base_frame, valid_for=valid_for, start_delay=start_delay
             )
@@ -451,28 +553,50 @@ async def rig(
                         max_frame_age=0.15 if freeze_test else 0.5,
                         action_valid_for=0.45 if freeze_test else 0.25,
                         decision_margin=decision_margin,
+                        fast_paths=fast_paths,
                     ),
                     profile=profile,
                     admission=AdmissionPolicy(max_rate=20, idle_interval=0.08),
-                    extra_plugins=()
-                    if planner is None
-                    else (planner_for(planner if callable(planner) else lambda: planner),),
-                    extra_entries=()
-                    if planner is None
-                    else (
-                        ResolvedEntry(
-                            id="plan",
-                            plugin="fixture-planner",
-                            config={},
-                            disabled=False,
-                            grant=frozenset(),
-                        ),
+                    extra_plugins=narrative_plugins
+                    + voice_plugins
+                    + (
+                        ()
+                        if planner is None
+                        else (planner_for(planner if callable(planner) else lambda: planner),)
+                    ),
+                    extra_entries=narrative_entries
+                    + voice_entries
+                    + (
+                        ()
+                        if planner is None
+                        else (
+                            ResolvedEntry(
+                                id="plan",
+                                plugin="fixture-planner",
+                                config={},
+                                disabled=False,
+                                grant=frozenset(),
+                            ),
+                        )
                     ),
                 ) as running:
                     await device.until_connected()
                     if profile is None:
                         assert running.kernel.status(STEP_ENTRY).state is State.ACTIVE
-                    yield Rig(running, console, device, world, events)
+                    remove = None
+                    if reading:
+                        controller = running.controller
+                        assert controller is not None
+                        remove = controller.scene.subscribe(
+                            lambda update: world.capture_by_frame.__setitem__(
+                                update.frame.frame_number, update.frame.capture_ns
+                            )
+                        )
+                    try:
+                        yield Rig(running, console, device, world, events)
+                    finally:
+                        if remove is not None:
+                            remove()
             finally:
                 presenting.cancel()
                 await asyncio.gather(presenting, return_exceptions=True)
@@ -1279,5 +1403,274 @@ def test_bad_ending_restarts_only_after_new_authorization(core_exe: Path, root: 
             [(source, click)] = r.world.inputs
             assert source is GameScene.BAD_ENDING
             assert isinstance(click, GameClick)
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("fast_paths", [True, False])
+def test_reading_pacing_routes_only_a_complete_line_with_current_voice_status(
+    core_exe: Path, root: Path, fast_paths: bool
+) -> None:
+    class VisualStub:
+        calls = 0
+
+        async def propose(self, inputs: PolicyInput) -> Plan:
+            self.calls += 1
+            return Plan(
+                steps=(
+                    StepProposal(
+                        Category.NAVIGATE, Press(ENTER), ExpectedEffect(EffectKind.CHANGED)
+                    ),
+                )
+            )
+
+    async def main() -> None:
+        voice = VoiceHub(VoiceStatus(VoiceState.IDLE, None, 0, 0))
+        policy = VisualStub()
+        planner = RecordingPlanner(PlannerContext(None))
+        async with rig(
+            core_exe,
+            root,
+            policy=policy,
+            planner=planner,
+            reading=True,
+            fast_paths=fast_paths,
+            voice=voice,
+            text_cps=12,
+        ) as r:
+            c = r.run.controller
+            assert c is not None
+            r.world.click("menu.start")
+            r.world.advance_game_clock = False
+            r.world.clock.advance(0.25)
+            r.world.presenting = True
+            await r.start()
+
+            await until(
+                lambda: (
+                    any(step.detail == "dialogue-awaiting-complete" for step in c.recent) or None
+                )
+            )
+            assert not r.world.inputs
+            assert policy.calls == 0
+            assert r.world.game.truth().visible_text != r.world.game.truth().text
+            r.world.clock.advance(2.0)
+            r.world.advance_game_clock = True
+            stamped = await until(
+                lambda: next(
+                    (
+                        step.frame_number
+                        for step in c.recent
+                        if step.detail == "dialogue-reading" and step.frame_number is not None
+                    ),
+                    None,
+                )
+            )
+            old_idle = r.world.capture_by_frame[stamped]
+            await until(
+                lambda: any(step.detail == "dialogue-voice-unknown" for step in c.recent) or None
+            )
+            await until(
+                lambda: (
+                    True
+                    if (latest := c.scene.latest) is not None and latest.frame.capture_ns > old_idle
+                    else None
+                )
+            )
+            voice.publish([], VoiceStatus(VoiceState.IDLE, None, old_idle, old_idle))
+            await asyncio.sleep(0.2)
+            assert not r.world.inputs
+            assert policy.calls == 0
+            r.follow_idle_voice(voice)
+            await until(lambda: r.world.inputs or None)
+            screen, action = r.world.inputs[0]
+            assert screen is GameScene.DIALOGUE
+            if fast_paths:
+                assert policy.calls == 0
+                assert isinstance(action, GameClick)
+                assert action.x in range(
+                    r.world.rect("dialogue").left, r.world.rect("dialogue").right
+                )
+                [receipt] = [
+                    event for event in planner.events if isinstance(event, ObservationReceipt)
+                ]
+                assert receipt.text == "雨停了，钟楼的指针停在七点。"
+                assert receipt.observation.screen_type is ScreenType.DIALOGUE
+            else:
+                assert policy.calls == 1
+                assert action == GamePress(Key.ENTER)
+
+    asyncio.run(main())
+
+
+def test_dialogue_voice_gate_is_rechecked_after_delayed_visual_policy(
+    core_exe: Path, root: Path
+) -> None:
+    class DelayedVisual:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.respond = asyncio.Event()
+
+        async def propose(self, inputs: PolicyInput) -> Plan:
+            self.started.set()
+            await self.respond.wait()
+            return Plan(
+                steps=(
+                    StepProposal(
+                        Category.NAVIGATE, Press(ENTER), ExpectedEffect(EffectKind.CHANGED)
+                    ),
+                )
+            )
+
+    async def main() -> None:
+        voice = VoiceHub(VoiceStatus(VoiceState.IDLE, None, 0, 0))
+        policy = DelayedVisual()
+        async with rig(
+            core_exe,
+            root,
+            policy=policy,
+            reading=True,
+            fast_paths=False,
+            voice=voice,
+        ) as r:
+            c = r.run.controller
+            assert c is not None
+            r.world.click("menu.start")
+            r.world.presenting = True
+            await r.start()
+            await until(
+                lambda: any(step.detail == "dialogue-voice-unknown" for step in c.recent) or None
+            )
+            stop_idle = r.follow_idle_voice(voice)
+            await asyncio.wait_for(policy.started.wait(), WAIT)
+            stop_idle()
+            now = time.perf_counter_ns()
+            voice.publish([], VoiceStatus(VoiceState.BUSY, None, now, now))
+            policy.respond.set()
+            await until(
+                lambda: any(step.detail == "dialogue-voice-busy" for step in c.recent) or None
+            )
+            assert not r.world.inputs
+            r.follow_idle_voice(voice)
+            await until(lambda: r.world.inputs or None)
+            assert r.world.inputs[0] == (GameScene.DIALOGUE, GamePress(Key.ENTER))
+
+    asyncio.run(main())
+
+
+def test_dialogue_fast_path_yields_to_an_agent_judged_goal(core_exe: Path, root: Path) -> None:
+    class Judge:
+        async def propose(self, inputs: PolicyInput) -> Plan:
+            return judged_complete(inputs)
+
+    async def main() -> None:
+        voice = VoiceHub(VoiceStatus(VoiceState.IDLE, None, 0, 0))
+        planner = RecordingPlanner(
+            PlannerContext(Goal("核对合成开场", generation=41, completion_by_agent=True))
+        )
+        async with rig(
+            core_exe, root, policy=Judge(), planner=planner, reading=True, voice=voice
+        ) as r:
+            c = r.run.controller
+            assert c is not None
+            r.world.click("menu.start")
+            r.world.presenting = True
+            await r.start()
+            await until(
+                lambda: any(step.detail == "dialogue-voice-unknown" for step in c.recent) or None
+            )
+            r.follow_idle_voice(voice)
+            await until(
+                lambda: next(
+                    (
+                        event
+                        for event in planner.events
+                        if isinstance(event, GoalEvent) and event.kind == "completed"
+                    ),
+                    None,
+                )
+            )
+            assert not r.world.inputs
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize(
+    ("fault", "reason"),
+    [("rejected", "invalid"), ("dropped", "geometry_changed"), ("revoked", "producer-revoked")],
+)
+def test_fast_dialogue_can_retry_a_submission_proven_not_executed(
+    core_exe: Path, root: Path, fault: Literal["rejected", "dropped", "revoked"], reason: str
+) -> None:
+    async def main() -> None:
+        voice = VoiceHub()
+        async with rig(core_exe, root, reading=True, voice=voice) as r:
+            c = r.run.controller
+            assert c is not None
+            r.world.next_submission_fault = fault
+            r.world.click("menu.start")
+            r.follow_idle_voice(voice)
+            r.world.presenting = True
+            await r.start()
+            await until(
+                lambda: (
+                    any(
+                        item.status is StepStatus.REJECTED and item.detail == reason
+                        for item in c.recent
+                    )
+                    or None
+                )
+            )
+            await until(lambda: r.world.inputs or None, timeout=3)
+            assert len(r.world.inputs) == 1
+            assert r.world.inputs[0][0] is GameScene.DIALOGUE
+            await until(
+                lambda: any(item.status is StepStatus.VERIFIED for item in c.recent) or None
+            )
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("outcome", ["no-effect", "unknown", "retry-rejected"])
+def test_fast_dialogue_retries_no_effect_once_and_holds_unknown(
+    core_exe: Path, root: Path, outcome: str
+) -> None:
+    async def main() -> None:
+        voice = VoiceHub()
+        async with rig(core_exe, root, reading=True, voice=voice) as r:
+            c = r.run.controller
+            assert c is not None
+            r.world.ignore_dialogue_inputs = 2
+            r.world.freeze_after_input = outcome == "unknown"
+            r.world.click("menu.start")
+            r.follow_idle_voice(voice)
+            r.world.presenting = True
+            await r.start()
+            if outcome == "unknown":
+                await until(
+                    lambda: any(item.status is StepStatus.UNKNOWN for item in c.recent) or None
+                )
+                r.world.freeze_after_input = False
+                r.world.presenting = True
+            elif outcome == "retry-rejected":
+                await until(lambda: r.world.inputs or None)
+                r.world.next_submission_fault = "rejected"
+                await until(
+                    lambda: any(item.status is StepStatus.REJECTED for item in c.recent) or None
+                )
+            else:
+                await until(
+                    lambda: (
+                        sum(item.status is StepStatus.NO_EFFECT for item in c.recent) == 2 or None
+                    ),
+                    timeout=4,
+                )
+            await until(
+                lambda: (
+                    any(item.detail == "dialogue-awaiting-next-line" for item in c.recent) or None
+                )
+            )
+            assert len(r.world.inputs) == (2 if outcome == "no-effect" else 1)
+            assert r.world.game.truth().text == "雨停了，钟楼的指针停在七点。"
 
     asyncio.run(main())
