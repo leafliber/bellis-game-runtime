@@ -12,6 +12,7 @@ from collections.abc import Generator, Iterable, Sequence
 from pathlib import Path
 from typing import Final
 
+from game_runtime.adapter import ScreenType
 from game_runtime.narrative.record import (
     Completeness,
     Cutscene,
@@ -19,13 +20,14 @@ from game_runtime.narrative.record import (
     LowConfidenceLine,
     NarrativeRecord,
     Scope,
+    ScreenRecord,
 )
 
 NARRATIVE_DIR: Final = "narrative"
 """本地数据目录下放剧情记录的子目录。"""
-SCHEMA_VERSION: Final = 3
+SCHEMA_VERSION: Final = 4
 """存储文件的格式版本（`user_version`）。2：`records.screen` 可为空（对白框没写画面）。3：加
-`records.cutscene` 与 `cutscenes` 表（播片段）。"""
+`records.cutscene` 与 `cutscenes` 表（播片段）。4：加入画面观察表。"""
 
 
 def _records_table(name: str, *, cutscene: bool = True) -> str:
@@ -71,6 +73,20 @@ CREATE TABLE cutscenes (
 );
 """
 
+_OBSERVATIONS_TABLE: Final = """
+CREATE TABLE observations (
+    session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
+    scope INTEGER NOT NULL,
+    frame INTEGER NOT NULL,
+    capture_ns INTEGER NOT NULL,
+    transform_version INTEGER NOT NULL,
+    screen_type TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    text TEXT NOT NULL,
+    PRIMARY KEY (session, frame)
+);
+"""
+
 _SCHEMA: Final = f"""
 CREATE TABLE sessions (
     session INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,6 +101,7 @@ CREATE TABLE scopes (
 );
 {_records_table("records")}
 {_CUTSCENES_TABLE}
+{_OBSERVATIONS_TABLE}
 CREATE TABLE discontinuities (
     session INTEGER NOT NULL REFERENCES sessions (session) ON DELETE CASCADE,
     first_frame INTEGER NOT NULL,
@@ -105,6 +122,7 @@ _UPGRADES: Final = {
         "ALTER TABLE records ADD COLUMN cutscene INTEGER;",
         _CUTSCENES_TABLE,
     ),
+    3: (_OBSERVATIONS_TABLE,),
 }
 """从各旧版本升到下一版的语句，记录照留：版本 1 的 `records.screen` 不能为空，按新表重建；版本 2
 没有播片段，加列与表。"""
@@ -206,6 +224,24 @@ class NarrativeStore:
     def close(self) -> None:
         self._db.close()
 
+    def write_observation(self, record: ScreenRecord) -> bool:
+        """同一运行的每帧只写一次。"""
+        cursor = self._db.execute(
+            "INSERT INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (session, frame) DO NOTHING",
+            (
+                record.session,
+                record.scope,
+                record.frame_number,
+                record.capture_ns,
+                record.transform_version,
+                record.screen_type.value,
+                record.confidence,
+                record.text,
+            ),
+        )
+        return cursor.rowcount == 1
+
 
 def _prepare(connection: sqlite3.Connection) -> None:
     """新文件建表；已有的文件核对版本，旧版本就地升级。"""
@@ -253,8 +289,9 @@ def _retain(
     当前运行不删。
     """
     rows = connection.execute(
-        "SELECT s.session, count(r.occurrence) FROM sessions s "
-        "LEFT JOIN records r ON r.session = s.session GROUP BY s.session ORDER BY s.session DESC"
+        "SELECT s.session, (SELECT COUNT(*) FROM records r WHERE r.session = s.session) + "
+        "(SELECT COUNT(*) FROM observations o WHERE o.session = s.session) "
+        "FROM sessions s ORDER BY s.session DESC"
     ).fetchall()
     kept = 0
     total = 0
@@ -346,6 +383,31 @@ def read_scopes(path: Path, session: int) -> list[Scope]:
     finally:
         connection.close()
     return [Scope(int(a), int(b), None if c is None else str(c), int(d)) for a, b, c, d in rows]
+
+
+def read_observations(path: Path, session: int) -> list[ScreenRecord]:
+    connection = _connect(path)
+    try:
+        rows = connection.execute(
+            "SELECT scope, frame, capture_ns, transform_version, screen_type, confidence, text "
+            "FROM observations WHERE session = ? ORDER BY frame",
+            (session,),
+        )
+        return [
+            ScreenRecord(
+                session,
+                int(scope),
+                int(frame),
+                int(capture),
+                int(version),
+                ScreenType(kind),
+                float(confidence),
+                str(text),
+            )
+            for scope, frame, capture, version, kind, confidence, text in rows
+        ]
+    finally:
+        connection.close()
 
 
 def read_discontinuities(path: Path, session: int) -> list[Discontinuity]:

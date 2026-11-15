@@ -173,6 +173,8 @@ class SentenceTracker:
         self.session = session
         self.params = params or TrackerParams()
         self._records: list[NarrativeRecord] = []
+        self._known_names: dict[str, str] = {}
+        self._weak_names: set[int] = set()
         self._open: _Open | None = None
         self._scope = 0
         self._scope_after: str | None = None
@@ -190,6 +192,15 @@ class SentenceTracker:
     @property
     def latest(self) -> NarrativeRecord | None:
         return self._records[-1] if self._records else None
+
+    def canonical_speaker(self, record: NarrativeRecord) -> str | None:
+        speaker = record.speaker
+        if speaker is None or record.session != self.session:
+            return speaker
+        key = compare_key(speaker)
+        if record.occurrence in self._weak_names:
+            key, _ = self._resolve_name(key)
+        return self._known_names.get(key, speaker)
 
     @property
     def scopes(self) -> tuple[Scope, ...]:
@@ -288,27 +299,48 @@ class SentenceTracker:
         current = self._open
         if not key:
             return Changes(self._close(frame.frame_number))
-        if current is not None and self._same_sentence(current, frame.screen, key, speaker_key):
+        weak = bool(self._low_confidence(frame.speaker))
+        if current is not None and self._same_sentence(
+            current, frame.screen, key, speaker_key, weak
+        ):
             return self._update(current, frame, key, speaker_key)
         closed = self._close(frame.frame_number)
         scope = self._next_scope(frame.frame_number)
         opened = self._start(frame, key, speaker_key)
         return Changes((*closed, opened), scope=scope)
 
-    @staticmethod
     def _same_sentence(
-        current: _Open, screen: str | None, key: str, speaker_key: str | None
+        self, current: _Open, screen: str | None, key: str, speaker_key: str | None, weak: bool
     ) -> bool:
         if current.record.screen != screen:
             return False
-        if (
-            current.speaker_key is not None
-            and speaker_key is not None
-            and not same_name(current.speaker_key, speaker_key)
-        ):
-            return False
+        if current.speaker_key is not None and speaker_key is not None:
+            before = current.speaker_key
+            first, ambiguous_first = (
+                self._resolve_name(before) if current.speaker_low else (before, False)
+            )
+            second, ambiguous_second = (
+                self._resolve_name(speaker_key) if weak else (speaker_key, False)
+            )
+            if first != second and (
+                ambiguous_first
+                or ambiguous_second
+                or (first in self._known_names and second in self._known_names)
+                or not same_name(first, second)
+            ):
+                return False
         partial = current.record.completeness is Completeness.PARTIAL
         return continues(current.key, key, partial=partial)
+
+    def _resolve_name(self, key: str) -> tuple[str, bool]:
+        if not key or key in self._known_names:
+            return key, False
+        matches = [
+            name
+            for name in self._known_names
+            if len(name) > 1 and len(key) > 1 and same_name(name, key)
+        ]
+        return (matches[0], False) if len(matches) == 1 else (key, bool(matches))
 
     def _start(self, frame: BoxFrame, key: str, speaker_key: str | None) -> NarrativeRecord:
         speaker = frame.speaker if speaker_key is not None else None
@@ -316,6 +348,8 @@ class SentenceTracker:
         text_low = self._low_confidence(frame.text)
         cutscene = self.playing
         occurrence = len(self._records) + 1
+        if speaker_low:
+            self._weak_names.add(occurrence)
         record = NarrativeRecord(
             session=self.session,
             occurrence=occurrence,
@@ -380,6 +414,8 @@ class SentenceTracker:
             record = replace(record, speaker=frame.speaker.text)
             current.speaker_key = speaker_key
             current.speaker_low = self._low_confidence(frame.speaker)
+            if current.speaker_low:
+                self._weak_names.add(record.occurrence)
         record = replace(
             record,
             last_frame=frame.frame_number,
@@ -433,6 +469,13 @@ class SentenceTracker:
             else Completeness.GAP
         )
         closed = replace(record, completeness=completeness, closed_frame=frame_number)
+        if (
+            completeness is Completeness.COMPLETE
+            and current.speaker_key
+            and record.speaker
+            and not current.speaker_low
+        ):
+            self._known_names.setdefault(current.speaker_key, record.speaker)
         self._records[-1] = closed
         return (closed,)
 

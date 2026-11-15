@@ -2,7 +2,7 @@
 
 import base64
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 
 import cv2
@@ -59,6 +59,23 @@ class ImageTransform:
         if isinstance(value, bool) or not inside:
             raise ValueError("模型给出的坐标在图像范围之外")
         return Fraction(str(value)) * crop_size / limit
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedKeyframe:
+    """关键帧用途本机准备的 PNG 与帧引用。"""
+
+    transform: ImageTransform
+    capture_ns: int
+    _owner: object = field(repr=False)
+    _spec: ImageSpec = field(repr=False)
+    _roi: NormalizedRect | None = field(repr=False)
+    _url: str = field(repr=False)
+
+    def url_for(self, owner: object, spec: ImageSpec, roi: NormalizedRect | None) -> str:
+        if self._owner is not owner or (self._spec, self._roi) != (spec, roi):
+            raise ModelCallError(ModelFailure.INVALID_REQUEST)
+        return self._url
 
 
 def encode_image(

@@ -34,6 +34,7 @@ from game_runtime.adapter import (
     PixelRect,
     load_adapter,
 )
+from game_runtime.adapter import ScreenType as RuntimeScreenType
 from game_runtime.artifacts import ArtifactError
 from game_runtime.frame_ring import RingFrame
 from game_runtime.kernel import (
@@ -67,6 +68,7 @@ from game_runtime.narrative import (
     compare_key,
     read_cutscenes,
     read_discontinuities,
+    read_observations,
     read_records,
     read_scopes,
     store_path,
@@ -92,6 +94,7 @@ from game_runtime.scene import (
     SceneService,
     SceneState,
     SceneUpdate,
+    ScreenObservation,
     SignatureJudge,
     Stability,
     bgra_view,
@@ -1197,6 +1200,38 @@ def test_subscribers_get_every_change_in_order(
     # 抛错的监听者每次都只记录，不影响别的监听者。
     errors = [r for r in caplog.records if "监听者处理第" in r.getMessage()]
     assert len(errors) == len(received)
+
+
+def test_accepted_screen_observation_is_saved_with_original_frame_and_scope(data_dir: Path) -> None:
+    async def script(play: Play) -> None:
+        await play.click("menu.start")
+        await play.type_out()
+        await play.drain()
+        narrative, scene = Shared.narrative, Shared.scene
+        assert narrative is not None
+        assert scene is not None
+        latest = scene.latest
+        assert latest is not None
+        observation = ScreenObservation(screen_type=RuntimeScreenType.DIALOGUE, confidence=0.94)
+        assert scene.observe(latest, observation)
+        frame = latest.frame
+        # 传给记忆的引用来自已被 scene 接受的原帧。
+        assert await narrative.remember_observation(
+            frame.frame_number,
+            capture_ns=frame.capture_ns,
+            transform_version=frame.transform_version,
+            observation=observation,
+            text="合成视觉描述",
+        )
+        saved = read_observations(store_path(data_dir, "synthetic-game"), narrative.session)
+        (note,) = saved
+        assert note.frame_number == frame.frame_number
+        assert note.capture_ns == frame.capture_ns
+        assert note.transform_version == frame.transform_version
+        assert narrative.latest is not None
+        assert note.scope == narrative.latest.scope
+
+    asyncio.run(Rig(data_dir).run(script))
 
 
 def test_stopping_keeps_the_open_sentence_as_it_was(data_dir: Path) -> None:

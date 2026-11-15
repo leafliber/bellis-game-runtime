@@ -43,6 +43,7 @@ from game_runtime.models import (
     ModelFailure,
     ModelImage,
     ModelResult,
+    PreparedKeyframe,
     Purpose,
     Usage,
     VlmConfig,
@@ -267,7 +268,10 @@ def new_store() -> CountingStore:
 
 
 async def call(
-    client: ModelClient, purpose: Purpose = Purpose.SUMMARY, *, images: tuple[ModelImage, ...] = ()
+    client: ModelClient,
+    purpose: Purpose = Purpose.SUMMARY,
+    *,
+    images: tuple[ModelImage | PreparedKeyframe, ...] = (),
 ) -> ModelResult[Prediction]:
     return await client.complete(
         purpose,
@@ -276,6 +280,72 @@ async def call(
         output=Prediction,
         images=images,
     )
+
+
+def test_prepared_keyframe_retains_crop_and_cannot_cross_client_or_purpose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        config = VlmConfig.model_validate(
+            {"keyframe": {"image": {"roi": "choices", "max_long_edge": 4}}}
+        )
+        store = new_store()
+        client = make_client(config, store)
+        other = make_client(config, new_store())
+        frame = RingFrame(4, 231, 2, 16, 12, 64, bytes(768))
+        raw = ModelImage(frame, PixelRect(5, 5, 11, 8))
+        ready = await client.prepare_keyframe(raw)
+        assert store.reads == []
+        assert ready.capture_ns == 231
+        assert ready.transform.crop == raw.crop
+        assert (ready.transform.width, ready.transform.height) == (4, 2)
+        assert (ready.transform.frame_number, ready.transform.transform_version) == (4, 2)
+        assert "data:image" not in repr(ready)
+
+        def refuse_encode(*args: object) -> None:
+            raise AssertionError("已准备的帧不能再次编码")
+
+        monkeypatch.setattr(model_client, "encode_image", refuse_encode)
+        async with fake_chat(monkeypatch, fixed(answer())) as fake:
+            for owner, purpose in ((other, Purpose.KEYFRAME), (client, Purpose.AGENT)):
+                with pytest.raises(ModelCallError) as failure:
+                    await call(owner, purpose, images=(ready,))
+                assert failure.value.reason is ModelFailure.INVALID_REQUEST
+                assert fake.connections == 0
+            with pytest.raises(ModelCallError) as too_many:
+                await call(client, Purpose.KEYFRAME, images=(ready,) * 9)
+            assert too_many.value.reason is ModelFailure.INVALID_REQUEST
+            result = await call(client, Purpose.KEYFRAME, images=(ready,))
+            assert result.transforms == (ready.transform,)
+            assert fake.connections == 1
+
+    asyncio.run(scenario())
+
+
+def test_keyframe_preparation_continues_during_an_outbound_keyframe_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        store = new_store()
+        client = make_client(VlmConfig(), store)
+        raw = ModelImage(RingFrame(4, 231, 2, 16, 12, 64, bytes(768)))
+        async with fake_chat(monkeypatch, b"") as fake:
+            active = asyncio.create_task(call(client, Purpose.KEYFRAME, images=(raw,)))
+            try:
+                await fake.opened.wait()
+                ready = await client.prepare_keyframe(raw)
+                assert ready.transform.frame_number == 4
+                assert store.reads == ["ark"]
+                with pytest.raises(ModelCallError) as busy:
+                    await call(client, Purpose.KEYFRAME, images=(ready,))
+                assert busy.value.reason is ModelFailure.CONCURRENCY_LIMIT
+                assert fake.connections == 1
+            finally:
+                await client.close()
+                with suppress(asyncio.CancelledError):
+                    await active
+
+    asyncio.run(asyncio.wait_for(scenario(), 4))
 
 
 @pytest.mark.parametrize("use_schema", [False, True])

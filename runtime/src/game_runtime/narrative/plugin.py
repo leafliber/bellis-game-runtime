@@ -25,7 +25,13 @@ from game_runtime.adapter import GAME_ADAPTER, Adapter, DialogueBox, PixelRect, 
 from game_runtime.frame_ring import RingFrame
 from game_runtime.kernel import Manifest, Plugin, PluginContext, ServiceToken, Tier
 from game_runtime.local_data import local_data_dir
-from game_runtime.narrative.record import Cutscene, Discontinuity, NarrativeRecord, Scope
+from game_runtime.narrative.record import (
+    Cutscene,
+    Discontinuity,
+    NarrativeRecord,
+    Scope,
+    ScreenRecord,
+)
 from game_runtime.narrative.store import NarrativeStore
 from game_runtime.narrative.tracker import (
     BoxFrame,
@@ -41,7 +47,7 @@ from game_runtime.narrative.tracker import (
     Unread,
 )
 from game_runtime.ocr import OCR, OcrService
-from game_runtime.scene import SCENE, Outcome, SceneUpdate, Stability, Verdict
+from game_runtime.scene import SCENE, Outcome, SceneUpdate, ScreenObservation, Stability, Verdict
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +80,18 @@ class NarrativeService(Protocol):
     def records(self, after: int = 0) -> tuple[NarrativeRecord, ...]:
         """本次运行中出现编号大于 `after` 的各句的最新状态，按出现编号。"""
         ...
+
+    def canonical_speaker(self, record: NarrativeRecord) -> str | None: ...
+
+    async def remember_observation(
+        self,
+        frame_number: int,
+        *,
+        capture_ns: int,
+        transform_version: int,
+        observation: ScreenObservation,
+        text: str,
+    ) -> bool: ...
 
     @property
     def scopes(self) -> tuple[Scope, ...]: ...
@@ -264,6 +282,7 @@ class Recorder:
         self._listeners: list[NarrativeListener] = []
         self._cutscene_listeners: list[CutsceneListener] = []
         self._processed = 0
+        self._progress = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._stopped = False
         self._ocr_failing = False
@@ -281,6 +300,44 @@ class Recorder:
 
     def records(self, after: int = 0) -> tuple[NarrativeRecord, ...]:
         return self._tracker.records[max(0, after) :]
+
+    def canonical_speaker(self, record: NarrativeRecord) -> str | None:
+        return self._tracker.canonical_speaker(record)
+
+    async def remember_observation(
+        self,
+        frame_number: int,
+        *,
+        capture_ns: int,
+        transform_version: int,
+        observation: ScreenObservation,
+        text: str,
+    ) -> bool:
+        if frame_number < 1 or not 0 < len(text.strip()) <= 600:
+            return False
+        while not self._stopped and self._processed < frame_number:
+            self._progress.clear()
+            await self._progress.wait()
+        if self._stopped or any(
+            gap.first_frame <= frame_number <= gap.last_frame for gap in self.discontinuities
+        ):
+            return False
+        scope = next(
+            (item.scope for item in reversed(self.scopes) if item.first_frame <= frame_number), 0
+        )
+        record = ScreenRecord(
+            self.session,
+            scope,
+            frame_number,
+            capture_ns,
+            transform_version,
+            observation.screen_type,
+            observation.confidence,
+            text.strip(),
+        )
+        return await asyncio.get_running_loop().run_in_executor(
+            self._db, self._store.write_observation, record
+        )
 
     @property
     def scopes(self) -> tuple[Scope, ...]:
@@ -319,6 +376,7 @@ class Recorder:
     async def stop(self) -> None:
         """取消处理任务，丢弃还没处理的更新，把当前句与还没结束的播片段的最新状态写库。"""
         self._stopped = True
+        self._progress.set()
         task = self._task
         if task is not None:
             task.cancel()
@@ -455,6 +513,7 @@ class Recorder:
                     await self._write(changes)
                     self._notify(changes)
                 self._processed = _frame_number(item)
+                self._progress.set()
             finally:
                 self._busy = False
 

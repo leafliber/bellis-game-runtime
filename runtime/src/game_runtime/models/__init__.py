@@ -3,7 +3,7 @@
 from game_runtime.models.client import CallMetrics, ModelClient, ModelResult
 from game_runtime.models.config import Purpose, VlmConfig
 from game_runtime.models.errors import ModelCallError, ModelFailure
-from game_runtime.models.images import ImageTransform, ModelImage
+from game_runtime.models.images import ImageTransform, ModelImage, PreparedKeyframe
 from game_runtime.models.plugin import VLM, VlmPlugin, vlm_plugin_for
 from game_runtime.models.stream import Usage
 
@@ -16,6 +16,7 @@ __all__ = [
     "ModelFailure",
     "ModelImage",
     "ModelResult",
+    "PreparedKeyframe",
     "Purpose",
     "Usage",
     "VlmConfig",

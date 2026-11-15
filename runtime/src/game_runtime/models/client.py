@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
@@ -17,7 +17,7 @@ from game_runtime.channel.frame import dumps
 from game_runtime.models.config import Purpose, RouteConfig, VisionRouteConfig, VlmConfig
 from game_runtime.models.errors import ModelCallError, ModelFailure
 from game_runtime.models.http import MAX_REQUEST_BYTES, ChatTransport, resolve_ark
-from game_runtime.models.images import ImageTransform, ModelImage, encode_image
+from game_runtime.models.images import ImageTransform, ModelImage, PreparedKeyframe, encode_image
 from game_runtime.models.stream import StreamStats, Usage, json_object
 from game_runtime.models.work import CallWork
 from game_runtime.secret_store import CredentialManagerStore, SecretStoreUnsupportedError
@@ -80,7 +80,9 @@ class ModelClient:
         self._permissions = permissions
         self._read_secret = read_secret if read_secret is not None else _windows_secret
         self._transport = ChatTransport()
+        self._keyframe_owner = object()
         self._budgets = {purpose: _Budget() for purpose in Purpose}
+        self._keyframe_preparations: set[CallWork] = set()
         self._closed = False
 
     async def complete[T: BaseModel](
@@ -90,7 +92,7 @@ class ModelClient:
         instruction: str,
         data: JsonValue,
         output: type[T],
-        images: tuple[ModelImage, ...] = (),
+        images: tuple[ModelImage | PreparedKeyframe, ...] = (),
     ) -> ModelResult[T]:
         """`instruction`、`output` 和用途由调用方代码决定，游戏内容只经 `data` 和 `images` 传入。"""
         loop = asyncio.get_running_loop()
@@ -106,7 +108,9 @@ class ModelClient:
                 raise ModelCallError(ModelFailure.CONCURRENCY_LIMIT)
             budget.check_rate(started, route.requests_per_minute)
             work = CallWork(purpose, route.concurrency, started + route.timeout_s)
-            task = loop.create_task(
+            value, transforms = await self._launch(
+                budget.calls,
+                work,
                 self._run(
                     route,
                     budget,
@@ -122,22 +126,10 @@ class ModelClient:
                         data,
                         output,
                         images,
+                        self._keyframe_owner,
                     ),
-                )
+                ),
             )
-            work.task = task
-            budget.calls.add(work)
-            try:
-                value, transforms = await task
-                if self._closed:
-                    raise ModelCallError(ModelFailure.CLOSED)
-            finally:
-                work.task = None
-                worker = work.worker
-                if worker is not None and not worker.done():
-                    worker.add_done_callback(lambda _: budget.calls.discard(work))
-                else:
-                    budget.calls.discard(work)
         except ModelCallError as error:
             failure, status = error.reason, error.http_status
             raise
@@ -170,12 +162,66 @@ class ModelClient:
             )
         return ModelResult(value, transforms, metrics)
 
+    async def prepare_keyframe(self, image: ModelImage) -> PreparedKeyframe:
+        """按关键帧配置在本机裁剪缩小，留待同客户端的关键帧调用。"""
+        purpose = Purpose.KEYFRAME
+        route = self._config.keyframe
+        self._authorize(route)
+        calls = self._keyframe_preparations
+        if len(calls) >= route.concurrency:
+            raise ModelCallError(ModelFailure.CONCURRENCY_LIMIT)
+        deadline = asyncio.get_running_loop().time() + route.timeout_s
+        work = CallWork(purpose, route.concurrency, deadline)
+
+        def prepare() -> PreparedKeyframe:
+            try:
+                roi = self._adapter.roi(route.image.roi) if route.image.roi is not None else None
+                url, transform = encode_image(image, route.image, roi)
+            except (LookupError, NotCalibratedError, ValueError, TypeError, cv2.error):
+                raise ModelCallError(ModelFailure.INVALID_REQUEST) from None
+            if len(url) > MAX_REQUEST_BYTES:
+                raise ModelCallError(ModelFailure.SIZE_LIMIT)
+            return PreparedKeyframe(
+                transform, image.frame.capture_ns, self._keyframe_owner, route.image, roi, url
+            )
+
+        try:
+            async with asyncio.timeout_at(deadline):
+                result = await self._launch(calls, work, work.run(prepare))
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise ModelCallError(ModelFailure.TIMEOUT)
+                return result
+        except TimeoutError:
+            raise ModelCallError(ModelFailure.TIMEOUT) from None
+
+    async def _launch[T](
+        self, calls: set[CallWork], work: CallWork, call: Coroutine[Any, Any, T]
+    ) -> T:
+        task = asyncio.create_task(call)
+        work.task = task
+        calls.add(work)
+        try:
+            result = await task
+            if self._closed:
+                raise ModelCallError(ModelFailure.CLOSED)
+            return result
+        finally:
+            work.task = None
+            worker = work.worker
+            if worker is not None and not worker.done():
+                worker.add_done_callback(lambda _: calls.discard(work))
+            else:
+                calls.discard(work)
+
     async def close(self) -> None:
         """停接新工作、取消请求，确认已开始的线程操作收尾。"""
         self._closed = True
         jobs: set[asyncio.Future[Any]] = set()
-        for budget in self._budgets.values():
-            for work in budget.calls:
+        for calls in (
+            self._keyframe_preparations,
+            *(budget.calls for budget in self._budgets.values()),
+        ):
+            for work in calls:
                 if work.task is not None:
                     work.task.cancel()
                     jobs.add(work.task)
@@ -252,7 +298,8 @@ def _request_body(
     instruction: str,
     data: JsonValue,
     output: type[BaseModel],
-    images: tuple[ModelImage, ...],
+    images: tuple[ModelImage | PreparedKeyframe, ...],
+    keyframe_owner: object,
 ) -> tuple[bytes, tuple[ImageTransform, ...]]:
     if not instruction.strip():
         raise ModelCallError(ModelFailure.INVALID_REQUEST)
@@ -274,7 +321,13 @@ def _request_body(
             roi = adapter.roi(route.image.roi) if route.image.roi is not None else None
             size = 0
             for image in images:
-                url, transform = encode_image(image, route.image, roi)
+                if isinstance(image, PreparedKeyframe):
+                    if purpose is not Purpose.KEYFRAME:
+                        raise ModelCallError(ModelFailure.INVALID_REQUEST)
+                    url = image.url_for(keyframe_owner, route.image, roi)
+                    transform = image.transform
+                else:
+                    url, transform = encode_image(image, route.image, roi)
                 size += len(url)
                 if size > MAX_REQUEST_BYTES:
                     raise ModelCallError(ModelFailure.SIZE_LIMIT)

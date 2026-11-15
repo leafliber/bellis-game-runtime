@@ -129,7 +129,10 @@ class Goal:
     completion_by_agent: bool = False
 
     def __post_init__(self) -> None:
-        if self.generation < 0 or (self.max_steps is not None and self.max_steps < 1):
+        if self.generation < 0 or (
+            self.max_steps is not None
+            and (self.max_steps < 0 or (self.max_steps == 0 and self.completion is None))
+        ):
             raise ValueError("目标代次或步数上限无效")
         if self.completion is not None and self.completion_by_agent:
             raise ValueError("确定性完成条件与智能体判断互斥")
