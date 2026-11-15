@@ -14,7 +14,7 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["docs/inherited"] # 移交的旧设计只作参考，不改动
+extend-exclude = ["docs/inherited", "vendor/bellis-protocol"] # 旧设计与上游锁定副本不改动
 # 工作区自己的包按第一方排序 import。
 src = ["runtime/src", "protocol/src", "tools/*/src"]
 
