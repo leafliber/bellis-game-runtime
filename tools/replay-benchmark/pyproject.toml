@@ -1,0 +1,24 @@
+[project]
+name = "bellis-game-runtime-replay-benchmark"
+version = "0.0.0"
+description = "GR-27：在本机录制上评测逐步策略与假输入"
+requires-python = "==3.12.*"
+dependencies = [
+    "bellis-game-runtime",
+    "core-protocol",
+    "pydantic>=2.14.2",
+]
+
+[project.scripts]
+replay-benchmark = "replay_benchmark.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "replay_benchmark"
+
+[tool.uv.sources]
+bellis-game-runtime = { workspace = true }
+core-protocol = { workspace = true }

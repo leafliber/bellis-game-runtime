@@ -11,6 +11,7 @@ members = [
     "bellis-game-runtime-gs03-probe",
     "bellis-game-runtime-gs04-ocr",
     "bellis-game-runtime-gs06-eval",
+    "bellis-game-runtime-replay-benchmark",
     "core-protocol",
     "synthetic-game",
 ]
@@ -160,6 +161,23 @@ dependencies = [
 requires-dist = [
     { name = "bellis-game-runtime", editable = "runtime" },
     { name = "numpy", specifier = ">=2.5.4" },
+    { name = "pydantic", specifier = ">=2.14.2" },
+]
+
+[[package]]
+name = "bellis-game-runtime-replay-benchmark"
+version = "0.0.0"
+source = { editable = "tools/replay-benchmark" }
+dependencies = [
+    { name = "bellis-game-runtime" },
+    { name = "core-protocol" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "bellis-game-runtime", editable = "runtime" },
+    { name = "core-protocol", editable = "protocol" },
     { name = "pydantic", specifier = ">=2.14.2" },
 ]
 

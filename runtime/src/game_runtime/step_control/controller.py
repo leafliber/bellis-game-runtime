@@ -282,7 +282,14 @@ class StepController:
             if prior.status is status and prior.detail == detail:
                 return
         self._recent.append(item)
-        logger.info("逐步控制 %s %s frame=%s category=%s", status, detail, frame, category)
+        logger.info(
+            "逐步控制 %s %s frame=%s category=%s",
+            status,
+            detail,
+            frame,
+            category,
+            extra={"step_result": item},
+        )
         if status is StepStatus.REJECTED:
             self._goal_feedback("rejected", detail)
 

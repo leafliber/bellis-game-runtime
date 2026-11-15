@@ -134,6 +134,7 @@ async def supervise(
     extra_plugins: Sequence[type[Plugin[Any]]] = (),
     extra_entries: Sequence[ResolvedEntry] = (),
     profile: Sequence[ResolvedEntry] | None = None,
+    core_factory: type[CoreLink] | None = None,
 ) -> AsyncGenerator[SupervisedRun]:
     """用模型 profile 或调用方的单独策略启动监督会话。"""
     games_dir, data_dir = games_dir.resolve(), data_dir.resolve()
@@ -195,7 +196,7 @@ async def supervise(
             real_input=real_input,
             input_policy=adapter.input_policy(),
         )
-        core = CoreLink(
+        core = (core_factory or CoreLink)(
             options,
             on_health=lambda _: signals.became_ready(),
             on_released=signals.released,
