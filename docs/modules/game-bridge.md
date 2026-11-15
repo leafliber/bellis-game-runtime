@@ -148,7 +148,7 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 | `operator.session` | 控制台 → 主进程 | 通知 | 连上后立即发一次，此后每次变化都发：`adapter`（适配包 id）、`state`、`confirmed`（已确认的前置条件 id）、`goal`（当前目标的文字，没有时为 `null`）、`ends_at_ns`（到时的时刻，还没开始时为 `null`） |
 | `operator.decision_opened` | 主进程 → 控制台 | 通知 | `id`（本会话内唯一）、`prompt`、`options`（每项 `index` 与 `text`）、`candidates`（按推荐顺序的 `index`）、`deadline_ns`（无计时时为 `null`） |
 | `operator.decision_resolved` | 控制台 → 主进程 | 通知 | `id`、`index`：操作员的选择 |
-| `operator.decision_closed` | 主进程 → 控制台 | 通知 | `id`、`index`（实际执行的；没有执行时为 `null`）、`by`：`operator`（按操作员的选择）、`default`（到余量线执行排第一的候选）或 `withdrawn`（画面已变，不再执行） |
+| `operator.decision_closed` | 主进程 → 控制台 | 通知 | `id`、`index`（确认执行的选项，撤回或结果未知时为 `null`）、`by` 为 `operator`、`default`、`withdrawn` 或 `unknown` |
 | `operator.action` | 主进程 → 控制台 | 通知 | `category`（`advance`、`navigate`、`select`）、`summary`：已提交的一个动作，计入会话记录 |
 
 - 主进程核对 `adapter` 与自己加载的适配包相同，不同即断开并报错。
