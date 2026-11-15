@@ -11,27 +11,37 @@ from pathlib import Path
 
 import pytest
 
-from game_runtime.adapter import Adapter, PixelRect
+from game_runtime.adapter import Adapter, PixelRect, ScreenType
 from game_runtime.frame_ring import RingFrame
-from game_runtime.scene import SceneAnalyzer, SceneState, SignatureJudge, Stability, Verdict
+from game_runtime.scene import (
+    SceneAnalyzer,
+    SceneState,
+    ScreenClassification,
+    ScreenSource,
+    SignatureJudge,
+    Stability,
+    Verdict,
+)
 from synthetic_game import (
     Click,
     GameConfig,
     ManualClock,
-    SceneType,
     Scroll,
     SyntheticGame,
     Truth,
 )
+from synthetic_game import (
+    SceneType as SyntheticScene,
+)
 from synthetic_game.anchors import anchor_templates
 
 SCREENS = {
-    SceneType.MENU: "title-menu",
-    SceneType.DIALOGUE: "dialogue",
-    SceneType.CHOICE: "choice",
-    SceneType.TIMED_CHOICE: "timed-choice",
-    SceneType.SHOP: "shop",
-    SceneType.BAD_ENDING: "bad-ending",
+    SyntheticScene.MENU: ("title-menu", ScreenType.MENU),
+    SyntheticScene.DIALOGUE: ("dialogue", ScreenType.DIALOGUE),
+    SyntheticScene.CHOICE: ("choice", ScreenType.CHOICE),
+    SyntheticScene.TIMED_CHOICE: ("timed-choice", ScreenType.TIMED_CHOICE),
+    SyntheticScene.SHOP: ("shop", ScreenType.SHOP),
+    SyntheticScene.BAD_ENDING: ("bad-ending", ScreenType.BAD_ENDING),
 }
 WITH_TEXTS = {"title-menu", "bad-ending"}
 """签名里有固定文字项的画面。"""
@@ -86,16 +96,32 @@ class Walk:
             frame.stride,
             frame.data,
         )
-        state = self.analyzer.analyze(ring, self.ocr)
+        update = self.analyzer.analyze_update(ring, self.ocr)
+        state = update.state
         assert (state.verdict, state.screen) == self.expected(truth), (truth, state.signatures)
+        if state.verdict is Verdict.SCREEN:
+            classification = ScreenClassification(
+                SCREENS[truth.scene][1], ScreenSource.SIGNATURE, 1
+            )
+        elif state.playing:
+            classification = ScreenClassification(ScreenType.CUTSCENE, None, 1)
+        else:
+            classification = ScreenClassification(ScreenType.UNKNOWN, None, 0)
+        assert update.screen_state.classification == classification
+        expected_restrictions: set[ScreenType] = (
+            set()
+            if classification.screen_type is ScreenType.UNKNOWN and state.verdict is Verdict.NONE
+            else {classification.screen_type}
+        )
+        assert update.screen_state.restrictions == expected_restrictions
         assert (state.frame_number, state.width, state.height) == (
             self.number,
             frame.width,
             frame.height,
         )
         if truth.overlay is None and truth.scene in SCREENS:
-            self.seen.add(SCREENS[truth.scene])
-        if truth.scene is SceneType.BAD_ENDING:
+            self.seen.add(SCREENS[truth.scene][0])
+        if truth.scene is SyntheticScene.BAD_ENDING:
             self.endings.add(truth.node)
         self.history.append((truth, state))
         return state
@@ -103,9 +129,9 @@ class Walk:
     def expected(self, truth: Truth) -> tuple[Verdict, str | None]:
         if truth.overlay is not None:
             return Verdict.NONE, None  # 弹窗不是画面
-        if truth.scene is SceneType.CUTSCENE:
+        if truth.scene is SyntheticScene.CUTSCENE:
             return Verdict.NONE, None  # 播片不是画面，不命中任何签名
-        screen = SCREENS[truth.scene]
+        screen, _ = SCREENS[truth.scene]
         if self.ocr is None and screen in WITH_TEXTS:
             return Verdict.UNDETERMINED, None
         return Verdict.SCREEN, screen
@@ -132,14 +158,14 @@ class Walk:
         是这一帧。"""
         start = len(self.history) - 1
         (cutscene, entered), (_, before) = self.history[start], self.history[start - 1]
-        assert cutscene.scene is SceneType.CUTSCENE
+        assert cutscene.scene is SyntheticScene.CUTSCENE
         assert before.stability is Stability.STABLE
-        while self.game.truth().scene is SceneType.CUTSCENE:
+        while self.game.truth().scene is SyntheticScene.CUTSCENE:
             change = self.wait(FRAME_INTERVAL)
             assert change.changed_fraction >= 0.1
             assert change.stability is not Stability.STABLE
         switch = len(self.history) - 1
-        assert self.history[switch][0].scene is SceneType.CHOICE
+        assert self.history[switch][0].scene is SyntheticScene.CHOICE
         for _ in range(60):
             self.wait(FRAME_INTERVAL)
         states = [state for _, state in self.history]
@@ -162,7 +188,7 @@ class Walk:
         """读完当前的对话节点：每句等逐字显示完再推进。"""
         node = self.game.truth().node
         while (
-            (now := self.game.truth()).scene is SceneType.DIALOGUE
+            (now := self.game.truth()).scene is SyntheticScene.DIALOGUE
             and now.node == node
             and now.overlay is None
         ):
@@ -229,7 +255,10 @@ def play_everything(walk: Walk) -> None:
     walk.settle()
 
     # 再来一次：烫手的左门是坏结局，右门通向结尾对话，读完回到标题菜单。
-    for door, then in (("choice.0", SceneType.BAD_ENDING), ("choice.1", SceneType.DIALOGUE)):
+    for door, then in (
+        ("choice.0", SyntheticScene.BAD_ENDING),
+        ("choice.1", SyntheticScene.DIALOGUE),
+    ):
         walk.click("ending.retry")
         walk.read_dialogue()
         walk.click("choice.0")
@@ -238,10 +267,10 @@ def play_everything(walk: Walk) -> None:
         walk.click(door)
         assert walk.game.truth().scene is then
     walk.read_dialogue()
-    assert walk.game.truth().scene is SceneType.MENU
+    assert walk.game.truth().scene is SyntheticScene.MENU
     walk.settle()
 
-    assert walk.seen == set(SCREENS.values())
+    assert walk.seen == {screen for screen, _ in SCREENS.values()}
     assert walk.endings == {"sleep", "late", "burn"}
     # 别的画面（逐字显示、计时条、换画面的转场）都不是播片。
     assert [n for n, (_, state) in enumerate(walk.history) if state.playing] == walk.playing
@@ -282,7 +311,26 @@ def test_the_package_references_the_rendered_templates(synthetic: Adapter) -> No
 
     assert referenced == {template.sha256 for template in anchor_templates()}
     assert all(signature.calibrated for signature in synthetic.signatures)
-    assert {signature.screen for signature in synthetic.signatures} == set(SCREENS.values())
+    assert {signature.screen for signature in synthetic.signatures} == {
+        screen for screen, _ in SCREENS.values()
+    }
+
+
+def test_the_adapter_extension_reports_its_generic_type(synthetic: Adapter, data_dir: Path) -> None:
+    extension = "合成游戏的商店"
+    screens = tuple(
+        screen.model_copy(update={"type": extension}) if screen.id == "shop" else screen
+        for screen in synthetic.screens
+    )
+    adapter = Adapter.model_validate(
+        {
+            **synthetic.model_dump(),
+            "screens": screens,
+            "screen_types": [{"name": extension, "base": ScreenType.SHOP}],
+        }
+    )
+    walk = Walk(adapter, data_dir, (1280, 720), ocr=True)
+    assert walk.click("menu.shop").screen == "shop"  # 同时核对报告的通用类型仍为商店
 
 
 def test_the_same_frames_give_the_same_states(synthetic: Adapter, data_dir: Path) -> None:

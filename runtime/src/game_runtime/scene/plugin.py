@@ -6,15 +6,15 @@
 import asyncio
 import functools
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Final, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from game_runtime._threads import in_thread
-from game_runtime.adapter import GAME_ADAPTER
+from game_runtime.adapter import GAME_ADAPTER, PixelRect
 from game_runtime.frame_ring import RingFrame
 from game_runtime.frames import FrameBacklogError, FrameSource
 from game_runtime.kernel import (
@@ -26,22 +26,16 @@ from game_runtime.kernel import (
     Tier,
 )
 from game_runtime.local_data import local_data_dir
-from game_runtime.scene.analyzer import SceneAnalyzer, SceneState
+from game_runtime.ocr.service import OcrLine, OcrResult
+from game_runtime.scene.analyzer import SceneAnalyzer, SceneUpdate
 from game_runtime.scene.change import ChangeParams
-from game_runtime.scene.signatures import OCR, SignatureJudge
+from game_runtime.scene.signatures import OCR, SignatureJudge, Verdict
+from game_runtime.scene.state import ScreenObservation
 
 logger = logging.getLogger(__name__)
 
 RETRY_INTERVAL: Final = 0.5
 """读帧失败后再试的间隔（秒）。"""
-
-
-@dataclass(frozen=True, slots=True)
-class SceneUpdate:
-    """处理过的一帧与它的判别结果。"""
-
-    frame: RingFrame
-    state: SceneState
 
 
 type SceneListener = Callable[[SceneUpdate], None]
@@ -61,6 +55,14 @@ class SceneService(Protocol):
         监听者在事件循环里同步调用，抛错只记录，不影响其它监听者；要做重活的监听者自己排队。
         订阅方把返回的函数登记为撤销函数。
         """
+        ...
+
+    def observe(self, update: SceneUpdate, observation: ScreenObservation) -> bool:
+        """合入原帧上的观察，已换画面或已失效时返回 False。"""
+        ...
+
+    def with_ocr(self, update: SceneUpdate, results: Sequence[OcrResult]) -> SceneUpdate | None:
+        """为原帧补充 OCR 吸附目标。画面已换或已失效时返回 None。"""
         ...
 
     @property
@@ -84,7 +86,8 @@ class SceneHub:
         self._problems = problems
         self._uncalibrated = uncalibrated
         self._latest: SceneUpdate | None = None
-        self._listeners: list[SceneListener] = []
+        self._listeners: dict[object, SceneListener] = {}
+        self._closed = False
 
     @property
     def latest(self) -> SceneUpdate | None:
@@ -99,22 +102,121 @@ class SceneHub:
         return self._uncalibrated
 
     def subscribe(self, listener: SceneListener) -> Callable[[], None]:
-        entry: list[SceneListener] = [listener]
-        self._listeners.append(listener)
+        if self._closed:
+            raise RuntimeError("scene@1 已停用")
+        entry = object()
+        self._listeners[entry] = listener
 
         def unsubscribe() -> None:
-            if entry:
-                self._listeners.remove(entry.pop())
+            self._listeners.pop(entry, None)
 
         return unsubscribe
 
+    def observe(self, update: SceneUpdate, observation: ScreenObservation) -> bool:
+        latest = self._matching_scope(update)
+        if latest is None or latest.state.playing:
+            return False
+        screen = latest.screen_state
+        observations = tuple(
+            item for item in screen.observations if item.screen_type is not observation.screen_type
+        )
+        screen = replace(screen, observations=(*observations, observation))
+        self._latest = replace(latest, screen_state=screen)
+        return True
+
+    def with_ocr(self, update: SceneUpdate, results: Sequence[OcrResult]) -> SceneUpdate | None:
+        latest = self._matching_scope(update)
+        if latest is None:
+            return None
+        targets: tuple[OcrLine, ...] = ()
+        if not latest.state.playing and latest.state.verdict is not Verdict.DISABLED:
+            targets = _text_targets(update.frame, results)
+        screen = replace(latest.screen_state, text_targets=targets)
+        return replace(update, screen_state=screen)
+
+    def _matching_scope(self, update: SceneUpdate) -> SceneUpdate | None:
+        latest = self._latest
+        if latest is not None and latest.observation_scope is update.observation_scope:
+            return latest
+        return None
+
+    def invalidate(self) -> None:
+        self._latest = None
+
+    def begin_frame(self, frame: RingFrame) -> None:
+        if self._latest is not None and not _same_picture(self._latest.frame, frame):
+            self.invalidate()
+
+    def close(self) -> None:
+        self._closed = True
+        self.invalidate()
+        self._listeners.clear()
+
     def publish(self, update: SceneUpdate) -> None:
+        if self._closed:
+            return
+        old = self._latest
+        if old is not None and _same_picture(old.frame, update.frame):
+            screen = replace(update.screen_state, observations=old.screen_state.observations)
+            # 确定性判别改变后重新观察，但同一画面已追加的限制仍然有效。
+            scope = (
+                old.observation_scope if _same_judgement(old, update) else update.observation_scope
+            )
+            update = replace(update, screen_state=screen, observation_scope=scope)
         self._latest = update
-        for listener in list(self._listeners):
+        for listener in list(self._listeners.values()):
             try:
                 listener(update)
             except Exception:
                 logger.exception("scene@1 的监听者处理帧 %d 时出错", update.state.frame_number)
+
+
+def _same_picture(before: RingFrame, current: RingFrame) -> bool:
+    return (
+        before.frame_number < current.frame_number
+        and before.transform_version == current.transform_version
+        and before.width == current.width
+        and before.height == current.height
+        and before.row_stride == current.row_stride
+        and before.pixels == current.pixels
+    )
+
+
+def _same_judgement(previous: SceneUpdate, update: SceneUpdate) -> bool:
+    before, current = previous.state, update.state
+    return (before.playing, before.verdict, before.screen, before.matched) == (
+        current.playing,
+        current.verdict,
+        current.screen,
+        current.matched,
+    )
+
+
+def _inside(box: PixelRect, outer: PixelRect) -> bool:
+    return (
+        outer.left <= box.left < box.right <= outer.right
+        and outer.top <= box.top < box.bottom <= outer.bottom
+    )
+
+
+def _text_targets(frame: RingFrame, results: Sequence[OcrResult]) -> tuple[OcrLine, ...]:
+    client = PixelRect(0, 0, frame.width, frame.height)
+    lines: dict[OcrLine, None] = {}
+    for result in results:
+        if (
+            result.frame_number != frame.frame_number
+            or result.transform_version != frame.transform_version
+            or not _inside(result.rect, client)
+        ):
+            continue
+        for line in result.lines:
+            if (
+                line.text.strip()
+                and 0.0 <= line.confidence <= 1.0
+                and _inside(line.box, result.rect)
+            ):
+                lines[line] = None
+    return tuple(lines)
 
 
 class SceneConfig(BaseModel):
@@ -188,6 +290,7 @@ class ScenePlugin(Plugin[SceneConfig]):
         )
 
         async def stop() -> None:
+            hub.close()
             task.cancel()
             await asyncio.wait((task,))
             if not task.cancelled() and task.exception() is not None:
@@ -209,10 +312,12 @@ async def _read_frames(
         try:
             frame = await frames.next_frame(after)
         except FrameBacklogError as error:
+            hub.invalidate()
             logger.error("%s 积压超限：%s", ctx.entry_id, error)
             after = error.resume_after
             continue
         except Exception as error:
+            hub.invalidate()
             if not failing:
                 logger.warning("%s 读帧失败，%g 秒后重试：%s", ctx.entry_id, RETRY_INTERVAL, error)
                 failing = True
@@ -222,13 +327,16 @@ async def _read_frames(
             logger.info("%s 恢复读帧", ctx.entry_id)
             failing = False
         if frame is None:
+            hub.invalidate()
             logger.info("%s 的帧源已结束", ctx.entry_id)
             return
         after = frame.frame_number
-        reader = ctx.optional(OCR)
+        hub.begin_frame(frame)
         try:
-            state = await in_thread(functools.partial(analyzer.analyze, frame, reader))
+            reader = ctx.optional(OCR)
+            update = await in_thread(functools.partial(analyzer.analyze_update, frame, reader))
         except Exception:
+            hub.invalidate()
             logger.exception("%s 判别帧 %d 出错，跳过这一帧", ctx.entry_id, frame.frame_number)
             continue
-        hub.publish(SceneUpdate(frame, state))
+        hub.publish(update)
