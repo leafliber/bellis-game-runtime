@@ -2,7 +2,7 @@
 “画面变化与签名”。锚点模板文件的布局见 `docs/modules/game-adapter.md` 的“模板文件”。
 """
 
-from game_runtime.scene.analyzer import SceneAnalyzer, SceneState
+from game_runtime.scene.analyzer import SceneAnalyzer, SceneState, SceneUpdate
 from game_runtime.scene.change import (
     Change,
     ChangeDetector,
@@ -17,7 +17,6 @@ from game_runtime.scene.plugin import (
     SceneListener,
     ScenePlugin,
     SceneService,
-    SceneUpdate,
 )
 from game_runtime.scene.signatures import (
     ASPECT_TOLERANCE,
@@ -31,6 +30,12 @@ from game_runtime.scene.signatures import (
     Verdict,
     decide,
     resolution_problem,
+)
+from game_runtime.scene.state import (
+    ScreenClassification,
+    ScreenObservation,
+    ScreenSource,
+    ScreenState,
 )
 from game_runtime.scene.templates import (
     TEMPLATES_DIR,
@@ -59,6 +64,10 @@ __all__ = [
     "SceneService",
     "SceneState",
     "SceneUpdate",
+    "ScreenClassification",
+    "ScreenObservation",
+    "ScreenSource",
+    "ScreenState",
     "SignatureJudge",
     "SignatureResult",
     "Stability",

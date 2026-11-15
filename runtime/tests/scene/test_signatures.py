@@ -314,7 +314,7 @@ def test_without_ocr_fixed_texts_are_undetermined_never_passed(
     assert reader.calls == []
 
 
-def test_ocr_results_are_reused_while_the_roi_is_unchanged(
+def test_ocr_results_are_reused_only_with_the_same_reader_and_pixels(
     synthetic: Adapter, data_dir: Path
 ) -> None:
     adapter = menu_with_text(synthetic)
@@ -329,13 +329,15 @@ def test_ocr_results_are_reused_while_the_roi_is_unchanged(
     assert run(1, reader) is Verdict.SCREEN
     assert run(2, reader) is Verdict.SCREEN
     assert len(reader.calls) == 1
-    # 同样的像素已经读过：OCR 暂时不在也沿用上次的结果。
-    assert run(3, None) is Verdict.SCREEN
+    # 即使像素未变，OCR 失效后也不能沿用原来的签名。
+    assert run(3, None) is Verdict.UNDETERMINED
+    assert run(4, reader) is Verdict.SCREEN
+    assert len(reader.calls) == 2
     # 光标移到“商店”，“开始”按钮的像素变了：重新读。
     game.handle(Press(Key.DOWN))
     assert game.truth().selected == "menu.shop"
-    assert run(4, reader) is Verdict.SCREEN
-    assert len(reader.calls) == 2
+    assert run(5, reader) is Verdict.SCREEN
+    assert len(reader.calls) == 3
 
 
 # 分辨率与尚未标定

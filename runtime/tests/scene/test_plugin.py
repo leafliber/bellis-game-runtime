@@ -17,7 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 from core_protocol import models
-from game_runtime.adapter import GameAdapterPlugin, PixelRect
+from game_runtime.adapter import Adapter, GameAdapterPlugin, PixelRect, ScreenType
 from game_runtime.frame_ring import RingFrame
 from game_runtime.frames import MemoryFrameSource
 from game_runtime.kernel import (
@@ -36,13 +36,20 @@ from game_runtime.kernel import (
     Tier,
     catalog,
 )
+from game_runtime.ocr.service import OcrLine, OcrResult
 from game_runtime.scene import (
     OCR,
     SCENE,
+    SceneAnalyzer,
     SceneConfig,
+    SceneHub,
     ScenePlugin,
     SceneService,
     SceneUpdate,
+    ScreenClassification,
+    ScreenObservation,
+    ScreenSource,
+    SignatureJudge,
     Stability,
     Verdict,
 )
@@ -173,13 +180,19 @@ class Feed:
         self.game = SyntheticGame(GameConfig(), self.clock)
         self.number = 0
 
-    def push(self, seconds: float = 1 / 30) -> int:
+    def push(self, seconds: float = 1 / 30, *, transform_version: int = 1) -> int:
         self.clock.advance(seconds)
         frame = self.game.frame()
         self.number += 1
         capture_ns = round(self.clock.now() * 1e9)
         ring = RingFrame(
-            self.number, capture_ns, 1, frame.width, frame.height, frame.stride, frame.data
+            self.number,
+            capture_ns,
+            transform_version,
+            frame.width,
+            frame.height,
+            frame.stride,
+            frame.data,
         )
         self.frames.push(ring)
         return self.number
@@ -339,11 +352,27 @@ def test_fixed_texts_use_ocr_while_it_is_there(data_dir: Path) -> None:
         assert Shared.reader.calls == 1
 
         # OCR 停用后 scene 仍在运行；“开始”按钮的像素变了，固定文字项不可判。
+        assert scene.observe(
+            menu, ScreenObservation(screen_type=ScreenType.SETTINGS, confidence=0.6)
+        )
         await k.disable("fake-ocr")
         assert k.status("scene").state is State.ACTIVE
+        unchanged = await processed(scene, feed.push())
+        assert unchanged.frame.pixels == menu.frame.pixels
+        assert unchanged.state.verdict is Verdict.UNDETERMINED  # 停用后不沿用缓存签名
+        assert unchanged.screen_state.restrictions == {ScreenType.UNKNOWN, ScreenType.SETTINGS}
+        assert not scene.observe(menu, ScreenObservation(screen_type=ScreenType.SHOP, confidence=1))
+
         feed.game.handle(Press(Key.DOWN))
         later = await processed(scene, feed.push())
         assert later.state.verdict is Verdict.UNDETERMINED
+        assert scene.observe(
+            later, ScreenObservation(screen_type=ScreenType.DIALOGUE, confidence=1)
+        )
+        latest = scene.latest
+        assert latest is not None
+        assert latest.screen_state.classification.source is ScreenSource.OBSERVATION
+        assert latest.screen_state.restrictions == {ScreenType.UNKNOWN}
         [signature] = [s for s in later.state.signatures if s.id == "title-menu"]
         assert signature.detail == "固定文字 [0]：OCR 不可用"
 
@@ -355,6 +384,226 @@ def test_fixed_texts_use_ocr_while_it_is_there(data_dir: Path) -> None:
         await k.shutdown()
 
     asyncio.run(scenario())
+
+
+def test_observations_only_add_restrictions_for_the_same_picture(data_dir: Path) -> None:
+    async def scenario() -> None:
+        frames = MemoryFrameSource()
+        k = kernel(frames)
+        k.add(profile(data_dir, ocr=True))
+        await k.settled()
+        scene = await scene_service()
+        feed = Feed(frames)
+        feed.click("menu.shop")
+        shop = await processed(scene, feed.push())
+        signed = ScreenClassification(ScreenType.SHOP, ScreenSource.SIGNATURE, 1)
+        assert shop.screen_state.classification == signed
+        before = shop.screen_state.restrictions
+        assert before == {ScreenType.SHOP}
+
+        received: list[SceneUpdate] = []
+        unsubscribe = scene.subscribe(received.append)
+        for screen_type in ScreenType:
+            assert scene.observe(shop, ScreenObservation(screen_type=screen_type, confidence=0.1))
+            latest = scene.latest
+            assert latest is not None
+            assert latest.screen_state.classification == signed
+            assert before <= latest.screen_state.restrictions
+            before = latest.screen_state.restrictions
+        assert {ScreenType.SETTINGS, ScreenType.CHOICE, ScreenType.TIMED_CHOICE} <= before
+        assert not received
+        newer = await processed(scene, feed.push(0.3))
+        assert newer.screen_state.restrictions == before
+        assert received == [newer]
+
+        # 即使像素相同，坐标变换后上一帧的观察也不能再合入。
+        moved = await processed(scene, feed.push(transform_version=2))
+        assert moved.frame.pixels == newer.frame.pixels
+        assert moved.screen_state.restrictions == {ScreenType.SHOP}
+        assert not scene.observe(
+            shop, ScreenObservation(screen_type=ScreenType.SETTINGS, confidence=1)
+        )
+        assert scene.with_ocr(newer, ()) is None
+        assert scene.observe(
+            moved, ScreenObservation(screen_type=ScreenType.SETTINGS, confidence=1)
+        )
+        await k.disable("scene")
+        assert scene.latest is None
+        assert not scene.observe(
+            moved, ScreenObservation(screen_type=ScreenType.SHOP, confidence=1)
+        )
+        assert scene.with_ocr(moved, ()) is None
+        unsubscribe()
+        await k.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_ocr_cache_is_invalidated_when_service_is_replaced(data_dir: Path) -> None:
+    class NoTextReader(LabelReader):
+        LABELS: ClassVar[dict[tuple[int, int], str]] = {}
+
+    async def scenario() -> None:
+        frames = MemoryFrameSource()
+        k = kernel(frames)
+        k.add(profile(data_dir, ocr=True))
+        await k.settled()
+        scene = await scene_service()
+        feed = Feed(frames)
+        menu = await processed(scene, feed.push())
+        assert menu.state.verdict is Verdict.SCREEN
+
+        await k.disable("fake-ocr")
+        Shared.reader = NoTextReader()
+        await k.enable("fake-ocr")
+        # 两个不同服务之间没有处理任何帧，且 ROI 的像素完全相同。
+        replaced = await processed(scene, feed.push())
+        assert replaced.frame.pixels == menu.frame.pixels
+        assert Shared.reader.calls == 1
+        assert replaced.state.verdict is Verdict.NONE
+        assert replaced.screen_state.classification.screen_type is ScreenType.UNKNOWN
+        await k.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_new_pixels_invalidate_old_evidence_before_analysis_finishes(data_dir: Path) -> None:
+    async def scenario() -> None:
+        frames = MemoryFrameSource()
+        k = kernel(frames)
+        k.add(profile(data_dir, ocr=True))
+        await k.settled()
+        scene = await scene_service()
+        feed = Feed(frames)
+        original = await processed(scene, feed.push())
+        assert original.state.verdict is Verdict.SCREEN
+        rect = PixelRect(460, 300, 820, 364)
+        line = OcrLine("开始", PixelRect(611, 321, 665, 343), 0.8)
+        result = OcrResult(
+            original.frame.frame_number,
+            original.frame.transform_version,
+            "menu-start",
+            rect,
+            (line,),
+        )
+        assert scene.with_ocr(original, (result,)) is not None
+        gate = threading.Event()
+        Shared.reader.gate = gate
+        Shared.reader.started.clear()
+        feed.game.handle(Press(Key.DOWN))
+        pending = feed.push()
+        try:
+            assert await asyncio.to_thread(Shared.reader.started.wait, WAIT)
+            assert scene.latest is None
+            assert scene.with_ocr(original, (result,)) is None
+            assert not scene.observe(
+                original, ScreenObservation(screen_type=ScreenType.SHOP, confidence=1)
+            )
+        finally:
+            gate.set()
+        refreshed = await processed(scene, pending)
+        assert refreshed.state.verdict is Verdict.SCREEN
+        assert refreshed.frame.transform_version == original.frame.transform_version
+        await k.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_no_signature_can_use_observed_dialogue_with_same_frame_ocr(synthetic: Adapter) -> None:
+    adapter = Adapter.model_validate(
+        {**synthetic.model_dump(), "signatures": (), "dialogue_boxes": ()}
+    )
+    analyzer = SceneAnalyzer(SignatureJudge(adapter, {}))
+    hub = SceneHub(problems=(), uncalibrated=())
+    frames = MemoryFrameSource()
+    feed = Feed(frames)
+    feed.click("menu.start")
+    feed.push(1.0)
+    update = analyzer.analyze_update(frames.frames[-1], None)
+    hub.publish(update)
+    assert update.state.verdict is Verdict.NONE
+    assert update.screen_state.classification.screen_type is ScreenType.UNKNOWN
+
+    # 观察可提供普通画面的类型，同帧 OCR 可作为吸附证据，来源仍是观察。
+    assert hub.observe(update, ScreenObservation(screen_type=ScreenType.DIALOGUE, confidence=0.8))
+    line = OcrLine("测试对白", PixelRect(84, 523, 121, 548), 0.9)
+    box = PixelRect(80, 500, 1200, 670)
+    result = OcrResult(
+        update.frame.frame_number, update.frame.transform_version, "dialogue", box, (line,)
+    )
+    with_targets = hub.with_ocr(update, (result,))
+    assert with_targets is not None
+    assert with_targets.screen_state.classification == ScreenClassification(
+        ScreenType.DIALOGUE, ScreenSource.OBSERVATION, 0.8
+    )
+    assert with_targets.screen_state.text_targets == (line,)
+    assert not with_targets.screen_state.restrictions
+    assert with_targets.state is update.state  # 用于录制的逐帧判别不受影响
+
+    # 危险观察随后仍可加限制，再报告普通画面也不会撤销限制。
+    assert hub.observe(update, ScreenObservation(screen_type=ScreenType.SETTINGS, confidence=0.4))
+    assert hub.observe(update, ScreenObservation(screen_type=ScreenType.DIALOGUE, confidence=1))
+    restricted = hub.with_ocr(update, (result,))
+    assert restricted is not None
+    assert restricted.screen_state.restrictions == {ScreenType.SETTINGS}
+
+
+def test_delayed_ocr_targets_stay_on_their_frame_and_observations_expire(data_dir: Path) -> None:
+    async def scenario() -> None:
+        frames = MemoryFrameSource()
+        k = kernel(frames)
+        k.add(profile(data_dir, ocr=True))
+        await k.settled()
+        scene = await scene_service()
+        feed = Feed(frames)
+        menu = await processed(scene, feed.push())
+        rect = PixelRect(460, 300, 820, 364)
+        line = OcrLine("开始", PixelRect(611, 321, 665, 343), 0.8)
+        outside = OcrLine("无效位置", PixelRect(0, 0, 9, 9), 1)
+        result = OcrResult(
+            menu.frame.frame_number,
+            menu.frame.transform_version,
+            "menu-start",
+            rect,
+            (line, outside),
+        )
+        newer = await processed(scene, feed.push(0.3))
+        assert scene.observe(menu, ScreenObservation(screen_type=ScreenType.CHOICE, confidence=0.6))
+        original = scene.with_ocr(menu, (result, result))
+        assert original is not None
+        assert original.frame is menu.frame
+        assert original.screen_state.text_targets == (line,)
+        assert original.screen_state.restrictions == {ScreenType.MENU, ScreenType.CHOICE}
+
+        wrong_version = OcrResult(newer.frame.frame_number, 9, "menu-start", rect, (line,))
+        no_targets = scene.with_ocr(newer, (result, wrong_version))
+        assert no_targets is not None
+        assert not no_targets.screen_state.text_targets
+
+        feed.game.handle(Press(Key.DOWN))
+        shifted = await processed(scene, feed.push())
+        assert shifted.frame.pixels != newer.frame.pixels
+        assert shifted.screen_state.restrictions == {ScreenType.MENU}
+        assert scene.with_ocr(menu, (result,)) is None
+        assert not scene.observe(
+            newer, ScreenObservation(screen_type=ScreenType.SHOP, confidence=0.8)
+        )
+        frames.close()
+        await until(lambda: True if scene.latest is None else None)
+        assert not scene.observe(
+            shifted, ScreenObservation(screen_type=ScreenType.SHOP, confidence=0.8)
+        )
+        await k.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("confidence", [-0.1, 1.1, float("nan"), "0.8"])
+def test_observation_confidence_must_be_a_probability(confidence: object) -> None:
+    with pytest.raises(ValidationError, match="confidence"):
+        ScreenObservation.model_validate(
+            {"screen_type": ScreenType.DIALOGUE, "confidence": confidence}
+        )
 
 
 def test_template_problems_are_reported(root: Path, caplog: pytest.LogCaptureFixture) -> None:

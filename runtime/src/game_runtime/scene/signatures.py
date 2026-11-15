@@ -8,10 +8,12 @@ import logging
 import math
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Final, Protocol
+from weakref import ReferenceType, ref
 
 import cv2
 import numpy as np
@@ -189,7 +191,7 @@ class SignatureJudge:
 
     def __init__(self, adapter: Adapter, templates: Mapping[str, Bgr | TemplateError]) -> None:
         """`templates` 按 SHA-256 给出读入的模板或读不出的原因，见 `load`。"""
-        self._adapter = adapter
+        self.adapter = adapter
         self._signatures = tuple(s for s in adapter.signatures if s.calibrated)
         self._pixels = {
             s.id: tuple(_Pixel.of(check) for check in s.pixels) for s in adapter.signatures
@@ -198,6 +200,7 @@ class SignatureJudge:
         self._scaled: dict[str, Bgr | str] = {}
         self._scaled_for: tuple[int, int] | None = None
         self._texts: OrderedDict[tuple[PixelRect, bytes], tuple[str, ...]] = OrderedDict()
+        self._text_reader: ReferenceType[TextReader] | None = None
         self._warned: tuple[int, int] | None = None
 
     @classmethod
@@ -219,7 +222,7 @@ class SignatureJudge:
     @property
     def uncalibrated(self) -> tuple[str, ...]:
         """尚未标定、不参与判别的签名。"""
-        return tuple(s.id for s in self._adapter.signatures if not s.calibrated)
+        return tuple(s.id for s in self.adapter.signatures if not s.calibrated)
 
     @property
     def problems(self) -> tuple[str, ...]:
@@ -235,10 +238,11 @@ class SignatureJudge:
     def judge(self, frame: RingFrame, bgra: Bgra, reader: TextReader | None) -> Judgement:
         """判别一帧。`reader` 为 None 即 OCR 不可用，固定文字项不可判。"""
         size = (frame.width, frame.height)
-        problem = resolution_problem(frame.width, frame.height, self._adapter.resolution)
+        self._use_text_reader(reader)
+        problem = resolution_problem(frame.width, frame.height, self.adapter.resolution)
         if problem is not None:
             if self._warned != size:
-                logger.warning("适配包 %s 的签名停用：%s", self._adapter.id, problem)
+                logger.warning("适配包 %s 的签名停用：%s", self.adapter.id, problem)
                 self._warned = size
             return Judgement(Verdict.DISABLED, None, (), (), problem)
         self._warned = None
@@ -299,7 +303,7 @@ class SignatureJudge:
         if isinstance(template, str):
             return unscored, template
         height, width = bgra.shape[:2]
-        rect = self._adapter.roi(anchor.roi).to_pixels(width, height)
+        rect = self.adapter.roi(anchor.roi).to_pixels(width, height)
         region_width, region_height = rect.right - rect.left, rect.bottom - rect.top
         template_height, template_width = template.shape[:2]
         if template_width > region_width or template_height > region_height:
@@ -330,7 +334,7 @@ class SignatureJudge:
             scaled = str(base)
         else:
             height, width = bgra.shape[:2]
-            expected = self._adapter.resolution
+            expected = self.adapter.resolution
             base_height, base_width = base.shape[:2]
             new_width = max(1, round(base_width * width / expected.width))
             new_height = max(1, round(base_height * height / expected.height))
@@ -348,20 +352,30 @@ class SignatureJudge:
 
     # 固定文字
 
+    def _use_text_reader(self, reader: TextReader | None) -> None:
+        if reader is not None and self._text_reader is not None and self._text_reader() is reader:
+            return
+        self._texts.clear()
+        self._text_reader = None
+        if reader is not None:
+            # 不支持弱引用时，每帧重新读取，不持有已停用的可选服务。
+            with suppress(TypeError):
+                self._text_reader = ref(reader)
+
     def _read(
         self, item: RoiText, frame: RingFrame, bgra: Bgra, reader: TextReader | None
     ) -> tuple[str, ...] | str:
         """ROI 内的各行文字，或不可判的原因。同一 ROI 的像素没变时沿用上次读出的。"""
+        if reader is None:
+            return "OCR 不可用"
         height, width = bgra.shape[:2]
-        rect = self._adapter.roi(item.roi).to_pixels(width, height)
+        rect = self.adapter.roi(item.roi).to_pixels(width, height)
         pixels = bgra[rect.top : rect.bottom, rect.left : rect.right]
         key = (rect, hashlib.blake2b(pixels.tobytes(), digest_size=16).digest())
         cached = self._texts.get(key)
         if cached is not None:
             self._texts.move_to_end(key)
             return cached
-        if reader is None:
-            return "OCR 不可用"
         try:
             lines = tuple(str(line) for line in reader.read_lines(frame, rect))
         except Exception as error:

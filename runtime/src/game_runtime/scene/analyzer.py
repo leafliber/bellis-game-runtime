@@ -4,8 +4,9 @@
 时刻取帧的采集时刻，不读墙钟；实时运行与回放按同样的顺序处理同样的帧即得到同样的结果。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from game_runtime.adapter import ScreenType
 from game_runtime.frame_ring import RingFrame
 from game_runtime.frames import check_frame
 from game_runtime.scene.change import ChangeDetector, ChangeParams, Stability, bgra_view
@@ -15,6 +16,7 @@ from game_runtime.scene.signatures import (
     TextReader,
     Verdict,
 )
+from game_runtime.scene.state import ScreenClassification, ScreenSource, ScreenState
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +48,19 @@ class SceneState:
     """每个参与判别的签名的结果；停用时为空。"""
     detail: str | None
     """停用时的分辨率、不可判时是哪些签名、歧义时是哪些画面。"""
+
+
+@dataclass(frozen=True, slots=True)
+class SceneUpdate:
+    """处理过的一帧、逐帧判别与控制使用的画面状态。"""
+
+    frame: RingFrame
+    state: SceneState
+    screen_state: ScreenState = field(default_factory=ScreenState)
+    observation_scope: object = field(
+        default_factory=object, repr=False, compare=False, kw_only=True
+    )
+    """连续未变的画面共用；由 scene@1 发布时设置。"""
 
 
 class SceneAnalyzer:
@@ -80,3 +95,14 @@ class SceneAnalyzer:
             signatures=judgement.signatures,
             detail=judgement.detail,
         )
+
+    def analyze_update(self, frame: RingFrame, reader: TextReader | None) -> SceneUpdate:
+        state = self.analyze(frame, reader)
+        if state.verdict is Verdict.SCREEN and state.screen is not None:
+            screen_type = self.judge.adapter.generic_type(state.screen)
+            screen = ScreenState(ScreenClassification(screen_type, ScreenSource.SIGNATURE, 1.0))
+        elif state.playing:
+            screen = ScreenState(ScreenClassification(ScreenType.CUTSCENE, None, 1.0))
+        else:
+            screen = ScreenState(uncertain_signature=state.verdict is not Verdict.NONE)
+        return SceneUpdate(frame, state, screen)
