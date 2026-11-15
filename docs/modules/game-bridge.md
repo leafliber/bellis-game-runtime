@@ -145,10 +145,11 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 
 | 方法 | 方向 | 类型 | 字段 |
 | --- | --- | --- | --- |
-| `operator.session` | 控制台 → 主进程 | 通知 | 连上后立即发一次，此后每次变化都发：`adapter`（适配包 id）、`state`、`confirmed`（已确认的前置条件 id）、`goal`（当前目标的文字，没有时为 `null`）、`ends_at_ns`（到时的时刻，还没开始时为 `null`） |
+| `operator.session` | 控制台 → 主进程 | 通知 | 连上后立即发一次，此后每次变化都发。字段为 `adapter`、`state`、`confirmed`、`goal`、`goal_revision`、`ends_at_ns`。每条目标指令使 `goal_revision` 递增，包括重发同一目标或清除目标 |
 | `operator.decision_opened` | 主进程 → 控制台 | 通知 | `id`（本会话内唯一）、`prompt`、`options`（每项 `index` 与 `text`）、`candidates`（按推荐顺序的 `index`）、`deadline_ns`（无计时时为 `null`） |
+| `operator.decision_updated` | 主进程 → 控制台 | 通知 | 已打开的 `id`、当前 `candidates` 与 `deadline_ns`。控制台校验候选属于原选项且截止时刻只会缩短 |
 | `operator.decision_resolved` | 控制台 → 主进程 | 通知 | `id`、`index`：操作员的选择 |
-| `operator.decision_closed` | 主进程 → 控制台 | 通知 | `id`、`index`（确认执行的选项，撤回或结果未知时为 `null`）、`by` 为 `operator`、`default`、`withdrawn` 或 `unknown` |
+| `operator.decision_closed` | 主进程 → 控制台 | 通知 | `id`、`index`（已核验的选项）、`by`（`operator`、`default`、`withdrawn` 或 `unknown`）、`executed_at_ns`（实时核确认交给输入后端的时刻）。撤回或结果未知时 `index` 为 `null`，缺少核的已执行回执时 `executed_at_ns` 为 `null` |
 | `operator.action` | 主进程 → 控制台 | 通知 | `category`（`advance`、`navigate`、`select`）、`summary`：已提交的一个动作，计入会话记录 |
 
 - 主进程核对 `adapter` 与自己加载的适配包相同，不同即断开并报错。
