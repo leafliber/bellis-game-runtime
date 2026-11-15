@@ -245,6 +245,147 @@ def test_the_pipeline_reports_lines_in_image_coordinates() -> None:
     assert second.top < 120 < 150 < second.bottom
     assert all(isinstance(value, int) for value in first)
     assert lines[0].confidence == pytest.approx(0.9)
+    assert [line.horizontal for line in lines] == [True, True]
+
+
+@pytest.mark.parametrize("merge_gap_ratio", [None, 1.0])
+def test_line_direction_is_preserved_before_flattening_and_rotation(
+    monkeypatch: pytest.MonkeyPatch, merge_gap_ratio: float | None
+) -> None:
+    flat = rect(10, 9, 40, 25)
+    tilted = np.array([[44, 9], [78, 11], [78, 27], [44, 25]], np.float32)
+    tall = rect(20, 51, 30, 96)
+
+    def detections(
+        _probability: NDArray[np.float32], **_options: object
+    ) -> list[tuple[Quad, float]]:
+        return [(quad, 1.0) for quad in (flat, tilted, tall)]
+
+    monkeypatch.setattr("game_runtime.ocr.engine.db_boxes", detections)
+    engine = OcrEngine(
+        FakeDetector(),
+        FakeRecognizerModel(len(DICTIONARY) + 2),
+        DICTIONARY,
+        EngineOptions(merge_gap_ratio=merge_gap_ratio),
+        model="fake",
+    )
+    lines = engine.recognize(np.full((128, 128, 3), 255, np.uint8))
+
+    assert [line.text for line in lines] == ["甲乙"] * len(lines)
+    if merge_gap_ratio is None:
+        assert [line.horizontal for line in lines] == [True, False, False]
+    else:
+        assert [line.horizontal for line in lines] == [False, False]
+        assert lines[0].box == PixelRect(10, 9, 78, 27)
+
+
+@pytest.mark.parametrize(
+    ("width", "rise", "side_shift", "horizontal"),
+    [
+        pytest.param(96, 3.3, 0, True, id="within-two-degrees"),
+        pytest.param(96, -3.3, 0, True, id="negative-tilt-within-two-degrees"),
+        pytest.param(96, 3.4, 0, False, id="exceeds-two-degrees"),
+        pytest.param(96, -3.4, 0, False, id="negative-tilt-exceeds-two-degrees"),
+        pytest.param(200, 5.1, 0, True, id="within-one-fifth-height"),
+        pytest.param(200, 5.3, 0, False, id="exceeds-one-fifth-height"),
+        pytest.param(96, 0, 0.90, True, id="sides-within-two-degrees"),
+        pytest.param(96, 0, 0.92, False, id="sides-exceed-two-degrees"),
+    ],
+)
+def test_line_direction_requires_both_angle_and_drift_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    rise: float,
+    side_shift: float,
+    horizontal: bool,
+) -> None:
+    quad = np.array(
+        [
+            [32, 20],
+            [32 + width, 20 + rise],
+            [32 + width + side_shift, 46 + rise],
+            [32 + side_shift, 46],
+        ],
+        np.float32,
+    )
+
+    def detections(
+        _probability: NDArray[np.float32], **_options: object
+    ) -> list[tuple[Quad, float]]:
+        return [(quad, 1.0)]
+
+    monkeypatch.setattr("game_runtime.ocr.engine.db_boxes", detections)
+    engine = OcrEngine(
+        FakeDetector(),
+        FakeRecognizerModel(len(DICTIONARY) + 2),
+        DICTIONARY,
+        EngineOptions(),
+        model="fake",
+    )
+    (line,) = engine.recognize(np.full((128, 256, 3), 255, np.uint8))
+
+    assert line.horizontal is horizontal
+
+
+@pytest.mark.parametrize(
+    ("segments", "expected_box", "horizontal"),
+    [
+        pytest.param(
+            ((0, 0, 40, 20), (42, 9, 82, 29)),
+            PixelRect(0, 0, 82, 29),
+            False,
+            id="merge-flattens-forty-five-percent-offset",
+        ),
+        pytest.param(
+            ((0, 0, 40, 20), (42, 3, 82, 23), (84, 6, 124, 26)),
+            PixelRect(0, 0, 124, 26),
+            False,
+            id="small-pairwise-offsets-can-accumulate",
+        ),
+        pytest.param(
+            ((20, 100, 60, 127), (62, 105, 102, 136)),
+            PixelRect(20, 100, 102, 128),
+            False,
+            id="clipping-cannot-mask-original-baselines",
+        ),
+        pytest.param(
+            ((10, 20, 200, 70), (202, 61, 211, 68)),
+            PixelRect(10, 20, 211, 70),
+            True,
+            id="punctuation-near-baseline",
+        ),
+        pytest.param(
+            ((10, 20, 100, 70), (102, 40, 140, 69)),
+            PixelRect(10, 20, 140, 70),
+            True,
+            id="different-glyph-heights-near-baseline",
+        ),
+    ],
+)
+def test_merged_text_keeps_baseline_evidence_from_original_segments(
+    monkeypatch: pytest.MonkeyPatch,
+    segments: tuple[tuple[int, int, int, int], ...],
+    expected_box: PixelRect,
+    horizontal: bool,
+) -> None:
+    def detections(
+        _probability: NDArray[np.float32], **_options: object
+    ) -> list[tuple[Quad, float]]:
+        return [(rect(*segment), 1.0) for segment in segments]
+
+    monkeypatch.setattr("game_runtime.ocr.engine.db_boxes", detections)
+    engine = OcrEngine(
+        FakeDetector(),
+        FakeRecognizerModel(len(DICTIONARY) + 2),
+        DICTIONARY,
+        EngineOptions(merge_gap_ratio=0.5),
+        model="fake",
+    )
+    (line,) = engine.recognize(np.full((128, 256, 3), 255, np.uint8))
+
+    assert line.box == expected_box
+    assert line.text == "甲乙"
+    assert line.horizontal is horizontal
 
 
 def test_low_confidence_lines_are_dropped() -> None:

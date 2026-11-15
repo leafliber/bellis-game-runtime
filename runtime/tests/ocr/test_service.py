@@ -82,8 +82,11 @@ def test_rects_outside_the_frame_are_rejected(rect: PixelRect) -> None:
         crop_bgr(gradient_frame(300, 200), rect)
 
 
-def test_boxes_are_moved_back_to_client_pixels() -> None:
-    recognizer = ScriptedRecognizer([[scripted_line("门", (5, 6, 25, 30), 0.8)]])
+@pytest.mark.parametrize("horizontal", [None, True, False])
+def test_boxes_are_moved_back_to_client_pixels(horizontal: bool | None) -> None:
+    recognizer = ScriptedRecognizer(
+        [[RecognizedLine("门", PixelRect(5, 6, 25, 30), 0.8, horizontal)]]
+    )
 
     result = recognize_frame(recognizer, gradient_frame(300, 200), PixelRect(100, 50, 200, 90), "x")
 
@@ -94,6 +97,7 @@ def test_boxes_are_moved_back_to_client_pixels() -> None:
     assert [(line.text, line.box, line.confidence) for line in result.lines] == [
         ("门", PixelRect(105, 56, 125, 80), 0.8)
     ]
+    assert result.lines[0].horizontal is horizontal
 
 
 def test_results_give_the_line_texts_in_reading_order() -> None:

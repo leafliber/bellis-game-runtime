@@ -9,7 +9,7 @@ import asyncio
 import functools
 from collections.abc import Buffer, Callable
 from concurrent.futures import CancelledError, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
@@ -61,6 +61,8 @@ class OcrLine:
     """识别框：客户区物理像素，含左边与上边、不含右边与下边。"""
     confidence: float
     """识别置信度，[0, 1]。"""
+    horizontal: bool | None = field(default=None, compare=False)
+    """识别引擎提供的原始水平几何证据。"""
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,7 @@ def recognize_frame(
                 line.box.bottom + rect.top,
             ),
             line.confidence,
+            line.horizontal,
         )
         for line in recognizer.recognize(crop_bgr(frame, rect))
     )
