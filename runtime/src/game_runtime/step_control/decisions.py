@@ -1,0 +1,102 @@
+"""决策点的身份、计时与选项。选项坐标由控制器在执行前重新读取。"""
+
+import re
+from dataclasses import dataclass
+from typing import Literal
+
+from game_runtime.adapter.schema import DecisionTimer
+from game_runtime.ocr import OcrLine
+from game_runtime.operator import messages
+from game_runtime.step_control.contracts import DecisionView, StepProposal
+from game_runtime.step_control.risk import text_key
+
+_TIME = re.compile(
+    r"(?:(?P<minutes>[0-9]{1,3}):)?(?P<seconds>[0-9]{1,4})"
+    r"(?:(?P<separator>[.:])(?P<fraction>[0-9]{1,3}))?"
+)
+
+type DecisionKey = tuple[str, str, tuple[str, ...]]
+
+
+def timer_deadline(timer: DecisionTimer, text: str, capture_ns: int) -> int | None:
+    """把屏幕剩余时间换成同一单调时钟上的保守截止时刻。"""
+    text = text_key(text)
+    prefix, suffix = text_key(timer.prefix), text_key(timer.suffix)
+    if not text.startswith(prefix) or not text.endswith(suffix):
+        return None
+    body = text[len(prefix) :]
+    if suffix:
+        body = body[: -len(suffix)]
+    match = _TIME.fullmatch(body)
+    if match is None:
+        return None
+    seconds = int(match["seconds"])
+    minutes = match["minutes"]
+    if minutes is None and match["separator"] == ":":
+        return None
+    if minutes is not None:
+        if seconds >= 60:
+            return None
+        seconds += 60 * int(minutes)
+    fraction = match["fraction"] or ""
+    unit = 10 ** (9 - len(fraction))
+    remaining = seconds * 10**9 + int(fraction or "0") * unit
+    # 显示可能向上舍入，至多扣除一个显示单位。
+    return capture_ns + max(0, remaining - unit)
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionEvidence:
+    screen: str
+    prompt: str
+    lines: tuple[OcrLine, ...]
+    deadline_ns: int | None
+    proposed: StepProposal | None = None
+
+    @property
+    def identity(self) -> DecisionKey:
+        return self.screen, text_key(self.prompt), tuple(text_key(line.text) for line in self.lines)
+
+    @property
+    def view(self) -> DecisionView:
+        return DecisionView(
+            self.prompt,
+            tuple(
+                messages.DecisionOption(index=i, text=line.text)
+                for i, line in enumerate(self.lines)
+            ),
+            self.deadline_ns,
+        )
+
+
+@dataclass(slots=True)
+class PendingDecision:
+    id: str
+    evidence: DecisionEvidence
+    candidates: tuple[int, ...]
+    deadline_ns: int | None
+    opened_frame: int
+    selected: int | None = None
+
+    def refresh_deadline(self, deadline: int | None) -> None:
+        if deadline is not None and self.deadline_ns is not None:
+            self.deadline_ns = min(deadline, self.deadline_ns)
+
+    def accept(self, resolved: messages.DecisionResolved, now_ns: int, margin_ns: int) -> None:
+        if (
+            resolved.id == self.id
+            and self.selected is None
+            and 0 <= resolved.index < len(self.evidence.lines)
+            and (self.deadline_ns is None or now_ns < self.deadline_ns - margin_ns)
+        ):
+            self.selected = resolved.index
+
+    def choose(
+        self, now_ns: int, margin_ns: int
+    ) -> tuple[int, Literal["operator", "default"]] | None:
+        if self.deadline_ns is not None:
+            if now_ns >= self.deadline_ns:
+                return None
+            if now_ns >= self.deadline_ns - margin_ns and self.selected is None:
+                return (self.candidates[0], "default") if self.candidates else None
+        return None if self.selected is None else (self.selected, "operator")

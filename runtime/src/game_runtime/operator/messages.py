@@ -107,14 +107,14 @@ class DecisionClosed(_Message):
 
     id: Text
     index: NonNegative | None
-    """实际执行的选项；没有执行时为 None。"""
-    by: Literal["operator", "default", "withdrawn"]
-    """`operator`：按操作员的选择；`default`：到余量线执行排第一的候选；`withdrawn`：画面已变，不再执行。"""
+    """确认执行的选项，撤回或结果未知时为 None。"""
+    by: Literal["operator", "default", "withdrawn", "unknown"]
+    """确认按操作员选择或缺省候选执行，执行前撤回，或执行结果未知。"""
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
-        if (self.by == "withdrawn") != (self.index is None):
-            raise ValueError("withdrawn 时 index 为 null，其余须给出 index")
+        if (self.by in {"withdrawn", "unknown"}) != (self.index is None):
+            raise ValueError("withdrawn 和 unknown 时 index 为 null，其余须给出 index")
         return self
 
 

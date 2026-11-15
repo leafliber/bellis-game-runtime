@@ -80,6 +80,7 @@ def _layout_rects(layout: Layout) -> dict[str, Rect]:
         "choice-prompt": layout.choice_prompt(),
         "choices": Rect(options[0].left, options[0].top, options[-1].right, options[-1].bottom),
         "timer-bar": layout.timer_bar(),
+        "timer-text": layout.rect(460, 629, 820, 670),
         "menu-start": layout.menu_button(0),
         "menu-shop": layout.menu_button(1),
         "menu-help": layout.menu_button(2),

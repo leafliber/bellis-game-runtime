@@ -94,6 +94,19 @@ type = "坏结局"
 
 [risk]
 
+[risk.returns.shop]
+roi = "shop-leave"
+text = "离开"
+
+[decisions.choice]
+options = "choices"
+prompt = "choice-prompt"
+
+[decisions.timed-choice]
+options = "choices"
+prompt = "choice-prompt"
+timer = { roi = "timer-text", prefix = "剩余", suffix = "秒" }
+
 # ROI 是 tools/synthetic-game/src/synthetic_game/layout.py 在设计稿 1280×720 下的矩形除以 1280×720，
 # 由 runtime/tests/adapter/test_packages.py 核对。
 [rois]
@@ -105,6 +118,7 @@ continue-marker = { title = "继续标记", rect = [0.9296875, 0.902778, 0.94843
 choice-prompt = { title = "选项提问", rect = [0.109375, 0.097222, 0.890625, 0.236111] }
 choices = { title = "选项按钮", rect = [0.28125, 0.319444, 0.71875, 0.686111] }
 timer-bar = { title = "计时条", rect = [0.1875, 0.819444, 0.8125, 0.852778] }
+timer-text = { title = "剩余时间", rect = [0.359375, 0.873611, 0.640625, 0.930556] }
 menu-start = { title = "菜单的“开始”", rect = [0.359375, 0.416667, 0.640625, 0.505556] }
 menu-shop = { title = "菜单的“商店”", rect = [0.359375, 0.538889, 0.640625, 0.627778] }
 menu-help = { title = "菜单的“说明”", rect = [0.359375, 0.661111, 0.640625, 0.75] }
