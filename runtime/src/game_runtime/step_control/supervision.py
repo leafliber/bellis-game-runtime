@@ -19,6 +19,7 @@ class SessionProgress:
     unknown_choice_revision: int | None = None
     ending: tuple[str, int] | None = None
     restart_attempt_revision: int | None = None
+    fast_dialogue_line: tuple[int, int] | None = None
 
     def select_goal(self, goal: Goal | None) -> None:
         if goal != self.goal:
