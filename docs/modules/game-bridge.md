@@ -31,6 +31,8 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 
 - 以 Bellis `packages/protocol`（TypeBox，Bellis D-21）为唯一的源（GD-03）。本仓库在 `vendor/bellis-protocol/` 锁定某个 Bellis 提交的生成物（JSON Schema 与 Pydantic 模型），附来源提交与摘要；`uv run check` 核对锁定副本未被改动。
 - 改动先在 Bellis 合入，本仓库再更新锁定的生成物；两边的检查各自校验。
+- 锁定清单为 `vendor/bellis-protocol/manifest.json`：记录上游仓库、完整提交号、每个副本的源路径与 SHA-256。Schema、Pydantic 模型与控制连接 fixture 均取自同一个已合入提交的 Git blob，保留原始字节；本仓库的格式化工具不改动副本。更新时一起替换这三份文件与清单。`uv run check` 离线核对文件集合、来源路径与摘要；它不联网验证提交是否已合入，更新者须在复制前确认。
+- Python 接收端先用锁定模型提供的 `parse_game_bridge_json` 解码原始 JSON，再校验信封、载荷、角色与方向；不能先用普通 JSON 解码丢失 `-0`、小数或指数形式的整数字段信息。模型和 fixture 只是契约，不能代替实时核对有效许可、帧与输入策略的核验。
 - 握手比较主版本，不兼容时 Bellis 的游戏桥插件停在 WAITING 并说明原因。
 - 控制连接上的消息在实时核中的 Rust 类型，首选用 typify 从锁定的 JSON Schema 生成，不可行时手写，并以锁定的 Schema 与 Bellis 的 fixture 在完整检查中双向校验。
 
