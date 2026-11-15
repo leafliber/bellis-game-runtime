@@ -18,6 +18,7 @@ operate = "game_runtime.operator.cli:main"
 record = "game_runtime.recording.cli:record_main"
 recording = "game_runtime.recording.cli:recording_main"
 replay = "game_runtime.recording.cli:replay_main"
+supervise = "game_runtime.step_control.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.11,<0.12"]

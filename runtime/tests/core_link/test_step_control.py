@@ -1,6 +1,7 @@
 """监督运行的完整路径。只有合成游戏、真实实时核、假显示面和假输入设备。"""
 
 import asyncio
+import json
 import math
 import sys
 import time
@@ -10,10 +11,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel, JsonValue
 
 from core_protocol import models
 from game_runtime.adapter import GAMES_DIR, Adapter, PixelRect, ScreenType, load_adapter
-from game_runtime.core_link import CaptureConfig, CoreLink, CoreLinkOptions
+from game_runtime.audio_ring.fake import FakeAudioOutput
+from game_runtime.core_link import AudioConfig, CaptureConfig, CoreLink, CoreLinkOptions
 from game_runtime.core_link.fake_device import DeviceEvent, FakeDevice
 from game_runtime.frame_ring import RingFrame
 from game_runtime.frame_ring.fake import FakeDisplay
@@ -24,10 +27,23 @@ from game_runtime.kernel import (
     NoConfig,
     Plugin,
     PluginContext,
+    ReasonCode,
     ResolvedEntry,
     State,
     Submission,
     Tier,
+    read_profile,
+    resolve_profile,
+)
+from game_runtime.models import (
+    CallMetrics,
+    ImageTransform,
+    ModelClient,
+    ModelImage,
+    ModelResult,
+    PreparedKeyframe,
+    Purpose,
+    VlmConfig,
 )
 from game_runtime.ocr import OCR, FrameLike, OcrConfig, OcrLine, OcrResult, OcrService
 from game_runtime.ocr.fake import ScriptedRecognizer
@@ -58,6 +74,8 @@ from game_runtime.step_control import (
     TextTarget,
     supervise,
 )
+from game_runtime.voice_activity import VoiceActivityPlugin
+from game_runtime.voice_activity.fake import EnergyModel
 from synthetic_game import Click as GameClick
 from synthetic_game import GameConfig, Key, ManualClock, SyntheticGame, Truth
 from synthetic_game import Press as GamePress
@@ -352,6 +370,7 @@ async def rig(
     freeze_test: bool = False,
     planner: RecordingPlanner | Callable[[], RecordingPlanner] | None = None,
     decision_margin: float = 0.75,
+    profile: Sequence[ResolvedEntry] | None = None,
 ) -> AsyncGenerator[Rig]:
     source = GAMES_DIR / "synthetic-game" / "adapter.toml"
     directory = root / "games" / "synthetic-game"
@@ -411,7 +430,7 @@ async def rig(
             try:
                 async with supervise(
                     adapter.id,
-                    policy or Journey(),
+                    (policy or Journey()) if profile is None else None,
                     CoreLinkOptions(
                         core_exe,
                         health_interval=0.05,
@@ -425,12 +444,15 @@ async def rig(
                     data_dir=data,
                     store=store,
                     ocr_plugin=ocr_for(world),
-                    step=StepConfig(
+                    step=None
+                    if profile is not None
+                    else StepConfig(
                         effect_timeout=0.85,
                         max_frame_age=0.15 if freeze_test else 0.5,
                         action_valid_for=0.45 if freeze_test else 0.25,
                         decision_margin=decision_margin,
                     ),
+                    profile=profile,
                     admission=AdmissionPolicy(max_rate=20, idle_interval=0.08),
                     extra_plugins=()
                     if planner is None
@@ -448,13 +470,160 @@ async def rig(
                     ),
                 ) as running:
                     await device.until_connected()
-                    assert running.kernel.status(STEP_ENTRY).state is State.ACTIVE
+                    if profile is None:
+                        assert running.kernel.status(STEP_ENTRY).state is State.ACTIVE
                     yield Rig(running, console, device, world, events)
             finally:
                 presenting.cancel()
                 await asyncio.gather(presenting, return_exceptions=True)
     finally:
         await console.close()
+
+
+@pytest.mark.parametrize("blocked", [None, "model-grant", "planner-disabled"])
+def test_supervised_profile_requires_model_and_planner(
+    core_exe: Path, root: Path, monkeypatch: pytest.MonkeyPatch, blocked: str | None
+) -> None:
+    class FixtureModel(ModelClient):
+        def __init__(
+            self,
+            config: VlmConfig,
+            *,
+            adapter: Adapter,
+            permissions: frozenset[str],
+        ) -> None:
+            super().__init__(config, adapter=adapter, permissions=permissions)
+            self.calls: list[Purpose] = []
+            self.grants = permissions
+            clients.append(self)
+
+        async def complete[T: BaseModel](
+            self,
+            purpose: Purpose,
+            *,
+            instruction: str,
+            data: JsonValue,
+            output: type[T],
+            images: tuple[ModelImage | PreparedKeyframe, ...] = (),
+        ) -> ModelResult[T]:
+            self.calls.append(purpose)
+            transforms: tuple[ImageTransform, ...] = ()
+            if purpose is Purpose.REASONING:
+                reply = {
+                    "subgoals": [{"text": "识别合成菜单"}],
+                    "overall_completion": {"kind": "screen", "screen_type": ScreenType.MENU.value},
+                }
+            elif purpose is Purpose.AGENT:
+                (image,) = images
+                assert isinstance(image, ModelImage)
+                frame = image.frame
+                transforms = (
+                    ImageTransform(
+                        frame.frame_number,
+                        frame.transform_version,
+                        PixelRect(0, 0, frame.width, frame.height),
+                        frame.width,
+                        frame.height,
+                        "pixels",
+                    ),
+                )
+                reply = {
+                    "observation": {"screen_type": ScreenType.MENU.value, "confidence": 1.0},
+                    "description": "合成菜单已出现",
+                    "goal_evidence": "画面显示合成菜单",
+                }
+            else:
+                assert purpose is Purpose.SUMMARY
+                reply = {"summary": "识别到了菜单"}
+            metrics = CallMetrics(purpose, "fake", "fake", 0.0, None, None, None, None)
+            return ModelResult(output.model_validate_json(json.dumps(reply)), transforms, metrics)
+
+    clients: list[FixtureModel] = []
+    monkeypatch.setattr("game_runtime.models.plugin.ModelClient", FixtureModel)
+    model_config = VlmConfig.model_validate(
+        {purpose.value: {"secret": "launcher-test"} for purpose in Purpose}
+    )
+    grants = frozenset(model_config.permissions)
+    entries = resolve_profile(read_profile(GAMES_DIR.parent / "profiles/supervised.example.json"))
+    for index, entry in enumerate(entries):
+        match entry.plugin:
+            case "ocr":
+                entries[index] = replace(entry, plugin="test-ocr")
+            case "vlm":
+                if blocked == "model-grant":
+                    grants -= {"secret:launcher-test"}
+                entries[index] = replace(
+                    entry, config=model_config.model_dump(mode="json"), grant=grants
+                )
+            case "planner":
+                if blocked == "planner-disabled":
+                    entries[index] = replace(entry, disabled=True)
+            case "voice-activity":
+                entries[index] = replace(entry, disabled=blocked is not None)
+            case "step-control":
+                entries[index] = replace(entry, id="drive")
+            case _:
+                pass
+
+    async def main() -> None:
+        with FakeAudioOutput.create(48_000, 2, block_capacity=960, block_count=32) as audio:
+
+            def fake_audio_config(adapter: Adapter) -> AudioConfig:
+                assert adapter.id == "synthetic-game"
+                return AudioConfig(
+                    target=audio.target,
+                    block_capacity=audio.block_capacity,
+                    block_count=32,
+                )
+
+            def model_for_voice(_plugin: VoiceActivityPlugin, _data_dir: Path) -> EnergyModel:
+                return EnergyModel()
+
+            monkeypatch.setattr("game_runtime.step_control.host.audio_config", fake_audio_config)
+            monkeypatch.setattr(VoiceActivityPlugin, "load_model", model_for_voice)
+            async with rig(core_exe, root, profile=entries) as r:
+                r.world.presenting = True
+                drive = r.run.kernel.status("drive")
+                assert r.console.pending_confirmation is not None
+                assert not r.run.operator.may_autoplay
+                assert not r.world.inputs
+                assert (r.run.core.audio is not None) is (blocked is None)
+                if blocked is not None:
+                    assert drive.state is State.WAITING
+                    assert r.run.kernel.active_control is None
+                    assert r.run.controller is None
+                    assert any(reason.subject == PLANNER.ref for reason in drive.reasons)
+                    if blocked == "model-grant":
+                        vlm = r.run.kernel.status("vlm")
+                        assert any(
+                            reason.code is ReasonCode.PERMISSION_NOT_GRANTED
+                            and reason.subject == "secret:launcher-test"
+                            for reason in vlm.reasons
+                        )
+                        assert not clients
+                    else:
+                        assert r.run.kernel.status("vlm").state is State.ACTIVE
+                        assert [client.calls for client in clients] == [[]]
+                    return
+
+                assert drive.state is State.ACTIVE
+                assert r.run.kernel.status("narrative").state is State.ACTIVE
+                assert r.run.kernel.status("voice").state is State.ACTIVE
+                assert len(clients) == 1
+                client = clients[0]
+                assert client.grants == grants
+                assert not client.calls
+                await r.start()
+                r.console.set_goal("识别菜单")
+                await until(lambda: True if Purpose.AGENT in client.calls else None)
+                assert Purpose.REASONING in client.calls
+                assert not r.world.inputs
+                await r.run.kernel.disable("vlm")
+                assert r.run.kernel.status("drive").state is State.WAITING
+                assert r.run.kernel.active_control is None
+                assert r.run.controller is None
+
+    asyncio.run(main())
 
 
 @pytest.fixture
