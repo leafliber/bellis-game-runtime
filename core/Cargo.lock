@@ -139,6 +139,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "game-bridge-protocol"
+version = "0.0.0"
+dependencies = [
+ "mono-clock",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
