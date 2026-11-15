@@ -1,4 +1,5 @@
 {
+  "release_id": 4,
   "cause": "release",
   "reason": "takeover",
   "items": [
@@ -7,5 +8,6 @@
       "button": "left"
     }
   ],
+  "repair_accepted": true,
   "checked_at_ns": 5700050000
 }

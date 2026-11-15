@@ -1,5 +1,7 @@
 {
+  "release_id": 1,
   "reason": "core_start",
   "producer": null,
-  "released_at_ns": 1000000
+  "released_at_ns": 1000000,
+  "verification": "unverified"
 }

@@ -5,9 +5,8 @@
 //! - 采集线程独占写入方与采集源：帧环在实时核里只有这一个写方；WGC 采集源不是 `Send`，在采集线程上
 //!   创建并使用。
 //! - 采集状态、本实例最近写进帧环的一帧与客户区几何的变化放在 [`FrameStatus`] 里，它有自己的锁；最近
-//!   一帧的采集时刻另存一份原子量。采集线程只在更新它的一瞬间持锁，从不在取帧或写帧时持锁，也从不碰
-//!   控制状态的锁；释放全部输入只用控制状态的锁，帧龄的检查只读原子量，所以释放不等采集线程，也不依赖
-//!   写帧成功。
+//!   一帧的采集时刻另存一份原子量。取帧、写帧都不持锁。换目标或丢弃采集源时，由控制侧一次作废帧与产出者代次。
+//!   释放全部输入只用控制状态的锁，帧龄检查只读原子量，所以释放不等采集线程，也不依赖写帧成功。
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -18,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use capture::{CaptureError, CaptureSource, Frame};
+use capture::{CaptureError, CaptureSource, Frame, WindowIdentity};
 use core_protocol::messages::{CaptureState, CaptureTarget, FakeTarget, LatestFrame, WindowTarget};
 use frame_ring::{FakeCapture, FrameRingError, FrameRingWriter, WriteError};
 
@@ -56,6 +55,8 @@ pub(crate) struct FrameStatus {
 struct StatusInner {
     state: CaptureState,
     latest: Option<LatestFrame>,
+    first_frame: Option<u64>,
+    window: Option<WindowIdentity>,
     /// 客户区几何的变化点：（从这一帧起，几何），按帧号递增，至多 [`GEOMETRY_HISTORY`] 个。
     geometry: VecDeque<(u64, Geometry)>,
 }
@@ -66,6 +67,8 @@ impl Default for FrameStatus {
             inner: Mutex::new(StatusInner {
                 state: CaptureState::Idle,
                 latest: None,
+                first_frame: None,
+                window: None,
                 geometry: VecDeque::new(),
             }),
             has_latest: AtomicBool::new(false),
@@ -97,6 +100,22 @@ impl FrameStatus {
         self.lock().geometry.back().map(|&(_, geometry)| geometry)
     }
 
+    /// 基准帧号是否落在本次采集写出的范围内。
+    pub(crate) fn contains_frame(&self, frame_number: u64) -> bool {
+        let inner = self.lock();
+        inner.first_frame.is_some_and(|first| frame_number >= first)
+            && inner
+                .latest
+                .is_some_and(|latest| frame_number <= latest.frame_number)
+    }
+
+    /// 最近写入帧所对应的原生窗口及其几何。
+    #[cfg(any(windows, test))]
+    pub(crate) fn captured_window(&self) -> Option<(WindowIdentity, Geometry)> {
+        let inner = self.lock();
+        Some((inner.window?, inner.geometry.back()?.1))
+    }
+
     /// 基准帧之后客户区的尺寸或 DPI 是否变了。基准帧的几何查不到时也算变了：比本实例在当前帧环
     /// 写出的第一帧早（旧实例或挂接之前的帧）、比最近写入的一帧晚，或早于记下的最早一次变化。
     pub(crate) fn geometry_changed_since(&self, base_frame: u64) -> bool {
@@ -122,17 +141,26 @@ impl FrameStatus {
         std::mem::replace(&mut self.lock().state, state)
     }
 
-    /// 换了帧环：最近写入的一帧与几何都属于原来的帧环，清空。
-    fn forget(&self) {
+    /// 换了帧环或采集源：清空旧帧、窗口身份与几何。
+    pub(crate) fn forget(&self) {
         let mut inner = self.lock();
         self.has_latest.store(false, Ordering::Release);
         inner.latest = None;
+        inner.first_frame = None;
+        inner.window = None;
         inner.geometry.clear();
     }
 
     /// 记下刚写进帧环的一帧与它的几何。只由采集线程调用（单元测试也用它造出最近一帧）。
-    pub(crate) fn record(&self, latest: LatestFrame, geometry: Geometry) {
+    pub(crate) fn record(
+        &self,
+        latest: LatestFrame,
+        geometry: Geometry,
+        window: Option<WindowIdentity>,
+    ) {
         let mut inner = self.lock();
+        inner.first_frame.get_or_insert(latest.frame_number);
+        inner.window = window;
         if inner
             .geometry
             .back()
@@ -168,11 +196,17 @@ pub(crate) trait SourceOpener: Send + fmt::Display {
 
 /// 帧的去处，即帧环的写入方；单元测试以记录帧的替身代替共享内存。
 pub(crate) trait FrameSink: Send {
+    /// 第一次写入前续用该实时核的帧号。
+    fn resume_after(&mut self, previous_frame: u64);
     /// 写入一帧，返回它在帧环中的帧号。
     fn write(&mut self, frame: &Frame) -> Result<u64, WriteError>;
 }
 
 impl FrameSink for FrameRingWriter {
+    fn resume_after(&mut self, previous_frame: u64) {
+        Self::resume_after(self, previous_frame);
+    }
+
     fn write(&mut self, frame: &Frame) -> Result<u64, WriteError> {
         Self::write(self, frame)
     }
@@ -353,7 +387,10 @@ pub(crate) struct CaptureThread {
 
 impl Capture {
     /// 启动采集线程。线程一开始处于 `idle`，等帧环与采集目标都到了才建立采集源。
-    pub(crate) fn spawn(status: Arc<FrameStatus>) -> io::Result<(Self, CaptureThread)> {
+    pub(crate) fn spawn(
+        status: Arc<FrameStatus>,
+        invalidate: impl Fn() + Send + 'static,
+    ) -> io::Result<(Self, CaptureThread)> {
         let (commands, receiver) = mpsc::channel();
         let (exited_sender, exited) = mpsc::channel::<()>();
         thread::Builder::new()
@@ -361,7 +398,7 @@ impl Capture {
             .spawn(move || {
                 // 线程结束（采集源与写入方都已丢弃）时随之丢弃，等待方由此得知。
                 let _exited = exited_sender;
-                run(&receiver, status);
+                run(&receiver, Pipeline::new(status, invalidate));
                 // 先于 `_exited` 丢弃：等待方得知结束时，命令已一定送不到。
                 drop(receiver);
             })?;
@@ -400,8 +437,7 @@ impl CaptureThread {
 }
 
 /// 采集线程的循环：等命令，至多等 [`Pipeline::step`] 给出的时间，然后再做一轮。
-fn run(commands: &Receiver<Command>, status: Arc<FrameStatus>) {
-    let mut pipeline = Pipeline::new(status);
+fn run(commands: &Receiver<Command>, mut pipeline: Pipeline) {
     let mut wait = None;
     loop {
         let first = match wait {
@@ -426,10 +462,12 @@ fn run(commands: &Receiver<Command>, status: Arc<FrameStatus>) {
 /// 采集线程的状态机，不含线程与通道。转换见模块文档的“采集主循环”。
 struct Pipeline {
     status: Arc<FrameStatus>,
+    invalidate: Box<dyn Fn() + Send>,
     sink: Option<Box<dyn FrameSink>>,
     opener: Option<Box<dyn SourceOpener>>,
     source: Option<Box<dyn CaptureSource>>,
     frame: Frame,
+    last_frame_number: u64,
     /// 没有采集源时，到这个时刻再建立；`None` 表示立即建立。
     retry_at: Option<Instant>,
     /// 最近记录的问题；同样的问题只记一次。
@@ -437,13 +475,15 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn new(status: Arc<FrameStatus>) -> Self {
+    fn new(status: Arc<FrameStatus>, invalidate: impl Fn() + Send + 'static) -> Self {
         Self {
             status,
+            invalidate: Box::new(invalidate),
             sink: None,
             opener: None,
             source: None,
             frame: Frame::default(),
+            last_frame_number: 0,
             retry_at: None,
             problem: None,
         }
@@ -452,12 +492,17 @@ impl Pipeline {
     /// 处理一条命令；返回 `false` 表示结束。
     fn apply(&mut self, command: Command) -> bool {
         match command {
-            Command::Attach(sink) => {
-                // 最近写入的一帧与几何属于原来的帧环。
-                self.status.forget();
+            Command::Attach(mut sink) => {
+                if self.sink.is_some() {
+                    (self.invalidate)();
+                    sink.resume_after(self.last_frame_number);
+                }
                 self.sink = Some(sink);
             }
             Command::Target(opener) => {
+                if self.opener.is_some() {
+                    (self.invalidate)();
+                }
                 // 先停掉旧的采集源，新目标的采集源在此之后才建立。
                 self.source = None;
                 self.opener = Some(opener);
@@ -504,7 +549,8 @@ impl Pipeline {
         let source = self.source.as_mut()?;
         match source.next_frame(FRAME_WAIT, &mut self.frame) {
             Ok(true) => {
-                self.write();
+                let window = source.window_identity();
+                self.write(window);
                 Some(Duration::ZERO)
             }
             Ok(false) => Some(Duration::ZERO),
@@ -515,6 +561,7 @@ impl Pipeline {
             }
             Err(error) => {
                 // 采集源不再产出帧：丢掉它，过一段时间重新识别窗口。
+                (self.invalidate)();
                 self.source = None;
                 self.search(now, &error);
                 Some(SEARCH_INTERVAL)
@@ -529,12 +576,13 @@ impl Pipeline {
         self.report(error.to_string());
     }
 
-    fn write(&mut self) {
+    fn write(&mut self, window: Option<WindowIdentity>) {
         let Some(sink) = self.sink.as_mut() else {
             return;
         };
         match sink.write(&self.frame) {
             Ok(frame_number) => {
+                self.last_frame_number = frame_number;
                 let meta = &self.frame.meta;
                 self.status.record(
                     LatestFrame {
@@ -546,6 +594,7 @@ impl Pipeline {
                         height: meta.height,
                         dpi: meta.dpi,
                     },
+                    window,
                 );
                 if let Some(problem) = self.problem.take() {
                     log!("capture: frames reach the frame ring again (was: {problem})");
@@ -577,7 +626,7 @@ mod tests {
         Capture, Command, FRAME_WAIT, FrameSink, FrameStatus, Geometry, Pipeline, RECOVER_INTERVAL,
         SEARCH_INTERVAL, SourceOpener, TargetError, check_window, opener_for,
     };
-    use capture::{CaptureError, CaptureSource, Frame, FrameMeta};
+    use capture::{CaptureError, CaptureSource, Frame, FrameMeta, WindowIdentity};
     use core_protocol::messages::{CaptureState, CaptureTarget, LatestFrame, WindowTarget};
     use frame_ring::WriteError;
     use std::collections::VecDeque;
@@ -617,6 +666,13 @@ mod tests {
     }
 
     impl CaptureSource for ScriptedSource {
+        fn window_identity(&self) -> Option<WindowIdentity> {
+            Some(WindowIdentity {
+                handle: isize::from(self.name.as_bytes()[0]),
+                process_id: 123,
+            })
+        }
+
         fn next_frame(&mut self, timeout: Duration, out: &mut Frame) -> Result<bool, CaptureError> {
             assert_eq!(timeout, FRAME_WAIT);
             match self.steps.pop_front() {
@@ -693,6 +749,10 @@ mod tests {
     }
 
     impl FrameSink for RecordingSink {
+        fn resume_after(&mut self, previous_frame: u64) {
+            self.next = self.next.max(previous_frame);
+        }
+
         fn write(&mut self, frame: &Frame) -> Result<u64, WriteError> {
             if frame.meta.width > Self::MAX_WIDTH {
                 return Err(WriteError::TooLarge {
@@ -736,8 +796,9 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let status = Arc::new(FrameStatus::default());
+            let invalidate = Arc::clone(&status);
             Self {
-                pipeline: Pipeline::new(Arc::clone(&status)),
+                pipeline: Pipeline::new(Arc::clone(&status), move || invalidate.forget()),
                 status,
                 log: Log::default(),
                 written: Arc::default(),
@@ -864,14 +925,18 @@ mod tests {
         assert_eq!(fx.pipeline.step(t0), Some(SEARCH_INTERVAL));
         assert_eq!(fx.state(), CaptureState::Searching);
         assert_eq!(entries(&fx.log), ["open a", "drop a"]);
-        // 最近写入的一帧还在帧环里，不清除；它的帧龄照样增长。
-        assert_eq!(fx.latest(), latest(101, 1));
+        // 帧环里仍有旧像素，但它们已失效，重新建立的源必须写入新帧才能供输入用。
+        assert_eq!(fx.latest(), None);
+        assert_eq!(fx.status.captured_window(), None);
+        assert!(!fx.status.contains_frame(101));
         let t1 = t0 + SEARCH_INTERVAL;
         assert_eq!(fx.pipeline.step(t1), Some(SEARCH_INTERVAL));
         assert_eq!(fx.state(), CaptureState::Searching);
         fx.pipeline.step(t1 + SEARCH_INTERVAL);
         assert_eq!(fx.state(), CaptureState::Capturing);
         assert_eq!(fx.latest(), latest(102, 1));
+        assert!(fx.status.geometry_changed_since(101));
+        assert!(!fx.status.contains_frame(101));
         assert_eq!(entries(&fx.log), ["open a", "drop a", "open a", "open a"]);
     }
 
@@ -894,6 +959,33 @@ mod tests {
         fx.pipeline.step(now);
         assert_eq!(fx.state(), CaptureState::Capturing);
         assert_eq!(entries(&fx.log)[3..], ["drop b", "open c", "open d"]);
+    }
+
+    #[test]
+    fn regression_new_target_invalidates_fresh_frames_with_the_same_geometry() {
+        let mut fx = Fixture::new();
+        fx.attach();
+        let now = Instant::now();
+        fx.target("a", vec![Ok(vec![Ok(Some(frame(1, 2)))])]);
+        fx.pipeline.step(now);
+        assert_eq!(fx.latest(), latest(101, 1));
+        assert_eq!(
+            fx.status.captured_window().unwrap().0.handle,
+            isize::from(b'a')
+        );
+
+        fx.target("b", vec![Ok(vec![Ok(Some(frame(1, 2)))])]);
+        assert_eq!(fx.latest(), None);
+        assert_eq!(fx.status.captured_window(), None);
+        assert!(fx.status.geometry_changed_since(101));
+        fx.pipeline.step(now);
+        assert_eq!(fx.latest(), latest(102, 1));
+        assert_eq!(
+            fx.status.captured_window().unwrap().0.handle,
+            isize::from(b'b')
+        );
+        assert!(fx.status.geometry_changed_since(101));
+        assert!(!fx.status.geometry_changed_since(102));
     }
 
     #[test]
@@ -956,6 +1048,7 @@ mod tests {
                     height: 10,
                     dpi,
                 },
+                None,
             );
         };
         assert!(status.geometry_changed_since(1), "no frames yet");
@@ -1011,7 +1104,9 @@ mod tests {
     #[test]
     fn the_capture_thread_writes_frames_and_stops_promptly() {
         let status = Arc::new(FrameStatus::default());
-        let (capture, worker) = Capture::spawn(Arc::clone(&status)).unwrap();
+        let invalidate = Arc::clone(&status);
+        let (capture, worker) =
+            Capture::spawn(Arc::clone(&status), move || invalidate.forget()).unwrap();
         let log = Log::default();
         let written = Arc::default();
         let steps = (1..=3).map(|n| Ok(Some(frame(n, 2)))).collect();

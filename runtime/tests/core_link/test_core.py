@@ -39,7 +39,9 @@ from core_protocol.models import (
     CoreHelloParams,
     InputReleasedParams,
     Producer,
+    ProducerRevokeResult,
     ReleaseReason,
+    ReleaseVerification,
 )
 from game_runtime.audio_ring import AudioRing
 from game_runtime.audio_ring.fake import FakeAudioOutput
@@ -161,6 +163,8 @@ class FakeMain:
         peer = await self.connected()
         released = await self.next_released()
         assert (released.reason, released.producer) == (ReleaseReason.CORE_START, None)
+        assert released.release_id == 1
+        assert released.verification is ReleaseVerification.UNVERIFIED
         return peer
 
     async def snapshot(self) -> CoreHealthParams:
@@ -208,7 +212,8 @@ class FakeMain:
 
     async def revoke(self, generation: int) -> None:
         assert self.peer is not None
-        assert await self.peer.request(PRODUCER_REVOKE.name, {"generation": generation}) == {}
+        reply = await self.peer.request(PRODUCER_REVOKE.name, {"generation": generation})
+        ProducerRevokeResult.model_validate(reply)
         self.events.append(f"revoke {generation} answered")
 
     async def exit_code(self) -> int:
@@ -287,7 +292,7 @@ def test_stop_releases_answers_and_exits_zero(core_exe: Path, tmp_path: Path) ->
         # 先释放、发通知，再回应，回应之后才退出。
         assert fake.events[-2:] == ["released stop", "stop answered"]
         assert await fake.exit_code() == 0
-        assert "core.stop; released all inputs, exiting" in fake.log()
+        assert "core.stop; input release requested, exiting" in fake.log()
 
     run_with_core(core_exe, tmp_path, script)
 
@@ -303,7 +308,7 @@ def test_connection_loss_releases_and_exits(core_exe: Path, tmp_path: Path) -> N
         assert time.monotonic() - dropped < 2
         log = fake.log()
         assert "core connection" in log
-        assert "released all inputs, exiting" in log
+        assert "input release requested, exiting" in log
 
     run_with_core(core_exe, tmp_path, script)
 
@@ -320,7 +325,7 @@ def test_stdin_eof_releases_and_exits(core_exe: Path, tmp_path: Path) -> None:
         result = await fake.process.stop(skip_rpc, StopTimeouts(shutdown=0.01, stdin=WAIT))
         assert (result.stage, result.returncode) == (StopStage.STDIN_EOF, 0)
         assert time.monotonic() - closed < 2
-        assert "stdin closed; released all inputs, exiting" in fake.log()
+        assert "stdin closed; input release requested, exiting" in fake.log()
 
     run_with_core(core_exe, tmp_path, script)
 
@@ -518,7 +523,13 @@ def test_a_new_target_replaces_the_old_source(core_exe: Path, tmp_path: Path) ->
             first.present(solid(16, 12, 1), 16, 12)
             await fake.until_health(lambda h: h.latest_frame is not None)
 
+            fake.heartbeat("step", 1, 1)
             await fake.request(CAPTURE_SET_TARGET.name, target_params(second.target))
+            released = await fake.next_released()
+            assert released.reason is ReleaseReason.GENERATION_REVOKED
+            assert released.producer == producer("step", 1)
+            assert (await fake.snapshot()).latest_frame is None
+
             second.present(solid(16, 12, 2), 16, 12)
             health = await fake.until_health(
                 lambda h: h.latest_frame is not None and h.latest_frame.frame_number > 1
@@ -526,11 +537,41 @@ def test_a_new_target_replaces_the_old_source(core_exe: Path, tmp_path: Path) ->
             frame = ring.read_latest()
             assert frame is not None
             assert frame.pixels == solid(16, 12, 2)
+            fake.heartbeat("step", 1, 2)
+            assert (await fake.snapshot()).producer is None
             # 旧的采集源已停掉：旧显示面上的新帧不再进入帧环。
             first.present(solid(16, 12, 3), 16, 12)
             await asyncio.sleep(0.3)
             assert (await fake.snapshot()).latest_frame == health.latest_frame
             assert ring.latest_frame_number() == frame.frame_number
+
+    run_with_core(core_exe, tmp_path, script)
+
+
+def test_a_new_ring_and_target_cannot_reuse_an_old_frame_number(
+    core_exe: Path, tmp_path: Path
+) -> None:
+    async def script(fake: FakeMain) -> None:
+        await fake.started()
+        with (
+            FrameRing.create(16, 12) as first_ring,
+            FrameRing.create(16, 12) as second_ring,
+            FakeDisplay.create(16, 12) as first,
+            FakeDisplay.create(16, 12) as second,
+        ):
+            await fake.request(FRAME_RING_ATTACH.name, attach_params(first_ring))
+            await fake.request(CAPTURE_SET_TARGET.name, target_params(first.target))
+            first.present(solid(16, 12, 1), 16, 12)
+            await fake.until_health(lambda h: h.latest_frame is not None)
+            old = first_ring.latest_frame_number()
+
+            await fake.request(FRAME_RING_ATTACH.name, attach_params(second_ring))
+            await fake.request(CAPTURE_SET_TARGET.name, target_params(second.target))
+            second.present(solid(16, 12, 2), 16, 12)
+            await fake.until_health(lambda _: second_ring.latest_frame_number() > 0)
+            frame = second_ring.read_latest()
+            assert frame is not None
+            assert frame.frame_number > old
 
     run_with_core(core_exe, tmp_path, script)
 

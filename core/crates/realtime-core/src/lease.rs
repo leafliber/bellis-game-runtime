@@ -48,6 +48,10 @@ pub(crate) enum Refusal {
     PastExpiry { expires_ns: u64, now: u64 },
     /// 没有许可源，或与它的连接已断开。
     NoSource,
+    /// 本实例的接管钩子失效。
+    HookLost,
+    /// 本实例无法可靠地完成输入释放。
+    ReleaseFailed,
 }
 
 impl fmt::Display for Refusal {
@@ -67,6 +71,8 @@ impl fmt::Display for Refusal {
                 write!(f, "expires_ns {expires_ns} is not after now ({now})")
             }
             Self::NoSource => f.write_str("there is no lease source"),
+            Self::HookLost => f.write_str("the input hook has failed; restart the core"),
+            Self::ReleaseFailed => f.write_str("input release failed; restart the core"),
         }
     }
 }

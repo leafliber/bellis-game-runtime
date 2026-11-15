@@ -15,7 +15,14 @@ from typing import Any
 
 import pytest
 
-from core_protocol.models import CoreHealthParams, InputReleasedParams, Producer
+from core_protocol.models import (
+    CoreHealthParams,
+    InputReleasedParams,
+    InputVerificationParams,
+    Producer,
+    ReleaseReason,
+    VerificationResult,
+)
 from game_runtime.core_link import (
     CoreLink,
     CoreLinkOptions,
@@ -70,8 +77,10 @@ class Recorder:
     def __init__(self) -> None:
         self.log: list[str] = []
         self.health: CoreHealthParams | None = None
+        self.releases: list[InputReleasedParams] = []
 
     def released(self, released: InputReleasedParams) -> None:
+        self.releases.append(released)
         self.log.append(f"released {released.reason}")
 
     def transition(self, transition: Transition) -> None:
@@ -201,10 +210,62 @@ def test_real_core_control_completes_quiescing_in_order(core_exe: Path) -> None:
     asyncio.run(main())
 
 
-def test_restarted_core_releases_first_and_completes_the_wait(core_exe: Path) -> None:
+def test_quiescing_waits_for_the_matching_physical_release(core_exe: Path) -> None:
+    async def main() -> None:
+        recorder, link, kernel = make_runtime(core_exe, KernelOptions(release_timeout=0.15))
+        await link.start()
+        async with stopped_at_end(link):
+            # 子进程已按默认参数启动。只让主进程把替身回执当成真实输入模式的回执处理。
+            object.__setattr__(link._options, "real_input", True)  # pyright: ignore[reportPrivateUsage]
+            kernel.add([STEP])
+            await kernel.set_control_producer("step")
+            await until(recorder.producer_is(Producer(id="step", generation=1)))
+            await kernel.disable("step")
+            assert kernel.status("step").state is State.QUIESCING
+            assert "revoke step#1" not in recorder.log
+
+            release = next(
+                r for r in recorder.releases if r.reason is ReleaseReason.GENERATION_REVOKED
+            )
+            instance = link._instance  # pyright: ignore[reportPrivateUsage]
+            assert instance is not None
+
+            def observed(release_id: int) -> None:
+                params = InputVerificationParams(
+                    release_id=release_id,
+                    result=VerificationResult.VERIFIED,
+                    checked_at_ns=time.perf_counter_ns(),
+                ).model_dump(mode="json")
+                link._on_verification_message(instance, params)  # pyright: ignore[reportPrivateUsage]
+
+            observed(release.release_id - 1)
+            await asyncio.sleep(0)
+            assert kernel.status("step").state is State.QUIESCING
+            observed(release.release_id)
+            await until(lambda: kernel.status("step").state is State.DISPOSED)
+            recorder.order("step quiescing", "released generation_revoked", "step unloading")
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("physical_check", [False, True])
+def test_restarted_core_releases_first_and_completes_the_wait(
+    core_exe: Path, physical_check: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     async def main() -> None:
         recorder, link, kernel = make_runtime(core_exe, KernelOptions(release_timeout=0.3))
+        if physical_check:
+            options = link._options  # pyright: ignore[reportPrivateUsage]
+            default_argv = options.argv()
+
+            def fake_argv(_: CoreLinkOptions) -> list[str]:
+                return default_argv
+
+            monkeypatch.setattr(CoreLinkOptions, "argv", fake_argv)
+            object.__setattr__(options, "real_input", True)
         await link.start()
+        old_instance = link._instance  # pyright: ignore[reportPrivateUsage]
+        assert old_instance is not None
         async with stopped_at_end(link):
             kernel.add([STEP])
             await kernel.set_control_producer("step")
@@ -221,8 +282,21 @@ def test_restarted_core_releases_first_and_completes_the_wait(core_exe: Path) ->
             assert [r.code for r in status.reasons] == [ReasonCode.RELEASE_TIMEOUT]
             recorder.log.clear()
 
-            # 新实例先释放全部输入，等待因此完成，控制产出者走完 QUIESCING。
+            # 真实输入需等启动编号的物理核验，假后端用启动回执完成等待。
             await link.start()
+            if physical_check:
+                assert kernel.status("step").state is State.QUIESCING
+                instance = link._instance  # pyright: ignore[reportPrivateUsage]
+                assert instance is not None
+                params = InputVerificationParams(
+                    release_id=recorder.releases[-1].release_id,
+                    result=VerificationResult.VERIFIED,
+                    checked_at_ns=time.perf_counter_ns(),
+                ).model_dump(mode="json")
+                link._on_verification_message(old_instance, params)  # pyright: ignore[reportPrivateUsage]
+                await asyncio.sleep(0)
+                assert kernel.status("step").state is State.QUIESCING
+                link._on_verification_message(instance, params)  # pyright: ignore[reportPrivateUsage]
             await until(lambda: kernel.status("step").state is State.DISPOSED)
             assert recorder.log[0] == "released core_start"
             recorder.order("released core_start", "step unloading", "revoke step#1")
@@ -326,7 +400,7 @@ def test_killing_the_main_process_lets_the_core_release_and_exit(
         # 实时核没有随主进程被杀，而是按生命线释放全部输入后自己退出。
         assert gone(core_pid, 5), "实时核没有退出"
         text = log_path.read_text(encoding="utf-8", errors="replace")
-        assert "released all inputs, exiting" in text, text
+        assert "input release requested, exiting" in text, text
         assert "core connection" in text or "stdin closed" in text, text
         if sys.platform == "win32":
             assert watch.exit_code() == 0

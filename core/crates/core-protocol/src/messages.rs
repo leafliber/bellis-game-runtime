@@ -228,12 +228,20 @@ pub struct ProducerHeartbeatParams {
     pub seq: u64,
 }
 
-/// `producer.revoke` 的 params：作废代次。实时核释放完成后才回应，回应即输入已释放的确认。
+/// `producer.revoke` 的 params：作废代次。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProducerRevokeParams {
     /// 作废此代次及更早的全部代次。
     pub generation: u64,
+}
+
+/// `producer.revoke` 的 result：代次已作废，物理核验另行通知。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerRevokeResult {
+    /// 对应的释放编号。没有可关联的释放时为 `null`。
+    pub release_id: Option<u64>,
 }
 
 // ---------------------------------------------------------------- 动作块
@@ -501,16 +509,30 @@ pub struct Uncertain {
     pub at_ns: u64,
 }
 
-/// `input.released` 的 params：实时核释放了全部输入。
+/// `input.released` 的 params：实时核已处理一次全部释放请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InputReleasedParams {
+    /// 本实例内递增的释放编号，与后续物理核验关联。
+    pub release_id: u64,
     /// 释放的原因。
     pub reason: ReleaseReason,
     /// 释放时的当前控制产出者；没有时为 `null`。
     pub producer: Option<Producer>,
-    /// 释放完成的时刻。
+    /// 抬起请求处理完毕的时刻。
     pub released_at_ns: u64,
+    /// 本次释放的证据状态。
+    pub verification: ReleaseVerification,
+}
+
+/// 释放回执能提供的证据。物理按键状态由残留检查另行观察。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseVerification {
+    /// 抬起请求已处理，发出时没有物理释放证据。
+    Unverified,
+    /// 后端至少拒绝了一项抬起。
+    UpFailed,
 }
 
 /// 释放全部输入的原因。
@@ -519,7 +541,7 @@ pub struct InputReleasedParams {
 pub enum ReleaseReason {
     /// 实时核启动，接受动作之前先释放。
     CoreStart,
-    /// 当前代次被 `producer.revoke` 作废。
+    /// 当前代次被 `producer.revoke` 或采集源变更作废。
     GenerationRevoked,
     /// 出现了更新的代次，更换控制产出者前先释放。
     ProducerChanged,
@@ -545,7 +567,7 @@ pub enum ReleaseReason {
     EmergencyStop,
     /// 真实后端：SendInput 注入的事件少于给出的；同时在本地撤权。
     InjectionBlocked,
-    /// 真实后端：本实例的注入没有经过自己的钩子，钩子已失效；同时在本地撤权，随后重新装钩子。
+    /// 真实后端：钩子失效；本实例释放并拒绝后续许可。
     HookLost,
     /// 持续状态里的一项按住超过输入策略的 `max_hold_ms`。
     MaxHold,
@@ -558,16 +580,20 @@ pub enum ReleaseReason {
 }
 
 /// `input.residual` 的 params：只在真实后端上。释放全部输入之后、以及收到输入策略时，实时核以
-/// `GetAsyncKeyState` 核验输入策略里的键与鼠标键，仍读作按住的项已补发抬起，以这条通知报出。
+/// `GetAsyncKeyState` 读输入策略里的键与鼠标键，报告读作按住的项及补发抬起的提交结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InputResidualParams {
+    /// 对应的释放编号。
+    pub release_id: u64,
     /// 核验的缘由。
     pub cause: ResidualCause,
     /// `cause` 为 `release` 时那次释放的原因，否则为 `null`。
     pub reason: Option<ReleaseReason>,
-    /// 读作按住、已补发抬起的项，至少一项；只有 `key` 与 `mouse_button`。
+    /// 读作按住的项，至少一项；只有 `key` 与 `mouse_button`。
     pub items: Vec<HeldInput>,
+    /// 系统是否接受了全部补发事件。
+    pub repair_accepted: bool,
     /// 读按键状态的时刻。
     pub checked_at_ns: u64,
 }
@@ -580,6 +606,32 @@ pub enum ResidualCause {
     Release,
     /// 新实例收到输入策略时的核验，旧实例可能留下了按住的键。
     CoreStart,
+}
+
+/// `input.verification` 的 params：对应一次释放的物理核验结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputVerificationParams {
+    /// 本实例内对应的释放编号。
+    pub release_id: u64,
+    /// 只描述该次释放的核验。
+    pub result: VerificationResult,
+    /// 核验结果的时刻。
+    pub checked_at_ns: u64,
+}
+
+/// 真实后端对一次释放的观察。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationResult {
+    /// 可读取输入桌面，白名单内的键与鼠标键均未读作按住。
+    Verified,
+    /// 仍有残留，或系统拒绝了补发抬起。
+    Residual,
+    /// 无法读取有效的按键状态，或释放时已有已知抬起失败。
+    Unavailable,
+    /// 这次核验已被更新的释放取代。
+    Superseded,
 }
 
 // ---------------------------------------------------------------- 健康

@@ -1,4 +1,5 @@
 {
+  "release_id": 5,
   "cause": "release",
   "reason": "emergency_stop",
   "items": [
@@ -11,5 +12,6 @@
       "button": "left"
     }
   ],
+  "repair_accepted": false,
   "checked_at_ns": 5700050000
 }

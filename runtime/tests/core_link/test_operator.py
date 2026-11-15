@@ -26,7 +26,7 @@ import pytest
 from core_protocol import models
 from core_protocol.models import ReleaseReason
 from game_runtime.adapter import GAMES_DIR, Adapter, load_adapter
-from game_runtime.channel import RpcError, RpcErrorCode, session_credentials
+from game_runtime.channel import ChannelError, RpcError, RpcErrorCode, session_credentials
 from game_runtime.core_link import (
     CORE_ROLE,
     ENV_CHANNEL_KEY,
@@ -332,6 +332,59 @@ async def rig(
 
 
 # ---------------------------------------------------------------- 会话即许可
+
+
+@pytest.mark.parametrize("event", ["release", "residual", "unavailable"])
+def test_input_release_failure_stops_submissions_and_lease(
+    core_exe: Path, data_dir: Path, event: str
+) -> None:
+    async def main() -> None:
+        async with rig(core_exe, data_dir) as r:
+            await r.confirm_and_start()
+            await r.hold()
+            instance = r.link._instance  # pyright: ignore[reportPrivateUsage]
+            peer = r.console._core  # pyright: ignore[reportPrivateUsage]
+            assert instance is not None
+            assert peer is not None
+            at = time.perf_counter_ns()
+            if event == "release":
+                params = models.InputReleasedParams(
+                    release_id=2,
+                    reason=ReleaseReason.DEADLINE_EXPIRED,
+                    producer=models.Producer(id="step", generation=1),
+                    released_at_ns=at,
+                    verification=models.ReleaseVerification.UP_FAILED,
+                ).model_dump(mode="json")
+                r.link._on_released_message(instance, params)  # pyright: ignore[reportPrivateUsage]
+                r.console._on_released(peer, params)  # pyright: ignore[reportPrivateUsage]
+            elif event == "residual":
+                params = models.InputResidualParams(
+                    release_id=2,
+                    cause=models.ResidualCause.RELEASE,
+                    reason=ReleaseReason.DEADLINE_EXPIRED,
+                    items=[held_key(W)],
+                    repair_accepted=False,
+                    checked_at_ns=at,
+                ).model_dump(mode="json")
+                r.link._on_residual_message(instance, params)  # pyright: ignore[reportPrivateUsage]
+                r.console._on_residual(peer, params)  # pyright: ignore[reportPrivateUsage]
+            else:
+                params = models.InputVerificationParams(
+                    release_id=2,
+                    result=models.VerificationResult.UNAVAILABLE,
+                    checked_at_ns=at,
+                ).model_dump(mode="json")
+                r.link._on_verification_message(instance, params)  # pyright: ignore[reportPrivateUsage]
+                r.console._on_verification(peer, params)  # pyright: ignore[reportPrivateUsage]
+
+            with pytest.raises(ChannelError, match="输入释放"):
+                await r.press()
+            await asyncio.wait_for(r.console.wait_ended(), WAIT)
+            assert r.console.end_reason == "input_release_failed"
+            assert await r.device_released(ReleaseReason.LEASE_REVOKED)
+            assert not r.device.held
+
+    asyncio.run(main())
 
 
 def test_actions_run_only_while_the_session_is_running(core_exe: Path, data_dir: Path) -> None:

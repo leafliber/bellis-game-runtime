@@ -12,11 +12,13 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+#[cfg(any(windows, test))]
+use core_protocol::messages::VerificationResult;
 use core_protocol::messages::{
     Accepted, Action, ActionBlock, ActionOutcome, ActionReceiptParams, ActionSubmitResult,
     CaptureState, CoreHealthParams, DropReason, Dropped, Executed, HeldInput, InputPolicy,
-    InputReleasedParams, InputResidualParams, LeaseGrantParams, Producer, ProducerHeartbeatParams,
-    RejectReason, Rejected, ReleaseReason, Uncertain,
+    InputReleasedParams, InputResidualParams, InputVerificationParams, LeaseGrantParams, Producer,
+    ProducerHeartbeatParams, RejectReason, Rejected, ReleaseReason, ReleaseVerification, Uncertain,
 };
 
 use crate::frames::FrameStatus;
@@ -72,6 +74,11 @@ pub(crate) enum Notice {
         allow(dead_code, reason = "只由 Windows 上真实后端的核验线程构造")
     )]
     Residual(InputResidualParams),
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "只有真实后端发出物理核验结果")
+    )]
+    Verification(InputVerificationParams),
 }
 
 impl Notices {
@@ -86,7 +93,7 @@ impl Notices {
             .iter()
             .filter_map(|notice| match notice {
                 Notice::Released(released) => Some(released.reason),
-                Notice::Receipt(_) | Notice::Residual(_) => None,
+                Notice::Receipt(_) | Notice::Residual(_) | Notice::Verification(_) => None,
             })
             .collect()
     }
@@ -98,7 +105,7 @@ impl Notices {
             .iter()
             .filter_map(|notice| match notice {
                 Notice::Receipt(receipt) => Some(receipt),
-                Notice::Released(_) | Notice::Residual(_) => None,
+                Notice::Released(_) | Notice::Residual(_) | Notice::Verification(_) => None,
             })
             .collect()
     }
@@ -258,11 +265,14 @@ struct State {
     current: Option<Current>,
     revoked_through: Option<u64>,
     stopping: bool,
+    input_fault: Option<Refusal>,
+    last_release_id: u64,
+    verifies_release: bool,
+    pending_verification: Option<u64>,
+    last_verification_posted: u64,
     plan: Plan,
     /// 输入策略；收到 `input.configure` 后有。
     policy: Option<Policy>,
-    /// 是否收到过 `input.configure`（收到即不能再设定，回 -32006）。
-    configured: bool,
     /// 真实后端：没有输入策略时拒绝含输入的动作块。
     requires_policy: bool,
     /// 过去 1 秒已执行的一次性动作的时刻，用于按 `max_rate` 限速。
@@ -280,6 +290,10 @@ enum Step {
 }
 
 impl State {
+    fn input_unavailable(&self) -> bool {
+        self.input_fault.is_some() || self.pending_verification.is_some()
+    }
+
     fn current_producer(&self) -> Option<Producer> {
         self.current.as_ref().map(|c| c.producer.clone())
     }
@@ -292,22 +306,70 @@ impl State {
         producer: Option<&Producer>,
         first: Outcomes,
         notices: &mut Notices,
-    ) {
-        self.ledger.release_all(reason);
+    ) -> bool {
+        self.last_release_id += 1;
+        let release_id = self.last_release_id;
+        if self.verifies_release
+            && (self.policy.is_some()
+                || matches!(
+                    reason,
+                    ReleaseReason::CoreStart
+                        | ReleaseReason::Stop
+                        | ReleaseReason::StdinClosed
+                        | ReleaseReason::CoreConnectionLost
+                ))
+        {
+            self.pending_verification = Some(release_id);
+        }
+        let accepted = self.ledger.release_all(reason, release_id);
+        let verification = if accepted {
+            ReleaseVerification::Unverified
+        } else {
+            self.latch_input_fault(Refusal::ReleaseFailed);
+            ReleaseVerification::UpFailed
+        };
         let released_at_ns = mono_clock::now_ns();
         let mut outcomes = first;
         self.plan.clear(&mut outcomes);
         notices.0.push(Notice::Released(InputReleasedParams {
+            release_id,
             reason,
             producer: producer.cloned(),
             released_at_ns,
+            verification,
         }));
         outcomes.emit(producer, notices);
+        accepted
     }
 
-    fn release_current(&mut self, reason: ReleaseReason, notices: &mut Notices) {
+    fn latch_input_fault(&mut self, fault: Refusal) {
+        self.input_fault.get_or_insert(fault);
+        self.lease.local_revoke();
+    }
+
+    fn release_current(&mut self, reason: ReleaseReason, notices: &mut Notices) -> bool {
         let producer = self.current_producer();
-        self.release(reason, producer.as_ref(), Outcomes::default(), notices);
+        self.release(reason, producer.as_ref(), Outcomes::default(), notices)
+    }
+
+    fn revoke_through(&mut self, generation: u64, notices: &mut Notices) {
+        let through = self
+            .revoked_through
+            .map_or(generation, |r| r.max(generation));
+        self.revoked_through = Some(through);
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|c| c.producer.generation <= through)
+        {
+            let producer = self.current.take().map(|c| c.producer);
+            self.release(
+                ReleaseReason::GenerationRevoked,
+                producer.as_ref(),
+                Outcomes::default(),
+                notices,
+            );
+        }
     }
 
     /// 执行一步时触发的释放：`first` 是这一步已有的结果与其余动作的 `released`。`revoke` 为真时先本地
@@ -370,7 +432,11 @@ impl State {
             return;
         }
         // 先抬起到期的瞬时按住：它不是失效，不释放全部；抬起后同一步的下一个一次性动作可以接着做。
-        self.ledger.lift_due(now);
+        if !self.ledger.lift_due(now) {
+            self.lease.local_revoke();
+            self.release_current(ReleaseReason::InjectionBlocked, notices);
+            return;
+        }
         if let Some(current) = self.current.as_mut()
             && current.deadline.is_some_and(|deadline| now >= deadline)
         {
@@ -413,6 +479,10 @@ impl State {
         limits: &Limits,
         notices: &mut Notices,
     ) {
+        // 一次提交可能在验完块后切换产出者并触发释放。调度也须等这次释放核验。
+        if self.input_unavailable() {
+            return;
+        }
         loop {
             let Some(front) = self.plan.entries.front() else {
                 return;
@@ -485,8 +555,16 @@ impl State {
                 revoke: false,
             };
         };
+        if !entry.held_done && !self.ledger.release_missing(&entry.held) {
+            return drain_released(entry, ReleaseReason::InjectionBlocked, true);
+        }
+        if late {
+            while let Some(action) = entry.actions.pop_front() {
+                entry.done.push(dropped(&action, DropReason::Superseded));
+            }
+            return Step::Done;
+        }
         if !entry.held_done {
-            self.ledger.release_missing(&entry.held);
             for input in &entry.held {
                 if self.ledger.holds(input) {
                     continue;
@@ -505,12 +583,6 @@ impl State {
                 }
             }
             entry.held_done = true;
-        }
-        if late {
-            while let Some(action) = entry.actions.pop_front() {
-                entry.done.push(dropped(&action, DropReason::Superseded));
-            }
-            return Step::Done;
         }
         while !entry.actions.is_empty() {
             // 瞬时按住还没抬起：同一步的下一个一次性动作等它抬起。
@@ -758,6 +830,9 @@ impl Control {
         requires_policy: bool,
     ) -> Self {
         let has_source = backend.is_some();
+        let verifies_release = backend
+            .as_ref()
+            .is_some_and(|backend| backend.verifies_release());
         Self {
             limits,
             state: Mutex::new(State {
@@ -766,9 +841,13 @@ impl Control {
                 current: None,
                 revoked_through: None,
                 stopping: false,
+                input_fault: None,
+                last_release_id: 0,
+                verifies_release,
+                pending_verification: None,
+                last_verification_posted: 0,
                 plan: Plan::default(),
                 policy: None,
-                configured: false,
                 requires_policy,
                 rate: VecDeque::new(),
             }),
@@ -800,6 +879,78 @@ impl Control {
             Some(Notice::Released(released)) => released,
             _ => unreachable!("release always reports the release first"),
         }
+    }
+
+    /// 只核验当前释放。检查可报告补发被拒，在同一把锁内本地撤权。
+    #[cfg(any(windows, test))]
+    pub(crate) fn with_verification<T>(
+        &self,
+        release_id: u64,
+        check: impl FnOnce() -> (T, bool),
+    ) -> Option<T> {
+        let mut state = self.lock();
+        if state.pending_verification != Some(release_id) {
+            return None;
+        }
+        let (observed, repair_rejected) = check();
+        if repair_rejected {
+            state.latch_input_fault(Refusal::ReleaseFailed);
+        }
+        Some(observed)
+    }
+
+    /// 核验期间可能发生了更新的释放。只有当前释放的成功结果能打开输入门禁。
+    #[cfg(any(windows, test))]
+    pub(crate) fn finish_verification(
+        &self,
+        release_id: u64,
+        observed: VerificationResult,
+    ) -> InputVerificationParams {
+        let mut state = self.lock();
+        let result = if state.pending_verification == Some(release_id) {
+            match observed {
+                VerificationResult::Verified if state.input_fault.is_some() => {
+                    VerificationResult::Unavailable
+                }
+                VerificationResult::Residual | VerificationResult::Unavailable => {
+                    state.latch_input_fault(Refusal::ReleaseFailed);
+                    observed
+                }
+                _ => observed,
+            }
+        } else {
+            VerificationResult::Superseded
+        };
+        let checked_at_ns = mono_clock::now_ns();
+        self.done(state);
+        InputVerificationParams {
+            release_id,
+            result,
+            checked_at_ns,
+        }
+    }
+
+    /// 回执入队后才放开对应的门禁；旧回执不能放开新的。
+    #[cfg(any(windows, test))]
+    pub(crate) fn verification_posted(&self, release_id: u64) {
+        let mut state = self.lock();
+        state.last_verification_posted = state.last_verification_posted.max(release_id);
+        if state.pending_verification == Some(release_id) {
+            state.pending_verification = None;
+        }
+        self.done(state);
+    }
+
+    /// 退出前给最后一次释放的物理核验一段有限时间。
+    pub(crate) fn wait_for_final_verification(&self, timeout: Duration) -> bool {
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(self.lock(), timeout, |state| {
+                state.verifies_release && state.last_verification_posted != state.last_release_id
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        state.input_fault.is_none()
+            && (!state.verifies_release || state.last_verification_posted == state.last_release_id)
     }
 
     /// `producer.heartbeat`。有效的心跳刷新截止时刻；更高的代次先释放（`producer_changed`）再切换。
@@ -851,25 +1002,26 @@ impl Control {
 
     /// `producer.revoke`：作废 `generation` 及更早的全部代次；当前代次在其中时先释放
     /// （`generation_revoked`）并不再有当前产出者。返回时释放已完成。
-    pub(crate) fn revoke(&self, generation: u64) -> Notices {
+    pub(crate) fn revoke(&self, generation: u64) -> (Option<u64>, Notices) {
         let mut state = self.lock();
-        let through = state
-            .revoked_through
-            .map_or(generation, |r| r.max(generation));
-        state.revoked_through = Some(through);
+        let previous_release = state.last_release_id;
         let mut notices = Notices::default();
-        if state
-            .current
-            .as_ref()
-            .is_some_and(|current| current.producer.generation <= through)
-        {
-            let producer = state.current.take().map(|c| c.producer);
-            state.release(
-                ReleaseReason::GenerationRevoked,
-                producer.as_ref(),
-                Outcomes::default(),
-                &mut notices,
-            );
+        state.revoke_through(generation, &mut notices);
+        // 空闲后至今本实例未发出新输入，仍可关联最后一次释放。
+        let has_release = state.last_release_id != previous_release
+            || state.verifies_release && state.current.is_none() && state.last_release_id > 0;
+        let release_id = has_release.then_some(state.last_release_id);
+        self.done(state);
+        (release_id, notices)
+    }
+
+    /// 采集线程在切换目标、帧环或丢弃采集源时调用。清除帧与作废代次之间不执行输入。
+    pub(crate) fn capture_reset(&self) -> Notices {
+        let mut state = self.lock();
+        self.frames.forget();
+        let mut notices = Notices::default();
+        if let Some(producer) = state.current_producer() {
+            state.revoke_through(producer.generation, &mut notices);
         }
         self.done(state);
         notices
@@ -881,7 +1033,7 @@ impl Control {
         let mut state = self.lock();
         let mut notices = Notices::default();
         state.tick(now, &self.frames, &self.limits, &mut notices);
-        let result = Self::accept(&mut state, block, now, &mut notices);
+        let result = Self::accept(&mut state, block, now, &self.frames, &mut notices);
         self.done(state);
         (result, notices)
     }
@@ -890,6 +1042,7 @@ impl Control {
         state: &mut State,
         block: ActionBlock,
         now: u64,
+        frames: &FrameStatus,
         notices: &mut Notices,
     ) -> ActionSubmitResult {
         if state.stopping {
@@ -951,9 +1104,32 @@ impl Control {
                 format!("deadline_ns {} is not after now ({now})", block.deadline_ns),
             );
         }
+        if block
+            .steps
+            .iter()
+            .any(|step| !step.held.is_empty() || !step.actions.is_empty())
+        {
+            if state.input_unavailable() {
+                return rejected(
+                    RejectReason::NotAllowed,
+                    "input release has not been verified",
+                );
+            }
+            if state.requires_policy && !frames.contains_frame(block.base_frame) {
+                return rejected(
+                    RejectReason::NotAllowed,
+                    "the base frame is outside the current capture",
+                );
+            }
+        }
         if same_generation.is_none() {
-            if state.current.is_some() {
-                state.release_current(ReleaseReason::ProducerChanged, notices);
+            if state.current.is_some()
+                && !state.release_current(ReleaseReason::ProducerChanged, notices)
+            {
+                return rejected(
+                    RejectReason::NotAllowed,
+                    "input release failed during producer change",
+                );
             }
             state.current = Some(Current::new(producer.clone()));
         }
@@ -977,9 +1153,15 @@ impl Control {
         let mut state = self.lock();
         let mut notices = Notices::default();
         state.tick(now, &self.frames, &self.limits, &mut notices);
-        let result = state.lease.grant(grant.token, grant.expires_ns, now);
-        if result == Ok(Granted::Replaced) {
-            state.release_current(ReleaseReason::LeaseRevoked, &mut notices);
+        let mut result = if let Some(fault) = state.input_fault {
+            Err(fault)
+        } else {
+            state.lease.grant(grant.token, grant.expires_ns, now)
+        };
+        if result == Ok(Granted::Replaced)
+            && !state.release_current(ReleaseReason::LeaseRevoked, &mut notices)
+        {
+            result = Err(Refusal::ReleaseFailed);
         }
         self.done(state);
         (result.map(|_| ()), notices)
@@ -1003,12 +1185,11 @@ impl Control {
     /// 不合规则回 `Err`（-32602）。接受时告诉输入后端白名单里的键与鼠标键，供真实后端核验残留。
     pub(crate) fn configure(&self, params: &InputPolicy) -> Result<Configured, String> {
         let mut state = self.lock();
-        if state.configured {
+        if state.policy.is_some() {
             return Ok(Configured::Conflict);
         }
         let policy = Policy::parse(params)?;
         state.policy = Some(policy);
-        state.configured = true;
         state.ledger.configured(params);
         self.done(state);
         Ok(Configured::Accepted)
@@ -1043,7 +1224,7 @@ impl Control {
         }
     }
 
-    /// 真实后端的本地撤权：接管、急停、钩子失效。吊销当前令牌并释放全部输入，许可源须换发更大的令牌。
+    /// 真实后端的本地撤权：吊销令牌并释放全部输入。钩子失效后本实例拒绝后续令牌。
     /// 由钩子线程调用，通知经发送队列发出，不阻塞回调。
     #[cfg_attr(
         not(windows),
@@ -1052,8 +1233,13 @@ impl Control {
     pub(crate) fn local_revoke(&self, reason: ReleaseReason) -> Notices {
         let mut state = self.lock();
         let mut notices = Notices::default();
-        if !state.stopping {
-            state.lease.local_revoke();
+        let hook_lost = reason == ReleaseReason::HookLost;
+        if !(state.stopping || hook_lost && state.input_fault.is_some()) {
+            if hook_lost {
+                state.latch_input_fault(Refusal::HookLost);
+            } else {
+                state.lease.local_revoke();
+            }
             state.release_current(reason, &mut notices);
         }
         self.done(state);
@@ -1148,10 +1334,15 @@ impl Control {
             .and_then(Policy::max_hold)
             .zip(state.ledger.earliest_held_ns())
             .map(|(max_hold, pressed)| pressed.saturating_add(nanos(max_hold)));
+        let next_entry = state
+            .plan
+            .entries
+            .front()
+            .filter(|_| !state.input_unavailable());
         [
             state.current.as_ref().and_then(|c| c.deadline),
             state.lease.expires_at(),
-            state.plan.entries.front().map(|e| e.at_ns),
+            next_entry.map(|entry| entry.at_ns),
             state.plan.active.map(|a| a.deadline_ns),
             frame_stale_at,
             state.ledger.next_lift(),

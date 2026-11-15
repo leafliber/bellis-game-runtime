@@ -38,6 +38,11 @@ impl FrameRingWriter {
         })
     }
 
+    /// 第一次写入前保留本实例在旧帧环中已使用的帧号。
+    pub fn resume_after(&mut self, previous_frame: u64) {
+        self.base = self.base.max(previous_frame);
+    }
+
     /// 最近写出的帧号；还没写过时是挂接时的 `write_seq`。
     #[must_use]
     pub fn last_frame_number(&self) -> u64 {

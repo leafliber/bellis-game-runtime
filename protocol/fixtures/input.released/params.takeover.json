@@ -1,8 +1,10 @@
 {
+  "release_id": 4,
   "reason": "takeover",
   "producer": {
     "id": "step-control",
     "generation": 3
   },
-  "released_at_ns": 5650000000
+  "released_at_ns": 5650000000,
+  "verification": "up_failed"
 }

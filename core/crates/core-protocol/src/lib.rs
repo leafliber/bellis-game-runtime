@@ -11,4 +11,4 @@ pub mod messages;
 pub mod methods;
 
 /// 核协议版本。握手时两端都核对，不相等即拒绝；两端同仓库同发布，仍然校验。
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;

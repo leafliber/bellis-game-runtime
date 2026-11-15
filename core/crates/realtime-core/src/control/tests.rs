@@ -159,6 +159,7 @@ impl Armed {
                 capture_ns,
             },
             geometry,
+            None,
         );
     }
 
@@ -275,14 +276,14 @@ fn revoke_releases_the_current_generation_and_blocks_it() {
     let control = Control::new(limits(), Arc::default(), None, false);
     control.heartbeat(&beat("a", 4, 1), T0).unwrap();
     // 作废更早的代次不影响当前产出者。
-    assert!(control.revoke(3).is_empty());
+    assert!(control.revoke(3).1.is_empty());
     assert_eq!(control.health().producer, Some(producer("a", 4)));
     assert_eq!(
         control.heartbeat(&beat("a", 3, 1), T0).unwrap_err(),
         Rejection::Revoked
     );
     assert_eq!(
-        released(&control.revoke(4)),
+        released(&control.revoke(4).1),
         [ReleaseReason::GenerationRevoked]
     );
     assert_eq!(control.health().producer, None);
@@ -291,7 +292,7 @@ fn revoke_releases_the_current_generation_and_blocks_it() {
         Rejection::Revoked
     );
     // 已作废的最高代次不回退。
-    assert!(control.revoke(1).is_empty());
+    assert!(control.revoke(1).1.is_empty());
     assert_eq!(
         control.heartbeat(&beat("a", 4, 3), T0).unwrap_err(),
         Rejection::Revoked
@@ -300,7 +301,7 @@ fn revoke_releases_the_current_generation_and_blocks_it() {
     assert!(control.heartbeat(&beat("b", 5, 1), T0).unwrap().is_empty());
     // 作废未来的代次也覆盖当前代次。
     assert_eq!(
-        released(&control.revoke(9)),
+        released(&control.revoke(9).1),
         [ReleaseReason::GenerationRevoked]
     );
     assert_eq!(
@@ -664,6 +665,24 @@ fn held_state_does_not_outlive_the_old_deadline_before_a_later_block_starts() {
     assert_eq!(armed.inputs(), ["down key 0x1e"]);
 }
 
+#[test]
+fn regression_expired_old_block_cannot_press_held_input() {
+    let armed = Armed::new_real();
+    armed.configure(&input_policy());
+    let (old, _) = armed.submit(
+        block(1, T0 + 20 * MS, 20, vec![step(0, vec![key(0x11)], vec![])]),
+        T0,
+    );
+    assert!(accepted(&old));
+    let (new, _) = armed.submit(
+        block(2, T0 + 60 * MS, 30, vec![step(0, vec![], vec![])]),
+        T0 + 10 * MS,
+    );
+    assert!(accepted(&new));
+    armed.control.tick(T0 + 50 * MS);
+    assert_eq!(armed.inputs(), Vec::<String>::new());
+}
+
 // ---------------------------------------------------------------- 权威检查
 
 /// 三个条件任一不成立：按下与一次性动作都不交给后端，释放全部输入并结束这一块。
@@ -761,6 +780,7 @@ fn every_authority_condition_gates_every_input() {
                 capture_ns: T0,
             },
             GEOMETRY,
+            None,
         );
         let control = Control::new(limits(), frames, backend, false);
         control.heartbeat(&beat("a", 1, 1), T0).unwrap();
@@ -869,7 +889,7 @@ fn revoking_the_generation_ends_its_block() {
     armed.submit(block(1, T0, 100, steps), T0);
     armed.control.tick(T0);
     armed.inputs();
-    let notices = armed.control.revoke(1);
+    let (_, notices) = armed.control.revoke(1);
     assert_eq!(released(&notices), [ReleaseReason::GenerationRevoked]);
     assert_eq!(
         receipts(&notices),
@@ -1047,6 +1067,7 @@ fn the_scheduler_runs_steps_and_timers_in_real_time() {
             capture_ns: now,
         },
         GEOMETRY,
+        None,
     );
     let (result, _) = control.grant_lease(
         &LeaseGrantParams {
@@ -1083,6 +1104,7 @@ fn releasing_never_waits_for_the_capture_side() {
             capture_ns: T0,
         },
         GEOMETRY,
+        None,
     );
     let backend = Recorder::default();
     let control = Arc::new(Control::new(
@@ -1106,7 +1128,7 @@ fn releasing_never_waits_for_the_capture_side() {
             control.heartbeat(&beat("a", 1, 1), T0).unwrap();
             push(control.heartbeat(&beat("b", 2, 1), T0).unwrap());
             push(control.tick(T0 + HEARTBEAT_TIMEOUT));
-            push(control.revoke(2));
+            push(control.revoke(2).1);
             let first = LeaseGrantParams {
                 token: 1,
                 expires_ns: T0 + 10 * MS,
@@ -1438,4 +1460,29 @@ fn a_local_revoke_releases_and_invalidates_the_token() {
         T0 + MS,
     );
     assert!(result.is_ok(), "换发更大的令牌被接受");
+}
+
+#[test]
+fn regression_hook_lost_cannot_be_rearmed_in_the_same_instance() {
+    let armed = Armed::new_real();
+    armed.configure(&input_policy());
+    assert_eq!(
+        released(&armed.control.local_revoke(ReleaseReason::HookLost)),
+        [ReleaseReason::HookLost]
+    );
+    let (result, _) = armed.control.grant_lease(
+        &LeaseGrantParams {
+            token: 2,
+            expires_ns: T0 + 10_000 * MS,
+        },
+        T0 + MS,
+    );
+    assert!(result.is_err(), "钩子失效的实例不能接受新许可");
+}
+
+#[test]
+fn regression_core_start_marks_unchecked_physical_release_as_unverified() {
+    let armed = Armed::new_real();
+    let released = serde_json::to_value(armed.control.release_on_start()).unwrap();
+    assert_eq!(released["verification"], "unverified");
 }

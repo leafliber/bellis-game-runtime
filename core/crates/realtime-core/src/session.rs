@@ -34,15 +34,15 @@ use bellis_channel::{
 use core_protocol::PROTOCOL_VERSION;
 use core_protocol::messages::{
     ActionBlock, ActionSubmitResult, AudioRingAttachParams, AudioSetTargetParams,
-    CaptureSetTargetParams, CaptureTarget, CoreHealthParams, CoreHelloParams, CoreHelloResult,
-    Empty, FrameRingAttachParams, InputPolicy, InputReleasedParams, InputResidualParams,
-    ProducerHeartbeatParams, ProducerRevokeParams, ReleaseReason,
+    CaptureSetTargetParams, CoreHealthParams, CoreHelloParams, CoreHelloResult, Empty,
+    FrameRingAttachParams, InputPolicy, InputReleasedParams, ProducerHeartbeatParams,
+    ProducerRevokeParams, ProducerRevokeResult, ReleaseReason,
 };
 use core_protocol::methods::{
     ActionReceipt, ActionSubmit, AudioRingAttach, AudioSetTarget, CaptureSetTarget, CoreHealth,
-    CoreHello, CoreStop, FrameRingAttach, InputConfigure, InputReleased, InputResidual, Method,
-    Notification, OperatorInputReleased, OperatorInputResidual, ProducerHeartbeat, ProducerRevoke,
-    error_code,
+    CoreHello, CoreStop, FrameRingAttach, InputConfigure, InputReleased, InputResidual,
+    InputVerification, Method, Notification, OperatorInputReleased, ProducerHeartbeat,
+    ProducerRevoke, error_code,
 };
 use frame_ring::FrameRingWriter;
 use serde_json::{Map, Value, json};
@@ -101,7 +101,7 @@ impl fmt::Display for Ended {
     }
 }
 
-/// 启动失败：没能建立会话。
+/// 启动失败或会话结束时无法确认释放。
 #[derive(Debug)]
 pub enum StartError {
     /// 连不上主进程或握手失败。
@@ -114,6 +114,7 @@ pub enum StartError {
     Hello(String),
     /// 无法创建线程。
     Thread(io::Error),
+    UnverifiedRelease,
 }
 
 impl fmt::Display for StartError {
@@ -124,13 +125,14 @@ impl fmt::Display for StartError {
             Self::TestDevice(error) => write!(f, "cannot connect to the test device: {error}"),
             Self::Hello(reason) => write!(f, "core.hello failed: {reason}"),
             Self::Thread(error) => write!(f, "cannot start a thread: {error}"),
+            Self::UnverifiedRelease => f.write_str("physical input release could not be verified"),
         }
     }
 }
 
 impl std::error::Error for StartError {}
 
-/// 运行一次会话直到结束；返回前已释放全部输入。
+/// 运行一次会话直到结束。返回成功前已处理抬起，真实后端还须完成物理核验。
 ///
 /// `input` 是输入后端与许可源的组合（[`InputSetup::select`] 已核对门禁）；`stdin` 是生命线：读到 EOF
 /// 即结束。
@@ -153,7 +155,7 @@ pub fn run(
     let (control, outbox, sides, target) = start_input(input, limits, &frames, &launch.role)?;
     // 每次启动先释放全部输入，再接受任何产出者与动作。操作员控制台随即收到 `core_start`。
     let started = control.release_on_start();
-    log!("released all inputs on start");
+    log_released(&started);
     outbox.mirror(&started);
 
     let credentials = &launch.credentials;
@@ -179,7 +181,11 @@ pub fn run(
         return Err(error);
     }
 
-    let (media, media_threads) = match Media::spawn(frames) {
+    let invalidate_capture = {
+        let (control, outbox) = (Arc::clone(&control), Arc::clone(&outbox));
+        move || outbox.post(control.capture_reset())
+    };
+    let (media, media_threads) = match Media::spawn(frames, invalidate_capture) {
         Ok(spawned) => spawned,
         Err(error) => {
             sides.finish();
@@ -238,16 +244,19 @@ pub fn run(
         // 连接可能仍在：尽量告诉主进程。
         Ended::StdinClosed => outbox.post(control.release_on_exit(ReleaseReason::StdinClosed)),
     }
-    log!("{reason}; released all inputs, exiting");
+    log!("{reason}; input release requested, exiting");
     for worker in workers {
         let _ = worker.join();
     }
+    let release_ok = control.wait_for_final_verification(OUTBOX_FLUSH_WAIT);
     outbox.close(OUTBOX_FLUSH_WAIT);
     // 释放全部输入的 `input.released` 写给操作员控制台、抬起写给测试一方之后才断开它们。
     sides.finish();
     media_threads.stop();
     peer.close();
-    Ok(reason)
+    release_ok
+        .then_some(reason)
+        .ok_or(StartError::UnverifiedRelease)
 }
 
 /// 旁路连接：操作员许可连接与测试设备连接，各自可能没有。
@@ -277,8 +286,7 @@ impl Sides {
 type Started = (Arc<Control>, Arc<Outbox>, Sides, Arc<TargetWindow>);
 
 /// 交出的 [`Outbox`] 是发给主进程的通知的出口；有操作员许可连接时，它把每条 `input.released`、
-/// `input.residual` 也放进那条连接的发送队列。还交出 [`TargetWindow`]：`capture.set_target` 据它告诉真实
-/// 后端当前的目标窗口，没有真实后端时无人读它。
+/// `input.residual` 也放进那条连接的发送队列。真实后端通过 [`TargetWindow`] 读取最近写入帧的窗口。
 fn start_input(
     input: InputSetup,
     limits: Limits,
@@ -287,7 +295,10 @@ fn start_input(
 ) -> Result<Started, StartError> {
     let operator_queue = input.operator().map(|_| Arc::new(SendQueue::default()));
     let outbox = Arc::new(Outbox::new(operator_queue.clone()));
-    let target = Arc::new(TargetWindow::new(matches!(input, InputSetup::Real { .. })));
+    let target = Arc::new(TargetWindow::new(
+        matches!(input, InputSetup::Real { .. }),
+        Arc::clone(frames),
+    ));
     let post: Post = {
         let outbox = Arc::clone(&outbox);
         Arc::new(move |notices| outbox.post(notices))
@@ -432,10 +443,13 @@ struct MediaThreads {
 }
 
 impl Media {
-    /// 启动采集线程与音频线程；两者互不依赖，也都不碰控制状态。
-    fn spawn(frames: Arc<FrameStatus>) -> io::Result<(Arc<Self>, MediaThreads)> {
+    /// 启动采集线程与音频线程；采集源变更时调用 `invalidate_capture`。
+    fn spawn(
+        frames: Arc<FrameStatus>,
+        invalidate_capture: impl Fn() + Send + 'static,
+    ) -> io::Result<(Arc<Self>, MediaThreads)> {
         let audio_status = Arc::new(AudioStatus::default());
-        let (capture, capture_thread) = Capture::spawn(frames)?;
+        let (capture, capture_thread) = Capture::spawn(frames, invalidate_capture)?;
         let (audio, audio_thread) = match Audio::spawn(Arc::clone(&audio_status)) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -584,15 +598,6 @@ impl Outbox {
         }
     }
 
-    /// 把一次残留的 `input.residual` 放进操作员许可连接的发送队列；没有这条连接时什么也不做。
-    fn mirror_residual(&self, residual: &InputResidualParams) {
-        if let Some(queue) = &self.operator
-            && let Some(params) = to_params(OperatorInputResidual::NAME, residual)
-        {
-            queue.push(OperatorInputResidual::NAME, params);
-        }
-    }
-
     /// 记下通知中的释放：主进程收不到时，日志是唯一的记录。操作员控制台照常收到。
     fn log(&self, notices: &Notices) {
         for notice in &notices.0 {
@@ -608,7 +613,6 @@ impl Outbox {
             let (method, params) = match &notice {
                 Notice::Released(released) => {
                     log_released(released);
-                    self.mirror(released);
                     (
                         InputReleased::NAME,
                         to_params(InputReleased::NAME, released),
@@ -618,15 +622,35 @@ impl Outbox {
                     (ActionReceipt::NAME, to_params(ActionReceipt::NAME, receipt))
                 }
                 Notice::Residual(residual) => {
-                    log_residual(residual);
-                    self.mirror_residual(residual);
+                    log!(
+                        "input residual #{}: {} item(s) observed down, all repair events accepted: {}",
+                        residual.release_id,
+                        residual.items.len(),
+                        residual.repair_accepted
+                    );
                     (
                         InputResidual::NAME,
                         to_params(InputResidual::NAME, residual),
                     )
                 }
+                Notice::Verification(verification) => {
+                    log!(
+                        "input verification #{}: {:?}",
+                        verification.release_id,
+                        verification.result
+                    );
+                    (
+                        InputVerification::NAME,
+                        to_params(InputVerification::NAME, verification),
+                    )
+                }
             };
             if let Some(params) = params {
+                if let Some(queue) = &self.operator
+                    && method != ActionReceipt::NAME
+                {
+                    queue.push(method, params.clone());
+                }
                 deliver(method, params);
             }
         }
@@ -658,18 +682,11 @@ impl Outbox {
 
 fn log_released(released: &InputReleasedParams) {
     log!(
-        "released all inputs: {:?} (producer {:?})",
+        "input release #{}: {:?} (producer {:?}, verification {:?})",
+        released.release_id,
         released.reason,
-        released.producer
-    );
-}
-
-fn log_residual(residual: &InputResidualParams) {
-    log!(
-        "input residual ({:?}, reason {:?}): {} item(s) still held, re-sent up",
-        residual.cause,
-        residual.reason,
-        residual.items.len()
+        released.producer,
+        released.verification
     );
 }
 
@@ -727,19 +744,7 @@ fn attach_handler(
     }
 }
 
-/// 采集目标里的窗口识别规则（真实后端据它找目标窗口）；假显示面没有窗口。
-fn target_selector(target: &CaptureTarget) -> Option<capture::WindowSelector> {
-    match target {
-        CaptureTarget::Window(window) => Some(capture::WindowSelector {
-            process_name: Some(window.process_name.clone()),
-            class_name: window.window_class.clone(),
-            title: window.title.clone(),
-        }),
-        CaptureTarget::Fake(_) => None,
-    }
-}
-
-/// `capture.set_target`：核对目标，交给采集线程；旧的采集源先停掉。同时更新真实后端的目标窗口。
+/// `capture.set_target`：核对目标并排入采集线程；旧采集源先作废，新采集源随后建立。
 fn set_target_handler(
     media: &Arc<Media>,
     target: &Arc<TargetWindow>,
@@ -759,7 +764,6 @@ fn set_target_handler(
                 "unsupported: the real input backend injects into a window; a fake display has none",
             ));
         }
-        target.set(target_selector(&params.target));
         let opener = opener_for(params.target).map_err(|error| {
             log!("{} refused: {error}", CaptureSetTarget::NAME);
             let code = match &error {
@@ -893,9 +897,9 @@ fn handlers(
         move |params: &Map<String, Value>| {
             let revoke: ProducerRevokeParams =
                 parse(params).map_err(|error| invalid_params(ProducerRevoke::NAME, &error))?;
-            // 释放完成、`input.released` 发出之后才回应：回应即这些代次的输入已释放的确认。
-            outbox.send(control.revoke(revoke.generation));
-            Ok(empty())
+            let (release_id, notices) = control.revoke(revoke.generation);
+            outbox.send(notices);
+            Ok(json!(ProducerRevokeResult { release_id }))
         }
     };
     let stop = {

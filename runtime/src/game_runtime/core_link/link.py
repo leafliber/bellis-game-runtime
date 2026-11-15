@@ -3,10 +3,11 @@
 设计见 `docs/modules/realtime-core.md` 的“启动与生命线”。每次启动都是一个新的实时核实例：
 新的会话地址与密钥、新的监听与子进程。等输入已释放的确认跨实例保留，按以下任一事件完成：
 
-- `producer.revoke` 的回应：该代次及更早代次的输入已释放；
-- 新实例的 `input.released(core_start)`：新实例启动时已释放全部输入，此前的等待全部完成；
-- 实例以退出码 0 退出：实时核只在释放全部输入之后以 0 退出（`core.stop`、核连接断开或 stdin EOF）；
-  此后没有实例在运行时，新的等待也立即完成。
+- 真实输入等待同实例内 `producer.revoke` 对应的 `verified`，或该实例核验后以 0 退出。
+- 新实例的启动核验成功后，完成旧实例仍未收到确认的等待。
+- 假后端以请求回应、启动释放回执或正常退出作为假输入释放依据。
+
+已知抬起或核验失败时，主进程停止动作与心跳，保留等待并停止自动重启。
 
 实例被强制终止或崩溃（退出码非 0）时没有进程发出按键抬起，等待保留到下一个实例的 `core_start`。
 
@@ -48,6 +49,7 @@ from core_protocol.methods import (
     INPUT_CONFIGURE,
     INPUT_RELEASED,
     INPUT_RESIDUAL,
+    INPUT_VERIFICATION,
     PRODUCER_HEARTBEAT,
     PRODUCER_REVOKE,
     PROTOCOL_VERSION,
@@ -60,10 +62,14 @@ from core_protocol.models import (
     InputPolicy,
     InputReleasedParams,
     InputResidualParams,
+    InputVerificationParams,
     Producer,
     ProducerHeartbeatParams,
     ProducerRevokeParams,
+    ProducerRevokeResult,
     ReleaseReason,
+    ReleaseVerification,
+    VerificationResult,
 )
 from game_runtime.audio_ring import AudioRead, AudioReader, AudioRing
 from game_runtime.channel import (
@@ -307,6 +313,16 @@ class _Instance:
     """收到 `input.released(core_start)`、实例就绪的 `time.perf_counter_ns()`；用于自动重启清零。"""
     tasks: list[asyncio.Task[None]] = field(default_factory=list[asyncio.Task[None]])
     closing: asyncio.Task[None] | None = None
+    release_failure: str | None = None
+    startup_release_id: int | None = None
+    latest_verification: InputVerificationParams | None = None
+    verification_changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass(frozen=True)
+class _ReleaseWait:
+    instance_number: int
+    done: asyncio.Future[None]
 
 
 class CoreLink:
@@ -325,22 +341,24 @@ class CoreLink:
         on_health: Callable[[CoreHealthParams], None] | None = None,
         on_residual: Callable[[InputResidualParams], None] | None = None,
         on_restart: Callable[[int], None] | None = None,
+        on_verification: Callable[[InputVerificationParams], None] | None = None,
     ) -> None:
         self._options = options
         self._on_released = on_released
         self._on_health = on_health
         self._on_residual = on_residual
         self._on_restart = on_restart
+        self._on_verification = on_verification
         self._grant_source: Callable[[], ControlGrant | None] | None = None
         self._instance: _Instance | None = None
         self._instances = 0
         self._clean = True
         self._stopping = False
-        """`stop` 已被调用：此后不自动重启。"""
+        """已请求停止或已知输入释放失败，此后不自动重启。"""
         self._restart_attempt = 0
         """连续重启的次数，就绪满 `reset_after` 秒后清零。"""
         self._restart_task: asyncio.Task[None] | None = None
-        self._released: dict[int, asyncio.Future[None]] = {}
+        self._released: dict[int, _ReleaseWait] = {}
         self._heartbeat_seq = 0
         self._heartbeat_generation: int | None = None
         """运行中的实例最近一次心跳的代次。"""
@@ -498,8 +516,10 @@ class CoreLink:
             # 启动被取消：不留下子进程，善后由退出回调完成。
             process.kill()
             raise
-        if not ready.done():
-            if process.exited.done():
+        if not ready.done() or instance.release_failure is not None:
+            if instance.release_failure is not None:
+                reason = instance.release_failure
+            elif process.exited.done():
                 reason = f"实时核 {number} 在就绪前退出，退出码 {process.exited.result()}"
             else:
                 reason = f"实时核 {number} 未在 {self._options.start_timeout:g} 秒内就绪"
@@ -526,6 +546,9 @@ class CoreLink:
             except (ChannelError, RpcError) as error:
                 await self._stop_instance(instance)
                 raise CoreStartError(f"实时核 {number} 没有接受输入策略：{error}") from error
+        if instance.release_failure is not None:
+            await self._stop_instance(instance)
+            raise CoreStartError(instance.release_failure)
         instance.tasks.append(loop.create_task(self._send_heartbeats(instance)))
         instance.tasks.append(loop.create_task(self._watch_health(instance)))
 
@@ -619,12 +642,12 @@ class CoreLink:
         """发 `producer.revoke`，返回表示请求已写出；回应由 `wait_released` 等待。"""
         released = self._released_future(grant.generation)
         instance = self._instance
-        peer = None if instance is None else instance.peer
-        if peer is None or not peer.connection.is_open:
+        if instance is None or instance.peer is None or not instance.peer.connection.is_open:
             raise ChannelError("closed", "核连接未建立，无法发出 producer.revoke")
-        task = asyncio.get_running_loop().create_task(self._revoke(peer, grant.generation))
-        if instance is not None:
-            instance.tasks.append(task)
+        task = asyncio.get_running_loop().create_task(
+            self._revoke(instance, instance.peer, grant.generation)
+        )
+        instance.tasks.append(task)
         # 让出一次，请求任务先跑到等回应处：RpcPeer.request 在第一次等待之前就已写出请求。
         # 回应只能在之后的轮次到达，所以此时任务已结束即写出失败（_revoke 已记录）。
         await asyncio.sleep(0)
@@ -632,18 +655,18 @@ class CoreLink:
             raise ChannelError("closed", f"producer.revoke({grant.generation}) 没有写出")
 
     async def wait_released(self, grant: ControlGrant) -> None:
-        """等到该代次的输入已释放，见模块说明中的三种事件。"""
+        """等到该代次的输入释放确认，见模块说明。"""
         released = self._released_future(grant.generation)
         if not released.done() and self._instance is None and self._clean:
             released.set_result(None)
         await asyncio.shield(released)
 
     def _released_future(self, generation: int) -> asyncio.Future[None]:
-        future = self._released.get(generation)
-        if future is None:
-            future = asyncio.get_running_loop().create_future()
-            self._released[generation] = future
-        return future
+        wait = self._released.get(generation)
+        if wait is None:
+            wait = _ReleaseWait(self._instances, asyncio.get_running_loop().create_future())
+            self._released[generation] = wait
+        return wait.done
 
     async def submit(
         self,
@@ -666,6 +689,8 @@ class CoreLink:
             raise ValueError(f"start_delay 不能为负：{start_delay}")
         grant.check()
         instance = self._instance
+        if instance is not None and instance.release_failure is not None:
+            raise ChannelError("closed", instance.release_failure)
         peer = None if instance is None else instance.peer
         if peer is None or not peer.connection.is_open:
             raise ChannelError("closed", "核连接未建立，无法提交动作块")
@@ -728,24 +753,59 @@ class CoreLink:
             submission.fail(error)
         self._submissions.clear()
 
-    def _release_through(self, generation: int | None) -> None:
-        """完成代次不大于 `generation` 的等待；None 表示全部。完成过的保留，之后再等立即返回。"""
-        for number, future in self._released.items():
-            if not future.done() and (generation is None or number <= generation):
-                future.set_result(None)
+    def _release_through(
+        self, generation: int | None, *, before_instance: int | None = None
+    ) -> None:
+        """完成确认覆盖的等待；启动核验只覆盖旧实例的等待。"""
+        for number, wait in self._released.items():
+            if (
+                not wait.done.done()
+                and (generation is None or number <= generation)
+                and (before_instance is None or wait.instance_number < before_instance)
+            ):
+                wait.done.set_result(None)
 
-    async def _revoke(self, peer: RpcPeer, generation: int) -> None:
+    async def _revoke(self, instance: _Instance, peer: RpcPeer, generation: int) -> None:
         params = ProducerRevokeParams(generation=generation)
-        try:
-            await peer.request(
-                PRODUCER_REVOKE.name, _dump(params), timeout=self._options.rpc_timeout
-            )
-        except (ChannelError, RpcError) as error:
-            # 等待不就此失败：实时核退出或重启时同样完成，见模块说明。
-            logger.warning("producer.revoke(%d) 未得到回应：%s", generation, error)
-            return
-        logger.info("实时核确认代次 %d 及更早代次的输入已释放", generation)
-        self._release_through(generation)
+        previous_id = None
+        while self._instance is instance and instance.release_failure is None:
+            try:
+                reply = await peer.request(
+                    PRODUCER_REVOKE.name, _dump(params), timeout=self._options.rpc_timeout
+                )
+                revoked = ProducerRevokeResult.model_validate(reply)
+            except (ChannelError, RpcError, ValidationError) as error:
+                logger.warning("producer.revoke(%d) 未得到有效回应：%s", generation, error)
+                return
+            if self._instance is not instance or instance.release_failure is not None:
+                return
+            if not self._options.real_input:
+                self._release_through(generation)
+                return
+            release_id = revoked.release_id
+            if release_id is None or release_id == previous_id:
+                return
+            previous_id = release_id
+            verification = await self._wait_verification(instance, release_id)
+            if verification is None:
+                return
+            if (
+                verification.release_id == release_id
+                and verification.result is VerificationResult.VERIFIED
+            ):
+                self._release_through(generation)
+                return
+            # 有更新的释放时再次幂等作废，请实时核返回仍可关联的编号。
+
+    async def _wait_verification(
+        self, instance: _Instance, release_id: int
+    ) -> InputVerificationParams | None:
+        while self._instance is instance and instance.release_failure is None:
+            observed = instance.latest_verification
+            if observed is not None and observed.release_id >= release_id:
+                return observed
+            await instance.verification_changed.wait()
+        return None
 
     # 连接与消息
 
@@ -767,6 +827,10 @@ class CoreLink:
         peer.on_notification(ACTION_RECEIPT.name, self._on_receipt_message)
         peer.on_notification(
             INPUT_RESIDUAL.name, lambda params: self._on_residual_message(instance, params)
+        )
+        peer.on_notification(
+            INPUT_VERIFICATION.name,
+            lambda params: self._on_verification_message(instance, params),
         )
         instance.peer = peer
         peer.closed.add_done_callback(
@@ -800,36 +864,86 @@ class CoreLink:
 
     def _on_released_message(self, instance: _Instance, params: dict[str, Any]) -> None:
         released = _parse(InputReleasedParams, INPUT_RELEASED.name, params)
-        if released is None or instance.hello_at_ns is None:
+        if released is None or instance.hello_at_ns is None or instance.number != self._instances:
             return
         producer = released.producer
         logger.info(
-            "实时核 %d 释放了全部输入：%s（产出者 %s）",
+            "实时核 %d 释放回执 #%d %s，状态 %s（产出者 %s）",
             instance.number,
+            released.release_id,
             released.reason,
+            released.verification,
             "无" if producer is None else f"{producer.id}#{producer.generation}",
         )
-        if released.reason is ReleaseReason.CORE_START:
-            # 新实例启动时已释放全部输入：此前的等待全部完成。
-            self._release_through(None)
-            if not instance.ready.done():
-                instance.ready.set_result(None)
+        if released.verification is ReleaseVerification.UP_FAILED:
+            self._fail_release(instance, released.release_id, "系统拒绝抬起")
+        if released.reason is ReleaseReason.CORE_START and not instance.ready.done():
+            instance.startup_release_id = released.release_id
+            if instance.release_failure is None:
                 instance.ready_at_ns = time.perf_counter_ns()
+                if not self._options.real_input:
+                    self._release_through(None)
+            instance.ready.set_result(None)
         if self._on_released is not None:
             self._on_released(released)
 
     def _on_residual_message(self, instance: _Instance, params: dict[str, Any]) -> None:
         residual = _parse(InputResidualParams, INPUT_RESIDUAL.name, params)
-        if residual is None or instance.hello_at_ns is None:
+        if residual is None or instance.hello_at_ns is None or instance.number != self._instances:
             return
         logger.info(
-            "实时核 %d 核验出残留（%s）：%d 项仍按住，已补发抬起",
+            "实时核 %d 释放 #%d 核验出残留 %d 项，补发抬起全被接受=%s",
             instance.number,
-            residual.cause,
+            residual.release_id,
             len(residual.items),
+            residual.repair_accepted,
         )
+        if not residual.repair_accepted:
+            self._fail_release(instance, residual.release_id, "系统拒绝补发抬起")
         if self._on_residual is not None:
             self._on_residual(residual)
+
+    def _on_verification_message(self, instance: _Instance, params: dict[str, Any]) -> None:
+        verification = _parse(InputVerificationParams, INPUT_VERIFICATION.name, params)
+        if (
+            verification is None
+            or instance.hello_at_ns is None
+            or instance.number != self._instances
+        ):
+            return
+        logger.info(
+            "实时核 %d 释放 #%d 物理核验 %s",
+            instance.number,
+            verification.release_id,
+            verification.result,
+        )
+        if verification.result in (VerificationResult.RESIDUAL, VerificationResult.UNAVAILABLE):
+            self._fail_release(instance, verification.release_id, verification.result.value)
+        if (
+            verification.release_id == instance.startup_release_id
+            and verification.result is VerificationResult.VERIFIED
+            and instance.release_failure is None
+        ):
+            self._release_through(None, before_instance=instance.number)
+        if (
+            instance.latest_verification is None
+            or verification.release_id > instance.latest_verification.release_id
+        ):
+            instance.latest_verification = verification
+            changed, instance.verification_changed = instance.verification_changed, asyncio.Event()
+            changed.set()
+        if self._on_verification is not None:
+            self._on_verification(verification)
+
+    def _fail_release(self, instance: _Instance, release_id: int, reason: str) -> None:
+        if instance.release_failure is None:
+            instance.release_failure = (
+                f"实时核 {instance.number} 输入释放 #{release_id} 失败（{reason}）"
+            )
+            instance.verification_changed.set()
+            logger.error("%s，停止动作提交与心跳", instance.release_failure)
+        if self._instance is instance:
+            self._stopping = True
 
     def _on_health_message(self, params: dict[str, Any]) -> None:
         health = _parse(CoreHealthParams, CORE_HEALTH.name, params)
@@ -842,7 +956,7 @@ class CoreLink:
 
     async def _send_heartbeats(self, instance: _Instance) -> None:
         """当前提交资格有效时按固定周期发 `producer.heartbeat`；资格收回即停发。"""
-        while True:
+        while instance.release_failure is None:
             grant = None if self._grant_source is None else self._grant_source()
             peer = instance.peer
             if grant is not None and grant.is_open and peer is not None and peer.connection.is_open:
@@ -884,13 +998,12 @@ class CoreLink:
             return
         level = logging.INFO if returncode == 0 else logging.WARNING
         logger.log(level, "实时核 %d 已退出，退出码 %d", instance.number, returncode)
-        if returncode == 0:
-            # 实时核只在释放全部输入后以 0 退出。
-            self._release_through(None)
         if self._instance is instance:
             self._instance = None
             self._exited = instance
-            self._clean = returncode == 0
+            self._clean = returncode == 0 and instance.release_failure is None
+            if self._clean:
+                self._release_through(None)
             self._last_returncode = returncode
             self._last_health_at_ns = None
             self._heartbeat_generation = None

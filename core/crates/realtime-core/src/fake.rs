@@ -92,7 +92,7 @@ impl InputBackend for FakeBackend {
         Inject::Done
     }
 
-    fn release(&mut self, input: &HeldInput) {
+    fn release(&mut self, input: &HeldInput) -> bool {
         match input {
             HeldInput::Key(key) => self.key_up(key.scan_code),
             HeldInput::MouseButton(button) => self.mouse_up(button.button),
@@ -100,6 +100,7 @@ impl InputBackend for FakeBackend {
                 axis: axis.axis.clone(),
             })),
         }
+        true
     }
 
     fn act(&mut self, action: &Action) -> Inject {
@@ -138,14 +139,15 @@ impl InputBackend for FakeBackend {
         Inject::Done
     }
 
-    fn end_momentary(&mut self, momentary: &Momentary) {
+    fn end_momentary(&mut self, momentary: &Momentary) -> bool {
         match momentary {
             Momentary::Click { button, .. } => self.mouse_up(*button),
             Momentary::Key { scan_code } => self.key_up(*scan_code),
         }
+        true
     }
 
-    fn released_all(&mut self, reason: ReleaseReason) {
+    fn released_all(&mut self, reason: ReleaseReason, _release_id: u64) {
         self.emit(FakeInputEvent::ReleaseAll(FakeReleaseAll { reason }));
     }
 }

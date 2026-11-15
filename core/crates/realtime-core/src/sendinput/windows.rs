@@ -22,9 +22,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use capture::win::{find_window, query_geometry};
-use core_protocol::messages::{InputResidualParams, MouseButton, ResidualCause};
-use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use capture::win::query_geometry;
+use core_protocol::messages::ResidualCause;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_HOOKCONTROL, OpenInputDesktop,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE,
@@ -33,18 +36,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetForegroundWindow, GetMessageW, GetSystemMetrics, HC_ACTION, IsIconic,
-    IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
-    MSLLHOOKSTRUCT, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    CallNextHookEx, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
+    GetWindowThreadProcessId, HC_ACTION, IsIconic, IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT,
+    LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_SWAPBUTTON, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetWindowsHookExW, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use super::{
     Class, Combo, Desktop, Event, HookState, PhysicalButton, RawEvent, SelfCheck, Target,
-    TargetWindow, VerifyKey, VerifyKeys, VerifyRequest, Win32, self_check_count, verify_residual,
+    TargetWindow, VerifyKey, VerifyKeys, VerifyRequest, Win32, check_release, self_check_count,
 };
 use crate::control::{Control, Notice, Notices};
 use crate::ledger::InputBackend;
@@ -178,16 +181,17 @@ fn on_input_desktop() -> bool {
 
 impl Win32 for RealWin32 {
     fn foreground_target(&self) -> Option<Target> {
-        let selector = self.target.get()?;
-        let window = find_window(&selector).ok()?;
-        let hwnd = window.hwnd;
-        // SAFETY: 句柄来自刚才的枚举；这些调用只读窗口状态，句柄失效时返回假。
+        let (window, captured) = self.target.get()?;
+        let hwnd = HWND(window.handle as *mut std::ffi::c_void);
+        let mut process_id = 0;
+        // SAFETY: Win32 只读窗口状态并把 PID 写入本地变量。失效的句柄不能通过核对。
         let ok = unsafe {
             IsWindow(Some(hwnd)).as_bool()
                 && IsWindowVisible(hwnd).as_bool()
                 && !IsIconic(hwnd).as_bool()
+                && GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) != 0
         };
-        if !ok {
+        if !ok || process_id != window.process_id {
             return None;
         }
         // SAFETY: 只读前台窗口。
@@ -198,8 +202,14 @@ impl Win32 for RealWin32 {
             return None;
         }
         let geometry = query_geometry(hwnd).ok()?;
+        let size = geometry.client.size();
+        if (size.width, size.height, geometry.dpi)
+            != (captured.width, captured.height, captured.dpi)
+        {
+            return None;
+        }
         Some(Target {
-            window: hwnd.0 as isize,
+            window: window.handle,
             client_x: geometry.client.left,
             client_y: geometry.client.top,
         })
@@ -225,21 +235,36 @@ impl Win32 for RealWin32 {
         sent
     }
 
-    fn is_down(&self, key: VerifyKey) -> bool {
+    fn can_verify(&self) -> bool {
+        // SAFETY: 只申请活动桌面的钩子访问权，不切换桌面，也不继承这个句柄。
+        let Ok(desktop) =
+            (unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_HOOKCONTROL) })
+        else {
+            return false;
+        };
+        let mut point = POINT::default();
+        // SAFETY: GetCursorPos 只写本地坐标，在非活动输入桌面上会失败。
+        let active = unsafe { GetCursorPos(&raw mut point) }.is_ok();
+        // SAFETY: 这是本函数刚打开的桌面句柄。
+        let _ = unsafe { CloseDesktop(desktop) };
+        active
+    }
+
+    fn is_down(&self, key: VerifyKey) -> Option<bool> {
         let vk = match key {
-            VerifyKey::Scan(scan) => scan_to_vk(scan),
-            VerifyKey::Mouse(MouseButton::Left) => VK_LBUTTON.0,
-            VerifyKey::Mouse(MouseButton::Right) => VK_RBUTTON.0,
-            VerifyKey::Mouse(MouseButton::Middle) => VK_MBUTTON.0,
+            VerifyKey::Scan(scan) => scan_to_vk(scan)?,
+            VerifyKey::Mouse(PhysicalButton::Left) => VK_LBUTTON.0,
+            VerifyKey::Mouse(PhysicalButton::Right) => VK_RBUTTON.0,
+            VerifyKey::Mouse(PhysicalButton::Middle) => VK_MBUTTON.0,
         };
         // SAFETY: 只读异步按键状态。
         let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
-        (state as u16 & 0x8000) != 0
+        Some((state as u16 & 0x8000) != 0)
     }
 }
 
-/// 扫描码（低字节 + 扩展标志）换算成虚拟键码；换不出时直接当作低字节。
-fn scan_to_vk(scan_code: u16) -> u16 {
+/// 扫描码（低字节 + 扩展标志）换算成虚拟键码；换不出时该项状态不可读。
+fn scan_to_vk(scan_code: u16) -> Option<u16> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VSC_TO_VK_EX, MapVirtualKeyW};
     let sc = if scan_code >> 8 == 0xE0 {
         0xE000 | (scan_code & 0xFF)
@@ -248,7 +273,7 @@ fn scan_to_vk(scan_code: u16) -> u16 {
     };
     // SAFETY: MapVirtualKeyW 只做换算，不访问调用方内存。
     let vk = unsafe { MapVirtualKeyW(u32::from(sc), MAPVK_VSC_TO_VK_EX) };
-    if vk == 0 { scan_code & 0xFF } else { vk as u16 }
+    (vk != 0).then_some(vk as u16)
 }
 
 // ---------------------------------------------------------------- 钩子
@@ -347,7 +372,7 @@ fn classify_and_dispatch(globals: &HookGlobals, raw: RawEvent, injected: bool, o
         Class::OwnInjection => {
             globals.seen.fetch_add(1, Ordering::Release);
         }
-        Class::Takeover | Class::Emergency => {
+        Class::Takeover | Class::Emergency | Class::HookLost => {
             // 不阻塞回调：交给工作线程释放。
             let _ = globals.worker.send(class);
         }
@@ -384,7 +409,10 @@ fn run_hook_loop(ready: &Sender<io::Result<()>>) {
     let _ = ready.send(Ok(()));
     let mut message = MSG::default();
     // SAFETY: 标准的消息循环；GetMessageW 填入本地 MSG。
-    while unsafe { GetMessageW(&raw mut message, None, 0, 0) }.as_bool() {}
+    while unsafe { GetMessageW(&raw mut message, None, 0, 0) }.0 > 0 {}
+    if let Some(globals) = HOOK.get() {
+        let _ = globals.worker.send(Class::HookLost);
+    }
     // SAFETY: 卸载刚装的钩子。
     unsafe {
         let _ = UnhookWindowsHookEx(keyboard);
@@ -475,7 +503,13 @@ pub(crate) fn build_backend(
 ///
 /// 无法创建线程时返回错误。
 pub(crate) fn start(control: &Arc<Control>, post: &Post, wiring: Wiring) -> io::Result<()> {
-    spawn_verify(&wiring.win32, &wiring.verify_keys, post, wiring.verify_rx)?;
+    spawn_verify(
+        control,
+        &wiring.win32,
+        &wiring.verify_keys,
+        post,
+        wiring.verify_rx,
+    )?;
     spawn_hook_worker(control, post, wiring.worker_rx)?;
     let lease_valid = Arc::new(AtomicBool::new(false));
     spawn_lease_poller(control, &lease_valid)?;
@@ -497,35 +531,39 @@ fn session_marker() -> usize {
 }
 
 fn spawn_verify(
+    control: &Arc<Control>,
     win32: &Arc<dyn Win32>,
     verify_keys: &Arc<Mutex<VerifyKeys>>,
     post: &Post,
     requests: Receiver<VerifyRequest>,
 ) -> io::Result<()> {
+    let control = Arc::clone(control);
     let (win32, verify_keys, post) = (Arc::clone(win32), Arc::clone(verify_keys), Arc::clone(post));
     thread::Builder::new()
         .name("input-verify".into())
         .spawn(move || {
             while let Ok(request) = requests.recv() {
-                if request.cause == ResidualCause::Release {
+                if request.cause == ResidualCause::Release
+                    && control
+                        .with_verification(request.release_id, || ((), false))
+                        .is_some()
+                {
                     thread::sleep(VERIFY_DELAY);
                 }
                 let keys = verify_keys
                     .lock()
                     .map(|keys| keys.clone())
                     .unwrap_or_default();
-                let items = verify_residual(win32.as_ref(), &keys.keys, &keys.buttons);
-                if !items.is_empty() {
-                    let residual = InputResidualParams {
-                        cause: request.cause,
-                        reason: request.reason,
-                        items,
-                        checked_at_ns: mono_clock::now_ns(),
-                    };
-                    let mut notices = Notices::default();
-                    notices.0.push(Notice::Residual(residual));
-                    post(notices);
-                }
+                let verified = check_release(
+                    &control,
+                    win32.as_ref(),
+                    &keys,
+                    request,
+                    |residual| post(Notices(vec![Notice::Residual(residual)])),
+                    || thread::sleep(VERIFY_DELAY),
+                );
+                post(Notices(vec![Notice::Verification(verified)]));
+                control.verification_posted(verified.release_id);
             }
         })?;
     Ok(())
@@ -544,6 +582,7 @@ fn spawn_hook_worker(
                 let reason = match class {
                     Class::Takeover => core_protocol::messages::ReleaseReason::Takeover,
                     Class::Emergency => core_protocol::messages::ReleaseReason::EmergencyStop,
+                    Class::HookLost => core_protocol::messages::ReleaseReason::HookLost,
                     Class::OwnInjection | Class::Ignore => continue,
                 };
                 post(control.local_revoke(reason));
@@ -602,6 +641,7 @@ fn spawn_self_check(
                 if check.tick(sent, passed) {
                     log!("self-check: own injections did not pass the hook; hooks may be lost");
                     post(control.local_revoke(core_protocol::messages::ReleaseReason::HookLost));
+                    break;
                 }
             }
         })?;
