@@ -12,8 +12,7 @@ from game_runtime.operator import Clock, OperatorClient, messages
 from game_runtime.scene import SCENE
 from game_runtime.step_control.contracts import PLANNER, POLICY, Policy
 from game_runtime.step_control.controller import StepConfig, StepController
-from game_runtime.step_control.decisions import DecisionKey
-from game_runtime.step_control.supervision import OperatorGoalRelay, PlannerBinding
+from game_runtime.step_control.supervision import OperatorGoalRelay, PlannerBinding, SessionProgress
 
 _INTERRUPTS: Final = frozenset(
     {
@@ -40,7 +39,7 @@ class SessionSignals:
     def __init__(self) -> None:
         self.controller: StepController | None = None
         self.ended = asyncio.Event()
-        self.closed_choices: set[DecisionKey] = set()
+        self.progress = SessionProgress()
         self.operator_goal = OperatorGoalRelay()
         self.planner_binding = PlannerBinding()
 
@@ -107,7 +106,7 @@ def step_plugin_for(
                 ctx.config,
                 core_ready,
                 lambda: ctx.optional(PLANNER),
-                signals.closed_choices,
+                signals.progress,
                 signals.operator_goal,
                 signals.planner_binding,
             )
@@ -119,9 +118,11 @@ def step_plugin_for(
                     signals.controller = None
 
             ctx.register(detach)
-            ctx.register(scene.subscribe(lambda _: controller.wake()))
+            ctx.register(scene.subscribe(controller.observe))
             if operator.session is not None:
                 controller.on_session(operator.session)
+            if scene.latest is not None:
+                controller.observe(scene.latest)
             task = asyncio.create_task(controller.run(), name=ctx.instance_id)
 
             async def stop() -> None:

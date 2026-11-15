@@ -413,6 +413,14 @@ class DecisionRegion(_Model):
     timer: DecisionTimer | None = None
 
 
+class RestartTarget(_Model):
+    """坏结局画面上游戏自带的一步重来入口。"""
+
+    roi: Ident
+    text: Text
+    success_signature: Ident
+
+
 # 参数与快路径
 
 
@@ -540,6 +548,7 @@ class Adapter(_Model):
     screen_types: tuple[ScreenTypeExtension, ...] = ()
     risk: Risk
     decisions: Mapping[Ident, DecisionRegion] = Field(default_factory=dict[Ident, DecisionRegion])
+    restarts: Mapping[Ident, RestartTarget] = Field(default_factory=dict[Ident, RestartTarget])
     rois: Mapping[Ident, Roi] = Field(default_factory=dict[str, Roi])
     pacing: Pacing | None = None
     """本游戏的阅读节奏覆盖；没有即用通用缺省（由使用方定义，G2）。不是标定项。"""
@@ -601,6 +610,27 @@ class Adapter(_Model):
                     pass
                 case _:
                     yield f"decisions.{screen} 须为选择或计时选择画面"
+        for screen, target in self.restarts.items():
+            if screen not in screens:
+                continue
+            if self.generic_type(screen) is not ScreenType.BAD_ENDING or not any(
+                signature.screen == screen and signature.calibrated for signature in self.signatures
+            ):
+                yield f"restarts.{screen} 须为签名已标定的坏结局画面"
+            if not any(
+                signature.id == target.success_signature
+                and signature.calibrated
+                and signature.screen in screens
+                and self.generic_type(signature.screen)
+                not in {
+                    ScreenType.BAD_ENDING,
+                    ScreenType.CUTSCENE,
+                    ScreenType.LOADING,
+                    ScreenType.STUCK,
+                }
+                for signature in self.signatures
+            ):
+                yield f"restarts.{screen}.success_signature 须指向已标定的可核验结果画面"
 
     def _dialogue_box_problems(self) -> Iterator[str]:
         """对白框：写了画面的，画面是对话类，每个画面至多一项；不写画面的至多一项；引用的 ROI 与
@@ -654,6 +684,7 @@ class Adapter(_Model):
             ("risk.screens", self.risk.screens),
             ("risk.returns", self.risk.returns),
             ("decisions", self.decisions),
+            ("restarts", self.restarts),
         ):
             for screen in group:
                 yield f"{field}.{screen}", screen
@@ -672,6 +703,8 @@ class Adapter(_Model):
             yield f"risk.forbidden_zones[{index}]", name
         for screen, target in self.risk.returns.items():
             yield f"risk.returns.{screen}.roi", target.roi
+        for screen, target in self.restarts.items():
+            yield f"restarts.{screen}.roi", target.roi
         for screen, decision in self.decisions.items():
             yield f"decisions.{screen}.options", decision.options
             if decision.prompt is not None:

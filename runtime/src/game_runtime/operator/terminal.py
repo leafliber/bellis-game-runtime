@@ -226,11 +226,24 @@ class TerminalConsole:
                 return [f"释放 #{fields['release_id']} 物理核验 {fields['result']}"]
             case EventKind.DECISION_OPENED:
                 return self._decision(fields)
+            case EventKind.DECISION_UPDATED:
+                rank = "、".join(str(index) for index in fields["candidates"]) or "暂无"
+                return [
+                    f"决策点 {fields['id']} 更新，候选顺序 {rank}，"
+                    f"{self._remaining(fields['deadline_ns'])}。"
+                ]
             case EventKind.DECISION_CHOSEN:
                 return [f"已给出决策点 {fields['id']} 的选择 {fields['index']}"]
             case EventKind.DECISION_CLOSED:
                 index = fields["index"]
                 chosen = "" if index is None else f" {index}"
+                if fields["by"] == "unknown":
+                    result = (
+                        "已发输入，画面结果未知"
+                        if fields.get("executed_at_ns") is not None
+                        else "执行结果未知"
+                    )
+                    return [f"决策点 {fields['id']} {result}。检查画面后用 goal 重新授权。"]
                 return [f"决策点 {fields['id']} 已关闭：{_CLOSED_BY[fields['by']]}{chosen}"]
             case EventKind.ACTION:
                 return [f"动作（{fields['category']}）：{fields['summary']}"]

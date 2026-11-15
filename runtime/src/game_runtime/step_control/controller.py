@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core_protocol import models
 from game_runtime.adapter import Adapter, ScreenType
+from game_runtime.adapter.schema import DecisionTimer
 from game_runtime.channel import ChannelError
 from game_runtime.kernel import ControlGrant, ControlRevokedError
 from game_runtime.ocr import OcrResult, OcrService
@@ -41,7 +42,6 @@ from game_runtime.step_control.contracts import (
 )
 from game_runtime.step_control.decisions import (
     DecisionEvidence,
-    DecisionKey,
     PendingDecision,
     timer_deadline,
 )
@@ -57,7 +57,7 @@ from game_runtime.step_control.risk import (
     text_key,
     verify_ocr,
 )
-from game_runtime.step_control.supervision import OperatorGoalRelay, PlannerBinding
+from game_runtime.step_control.supervision import OperatorGoalRelay, PlannerBinding, SessionProgress
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ class StepController:
         config: StepConfig,
         core_ready: Callable[[], bool],
         planner: Callable[[], PlannerPort | None],
-        closed_choices: set[DecisionKey],
+        progress: SessionProgress,
         operator_goal: OperatorGoalRelay,
         planner_binding: PlannerBinding,
     ) -> None:
@@ -111,16 +111,15 @@ class StepController:
         self._planner = planner
         self._planner_binding = planner_binding
         self._planner_paused = False
+        self._planner_planning = False
         self._pause_reason: str | None = None
         self._operator_goal = operator_goal
         self._wake = asyncio.Event()
         self._work: asyncio.Task[None] | None = None
         self._closed = False
         self._session: messages.Session | None = None
-        self._goal: Goal | None = None
+        self._progress = progress
         self._notes = ""
-        self._steps = 0
-        self._goal_done = False
         self._revision = 0
         self._recent: deque[StepResult] = deque(maxlen=24)
         self._plan: deque[StepProposal] = deque()
@@ -129,7 +128,6 @@ class StepController:
         self._last_action_ns: int | None = None
         self._next_id = 0
         self._pending: PendingDecision | None = None
-        self._closed_choices = closed_choices
         self._decision_prefix = uuid4().hex
         self._decision_count = 0
         self._choice_submitting = False
@@ -137,7 +135,6 @@ class StepController:
         self._language_failed = False
         self._rejected_screen: tuple[str | None, ScreenType] | None = None
         self._rejects = 0
-        self._stuck = False
 
     @property
     def recent(self) -> tuple[StepResult, ...]:
@@ -150,15 +147,30 @@ class StepController:
     def wake(self) -> None:
         self._wake.set()
 
+    def observe(self, update: SceneUpdate) -> None:
+        if (
+            update.state.stability is Stability.STABLE
+            and update.state.verdict is Verdict.SCREEN
+            and (screen := update.state.screen) is not None
+        ):
+            ending = self._progress.ending
+            if update.screen_state.classification.screen_type is ScreenType.BAD_ENDING:
+                if ending is None or ending[0] != screen:
+                    self._progress.ending = (screen, self._operator_goal.revision)
+            else:
+                self._progress.ending = None
+        self.wake()
+
     def on_session(self, session: messages.Session) -> None:
         if self._session == session:
             return
         old = self._session
         self._session = session
         session_id = self.operator.session_id
+        previous_revision = self._operator_goal.revision
         if session_id is not None:
-            self._operator_goal.update(session_id, session.goal)
-        if old is None or old.goal != session.goal:
+            self._operator_goal.update(session_id, session.goal_revision, session.goal)
+        if old is None or self._operator_goal.revision != previous_revision:
             if not self._planner_binding.used:
                 self.set_goal(self._operator_goal.goal)
             else:
@@ -166,15 +178,14 @@ class StepController:
         else:
             # 暂停时保留仍可核对的决策点。之前未提交的动作须重新规划。
             self.interrupt(keep_decision=session.state is not SessionState.ENDED)
+        if not self._progress.choice_held(self._operator_goal):
+            self._progress.unknown_choice_revision = None
 
-    def set_goal(self, goal: Goal | None, *, notes: str = "") -> None:
-        self._goal = goal
+    def set_goal(self, goal: Goal | None, *, notes: str = "", keep_decision: bool = False) -> None:
+        self._progress.select_goal(goal)
         self._notes = notes
-        self._steps = 0
-        self._goal_done = False
-        self._stuck = False
         self._rejects = 0
-        self.interrupt()
+        self.interrupt(keep_decision=keep_decision)
 
     def on_resolved(self, resolved: messages.DecisionResolved) -> None:
         if self._pending is not None and not self._choice_submitting:
@@ -277,18 +288,20 @@ class StepController:
     def _goal_feedback(
         self, kind: Literal["completed", "step-limit", "timeout", "rejected"], detail: str = ""
     ) -> None:
-        if self._goal is not None:
-            self._planner_event(GoalEvent(self._goal.generation, kind, self._steps, detail))
+        if self._progress.goal is not None:
+            self._planner_event(
+                GoalEvent(self._progress.goal.generation, kind, self._progress.steps, detail)
+            )
 
     def _complete_goal(self, update: SceneUpdate, detail: str = "") -> None:
         self._plan.clear()
-        self._goal_done = True
+        self._progress.goal_done = True
         self._record(StepStatus.WAITING, "goal-complete", update)
         self._goal_feedback("completed", detail)
 
     def _step_limit(self, update: SceneUpdate) -> None:
         self._plan.clear()
-        self._stuck = True
+        self._progress.stuck = True
         self._record(StepStatus.STUCK, "goal-step-limit", update)
         self._goal_feedback("step-limit")
 
@@ -302,10 +315,10 @@ class StepController:
     ) -> bool:
         goal, frame = inputs.goal, inputs.scene.frame
         if (
-            self._goal_done
+            self._progress.goal_done
             or goal is None
             or not goal.completion_by_agent
-            or goal != self._goal
+            or goal != self._progress.goal
             or original_session != (self.operator.session_id, self.operator.session)
             or (judgment.generation, judgment.frame_number, judgment.transform_version)
             != (goal.generation, frame.frame_number, frame.transform_version)
@@ -338,10 +351,20 @@ class StepController:
             binding.bind(planner)
         if context.paused and not self._planner_paused:
             self.interrupt(keep_decision=True)
+        pending = self._pending
+        keep_decision = (
+            self._planner_planning
+            and not context.paused
+            and pending is not None
+            and pending.deadline_ns is not None
+        )
         self._planner_paused = context.paused
+        self._planner_planning = (
+            context.paused and context.planning and self._operator_goal.goal is not None
+        )
         self._pause_reason = context.pause_reason
-        if context.goal != self._goal:
-            self.set_goal(context.goal, notes=context.notes)
+        if context.goal != self._progress.goal:
+            self.set_goal(context.goal, notes=context.notes, keep_decision=keep_decision)
         else:
             self._notes = context.notes
 
@@ -350,6 +373,7 @@ class StepController:
         if not self._planner_paused or self._pause_reason != reason:
             self.interrupt()
         self._planner_paused = True
+        self._planner_planning = False
         self._pause_reason = reason
 
     def _allowed(self) -> bool:
@@ -375,6 +399,38 @@ class StepController:
             and self.clock.now_ns() - self._last_action_ns < _ns(interval)
         )
 
+    def _restart_permitted(self, update: SceneUpdate) -> bool:
+        ending = self._progress.ending
+        revision = self._operator_goal.revision
+        if (
+            ending is None
+            or update.state.screen != ending[0]
+            or ending[0] not in self.adapter.restarts
+            or revision <= ending[1]
+            or revision == self._progress.restart_attempt_revision
+            or self._operator_goal.goal is None
+            or update.state.stability is not Stability.STABLE
+        ):
+            return False
+        planner = self._planner()
+        if planner is None or not self._planner_binding.permits(planner):
+            return False
+        context = planner.current()
+        return context.restarting and not context.paused and context.goal is not None
+
+    async def _restart(self, update: SceneUpdate, revision: int) -> None:
+        screen = update.state.screen
+        if screen is None:
+            return
+        target = self.adapter.restarts[screen]
+        proposal = StepProposal(
+            Category.NAVIGATE,
+            Click(TextTarget(text=target.text, roi=target.roi)),
+            ExpectedEffect(EffectKind.SIGNATURE, signature=target.success_signature),
+        )
+        found = await self._locate(update, proposal)
+        await self._issue(update, proposal, found, revision, restart=True)
+
     async def _tick(self, revision: int) -> None:
         self._sync_planner()
         if revision != self._revision:
@@ -385,7 +441,10 @@ class StepController:
             self._close_decision("withdrawn")
             self._record(StepStatus.REJECTED, "decision-expired")
             return
-        if self._planner_paused:
+        if self._progress.choice_held(self._operator_goal):
+            self._record(StepStatus.WAITING, "choice-awaiting-authorization")
+            return
+        if self._planner_paused and not self._planner_planning:
             self._record(StepStatus.WAITING, self._pause_reason or "planner-paused")
             return
         if not self._allowed():
@@ -402,23 +461,23 @@ class StepController:
         if update.state.playing:
             since = update.state.playing_since_ns
             if since is not None and now - since >= _ns(self.config.cutscene_timeout):
-                self._stuck = True
+                self._progress.stuck = True
                 self._record(StepStatus.STUCK, "cutscene-timeout", update)
             self._plan.clear()
             return
-        if self._stuck or self._language_failed or self._goal_done:
+        if self._progress.stuck or self._language_failed or self._progress.goal_done:
             return
-        goal = self._goal
+        goal = self._progress.goal
         if goal is not None and goal.deadline_ns is not None and now >= goal.deadline_ns:
             self._plan.clear()
-            self._stuck = True
+            self._progress.stuck = True
             self._record(StepStatus.STUCK, "goal-timeout", update)
             self._goal_feedback("timeout")
             return
         if update.state.verdict is Verdict.SCREEN and any(
-            choice[0] != update.state.screen for choice in self._closed_choices
+            choice[0] != update.state.screen for choice in self._progress.closed_choices
         ):
-            self._closed_choices.clear()
+            self._progress.closed_choices.clear()
         timed = (
             update.screen_state.classification.screen_type is ScreenType.TIMED_CHOICE
             and update.screen_state.classification.source is ScreenSource.SIGNATURE
@@ -435,6 +494,11 @@ class StepController:
             return
         if pending is not None:
             await self._advance_decision(update, pending, revision)
+            return
+        if self._planner_planning:
+            if timed and update.observation_scope is not self._last_proposed:
+                self._last_proposed = update.observation_scope
+                await self._open_from_scene(update, revision)
             return
         if self._waiting_time():
             return
@@ -454,7 +518,11 @@ class StepController:
             ):
                 self._complete_goal(latest)
             return
-        at_limit = goal is not None and goal.max_steps is not None and self._steps >= goal.max_steps
+        at_limit = (
+            goal is not None
+            and goal.max_steps is not None
+            and self._progress.steps >= goal.max_steps
+        )
         if at_limit:
             self._plan.clear()
             if (
@@ -466,16 +534,21 @@ class StepController:
             ):
                 self._step_limit(update)
                 return
+        if update.screen_state.restrictions & STOPPED:
+            self._plan.clear()
+            if self._restart_permitted(update):
+                if update.observation_scope is not self._last_proposed:
+                    self._last_proposed = update.observation_scope
+                    await self._restart(update, revision)
+            else:
+                self._record(StepStatus.WAITING, "screen-blocked", update)
+            return
         if requires_choice(update):
             self._plan.clear()
             if update.observation_scope is self._last_proposed:
                 return
             self._last_proposed = update.observation_scope
             await self._open_from_scene(update, revision)
-            return
-        if update.screen_state.restrictions & STOPPED:
-            self._plan.clear()
-            self._record(StepStatus.WAITING, "screen-blocked", update)
             return
         if self._plan and update.observation_scope is not self._verified_scope:
             self._plan.clear()
@@ -543,7 +616,12 @@ class StepController:
 
     def _inputs(self, update: SceneUpdate, decision: DecisionView | None = None) -> PolicyInput:
         return PolicyInput(
-            update, update.screen_state.text_targets, self._goal, self._notes, self.recent, decision
+            update,
+            update.screen_state.text_targets,
+            self._progress.goal,
+            self._notes,
+            self.recent,
+            decision,
         )
 
     async def _read_policy_context(self, update: SceneUpdate) -> SceneUpdate:
@@ -593,7 +671,7 @@ class StepController:
         self._rejects = self._rejects + 1 if self._rejected_screen == screen else 1
         self._rejected_screen = screen
         if self._rejects >= self.config.max_rejections:
-            self._stuck = True
+            self._progress.stuck = True
             self._record(StepStatus.STUCK, "repeated-rejections", update, category)
 
     async def _locate(self, update: SceneUpdate, proposal: StepProposal) -> Located:
@@ -646,6 +724,8 @@ class StepController:
     def _require_authority(self, revision: int) -> None:
         if revision != self._revision or not self._allowed():
             raise ActionRefusedError("operator-permission")
+        if self._progress.choice_held(self._operator_goal):
+            raise ActionRefusedError("choice-awaiting-authorization")
         if not self._core_ready():
             raise ActionRefusedError("core-lease")
         planner = self._planner()
@@ -657,21 +737,21 @@ class StepController:
             context = planner.current()
             if context.paused:
                 raise ActionRefusedError("planner-paused")
-            if context.goal != self._goal:
+            if context.goal != self._progress.goal:
                 raise ActionRefusedError("goal-changed")
         if (
-            self._goal is not None
-            and self._goal.deadline_ns is not None
-            and self.clock.now_ns() >= self._goal.deadline_ns
+            self._progress.goal is not None
+            and self._progress.goal.deadline_ns is not None
+            and self.clock.now_ns() >= self._progress.goal.deadline_ns
         ):
             raise ActionRefusedError("goal-timeout")
 
     def _current(self, update: SceneUpdate, found: Located, revision: int) -> SceneUpdate:
         self._require_authority(revision)
         if (
-            self._goal is not None
-            and self._goal.max_steps is not None
-            and self._steps >= self._goal.max_steps
+            self._progress.goal is not None
+            and self._progress.goal.max_steps is not None
+            and self._progress.steps >= self._progress.goal.max_steps
         ):
             raise ActionRefusedError("goal-step-limit")
         current = self.scene.with_ocr(update, found.reads)
@@ -699,6 +779,14 @@ class StepController:
             await self.clock.sleep_until(min(end, self.clock.now_ns() + _ns(0.025)))
         return None
 
+    async def _read_timer(self, update: SceneUpdate, timer: DecisionTimer) -> tuple[OcrResult, int]:
+        timing = await self.ocr.recognize(update.frame, timer.roi)
+        verify_ocr(update, timing)
+        deadline = timer_deadline(timer, timing.text, update.frame.capture_ns)
+        if deadline is None:
+            raise ActionRefusedError("invalid-decision-timer")
+        return timing, deadline
+
     async def _scene_evidence(
         self, update: SceneUpdate
     ) -> tuple[SceneUpdate, DecisionEvidence, tuple[OcrResult, ...]]:
@@ -715,16 +803,13 @@ class StepController:
             prompt = read.text.strip()[:2000] or prompt
         deadline = None
         if declared.timer is not None:
-            timing = await self.ocr.recognize(update.frame, declared.timer.roi)
+            timing, deadline = await self._read_timer(update, declared.timer)
             reads.append(timing)
-            deadline = timer_deadline(declared.timer, timing.text, update.frame.capture_ns)
         for read in reads:
             verify_ocr(update, read)
         here = self.scene.with_ocr(update, reads)
         if here is None:
             raise ActionRefusedError("scene-changed")
-        if declared.timer is not None and deadline is None:
-            raise ActionRefusedError("invalid-decision-timer")
         lines = tuple(
             line
             for line in options.lines
@@ -746,8 +831,35 @@ class StepController:
         except ActionRefusedError as error:
             self._reject(str(error), update)
 
+    def _can_preview(self, update: SceneUpdate, evidence: DecisionEvidence, revision: int) -> bool:
+        if (
+            update.state.screen != evidence.screen
+            or update.state.playing
+            or not self._fresh(update)
+            or revision != self._revision
+            or not self._allowed()
+            or not self._core_ready()
+            or self._progress.choice_held(self._operator_goal)
+        ):
+            return False
+        planner = self._planner()
+        if not self._planner_binding.permits(planner):
+            return False
+        if planner is None:
+            return True
+        context = planner.current()
+        return not context.paused or (
+            context.planning
+            and self._operator_goal.goal is not None
+            and evidence.deadline_ns is not None
+            and update.screen_state.classification.source is ScreenSource.SIGNATURE
+            and update.screen_state.classification.screen_type is ScreenType.TIMED_CHOICE
+        )
+
     async def _open(self, update: SceneUpdate, evidence: DecisionEvidence, revision: int) -> None:
-        if evidence.identity in self._closed_choices or self._pending is not None:
+        if evidence.identity in self._progress.closed_choices or self._pending is not None:
+            return
+        if not self._can_preview(update, evidence, revision):
             return
         self._decision_count += 1
         identity = f"{self._decision_prefix}-{self._decision_count}"
@@ -773,19 +885,13 @@ class StepController:
                     ranking = self._validated_rank(rank.ranked_options, evidence)
         # 排名可以晚于同一倒计时内的下一帧。执行之前仍按新帧重新定位。
         latest = self.scene.latest
-        if (
-            latest is None
-            or latest.state.screen != evidence.screen
-            or latest.state.playing
-            or revision != self._revision
-            or not self._allowed()
-        ):
+        if latest is None or not self._can_preview(latest, evidence, revision):
             self._planner_event(
                 DecisionEvent(session, identity, "withdrawn", view, update.frame.frame_number)
             )
             raise ActionRefusedError("scene-changed")
         if evidence.deadline_ns is not None and self.clock.now_ns() >= evidence.deadline_ns:
-            self._closed_choices.add(evidence.identity)
+            self._progress.closed_choices.add(evidence.identity)
             self._planner_event(
                 DecisionEvent(session, identity, "withdrawn", view, update.frame.frame_number)
             )
@@ -814,18 +920,43 @@ class StepController:
             return ranking
         return ()
 
-    def _refresh_rank(self, pending: PendingDecision, now: int) -> None:
+    def _publish_decision_update(
+        self, pending: PendingDecision, update: SceneUpdate, old_deadline: int | None
+    ) -> None:
         planner = self._planner()
         session = self.operator.session_id
-        if (
-            planner is not None
-            and session is not None
-            and pending.deadline_ns is not None
-            and now >= pending.deadline_ns - _ns(self.config.decision_margin)
-        ):
+        previous = pending.candidates
+        shortened = pending.deadline_ns != old_deadline
+        if planner is not None and session is not None and self._planner_binding.permits(planner):
+            if shortened:
+                self._planner_event(
+                    DecisionEvent(
+                        session, pending.id, "opened", pending.view, update.frame.frame_number
+                    )
+                )
             pending.candidates = self._validated_rank(
                 planner.candidates(session, pending.id), pending.evidence
             )
+        if shortened or pending.candidates != previous:
+            self.operator.update_decision(
+                messages.DecisionUpdated(
+                    id=pending.id, candidates=pending.candidates, deadline_ns=pending.deadline_ns
+                )
+            )
+
+    async def _refresh_decision_timer(self, update: SceneUpdate, pending: PendingDecision) -> None:
+        if pending.deadline_ns is None or update.frame.frame_number <= max(
+            pending.opened_frame, pending.last_timing_frame
+        ):
+            return
+        timer = self.adapter.decisions[pending.evidence.screen].timer
+        if timer is None:
+            raise ActionRefusedError("invalid-decision-timer")
+        timing, deadline = await self._read_timer(update, timer)
+        if self.scene.with_ocr(update, (timing,)) is None:
+            raise ActionRefusedError("scene-changed")
+        pending.refresh_deadline(deadline)
+        pending.last_timing_frame = update.frame.frame_number
 
     async def _advance_decision(
         self, update: SceneUpdate, pending: PendingDecision, revision: int
@@ -833,27 +964,34 @@ class StepController:
         if update.state.screen != pending.evidence.screen:
             self._close_decision("withdrawn")
             return
-        now = self.clock.now_ns()
         margin = _ns(self.config.decision_margin)
-        self._refresh_rank(pending, now)
-        choice = pending.choose(now, margin)
-        if choice is None:
-            if pending.deadline_ns is not None and now >= pending.deadline_ns - margin:
-                self._record(StepStatus.REJECTED, "decision-no-verified-candidate", update)
-                self._close_decision("withdrawn")
-            return
-        if update.frame.frame_number <= pending.opened_frame or self._waiting_time():
-            return
-        index, by = choice
         try:
+            old_deadline = pending.deadline_ns
+            await self._refresh_decision_timer(update, pending)
+            self._publish_decision_update(pending, update, old_deadline)
+            now = self.clock.now_ns()
+            if pending.deadline_ns is not None and now >= pending.deadline_ns:
+                self._close_decision("withdrawn")
+                return
+            if self._planner_paused:
+                return
+            choice = pending.choose(now, margin)
+            if choice is None:
+                if pending.deadline_ns is not None and now >= pending.deadline_ns - margin:
+                    self._record(StepStatus.REJECTED, "decision-no-verified-candidate", update)
+                    self._close_decision("withdrawn")
+                return
+            if update.frame.frame_number <= pending.opened_frame or self._waiting_time():
+                return
+            index, by = choice
             if pending.evidence.proposed is None:
                 here, evidence, reads = await self._scene_evidence(update)
                 if evidence.identity != pending.evidence.identity:
                     raise ActionRefusedError("decision-instance-changed")
+                old_deadline = pending.deadline_ns
                 pending.refresh_deadline(evidence.deadline_ns)
-                now = self.clock.now_ns()
-                self._refresh_rank(pending, now)
-                refreshed = pending.choose(now, margin)
+                self._publish_decision_update(pending, here, old_deadline)
+                refreshed = pending.choose(self.clock.now_ns(), margin)
                 if refreshed is None:
                     raise ActionRefusedError("decision-no-verified-candidate")
                 index, by = refreshed
@@ -905,10 +1043,16 @@ class StepController:
         pending, self._pending = self._pending, None
         if pending is None:
             return
-        if consume:
-            self._closed_choices.add(pending.evidence.identity)
+        if by == "unknown":
+            self._progress.unknown_choice_revision = self._operator_goal.revision
+        elif consume:
+            self._progress.closed_choices.add(pending.evidence.identity)
         with suppress(ChannelError):
-            self.operator.close_decision(messages.DecisionClosed(id=pending.id, index=index, by=by))
+            self.operator.close_decision(
+                messages.DecisionClosed(
+                    id=pending.id, index=index, by=by, executed_at_ns=pending.executed_at_ns
+                )
+            )
         session = self.operator.session_id
         if session is not None:
             confirmed = by if by in ("operator", "default") else None
@@ -919,10 +1063,11 @@ class StepController:
                     session,
                     pending.id,
                     "confirmed" if by in ("operator", "default") else by,
-                    pending.evidence.view,
+                    pending.view,
                     frame,
                     index,
                     confirmed,
+                    pending.executed_at_ns,
                 )
             )
 
@@ -934,6 +1079,7 @@ class StepController:
         revision: int,
         *,
         decision: PendingDecision | None = None,
+        restart: bool = False,
     ) -> StepStatus:
         auto_choice = decision is not None and decision.evidence.proposed is None
         if (
@@ -949,7 +1095,16 @@ class StepController:
         ):
             raise ActionRefusedError("effect-already-present")
         here = self._current(update, found, revision)
-        if assess(self.adapter, here, proposal, found, authorized_decision=decision is not None):
+        if restart and not self._restart_permitted(here):
+            raise ActionRefusedError("restart-not-authorized")
+        if assess(
+            self.adapter,
+            here,
+            proposal,
+            found,
+            authorized_decision=decision is not None,
+            authorized_restart=restart,
+        ):
             raise ActionRefusedError("decision-required")
         if self._waiting_time():
             raise ActionRefusedError("action-interval")
@@ -959,7 +1114,7 @@ class StepController:
         for bound in (
             None if session is None else session.ends_at_ns,
             None if decision is None else decision.deadline_ns,
-            None if self._goal is None else self._goal.deadline_ns,
+            None if self._progress.goal is None else self._progress.goal.deadline_ns,
         ):
             if bound is not None:
                 end = min(end, bound)
@@ -969,7 +1124,9 @@ class StepController:
         action = core_action(proposal, found, self._next_id)
         category = Category.SELECT if decision is not None else proposal.category
         self._last_action_ns = started
-        self._steps += 1
+        self._progress.steps += 1
+        if restart:
+            self._progress.restart_attempt_revision = self._operator_goal.revision
         self._choice_submitting = decision is not None
         status, detail = StepStatus.UNKNOWN, "submission-unknown"
         receipt: models.Executed | models.Dropped | models.Uncertain | None = None
@@ -991,14 +1148,19 @@ class StepController:
                     if isinstance(receipt, models.Dropped):
                         status, detail = StepStatus.REJECTED, receipt.reason.value
                     elif isinstance(receipt, models.Executed):
-                        detail = "effect-unknown"
+                        if decision is not None:
+                            decision.executed_at_ns = receipt.at_ns
+                        detail = "executed-effect-unknown"
                     else:
                         detail = "receipt-uncertain"
             if isinstance(receipt, models.Executed):
                 status = await self._verify(
                     here, proposal.expected, receipt.at_ns, decision, revision
                 )
-                detail = "screen-verified" if status is StepStatus.VERIFIED else status.value
+                if status is StepStatus.VERIFIED:
+                    detail = "screen-verified"
+                elif status is not StepStatus.UNKNOWN:
+                    detail = status.value
         except ControlRevokedError:
             status, detail = StepStatus.REJECTED, "producer-revoked"
         except (TimeoutError, ChannelError):
@@ -1030,8 +1192,10 @@ class StepController:
         until = self.clock.now_ns() + _ns(self.config.effect_timeout)
         last = before.frame.frame_number
         unchanged = False
-        if decision is not None and decision.deadline_ns is not None:
-            until = min(until, decision.deadline_ns)
+        deadline = None if decision is None else decision.deadline_ns
+        if deadline is not None and executed_ns >= deadline:
+            return StepStatus.UNKNOWN
+        early_destination: str | None = None
         while self._allowed() and revision == self._revision and self.clock.now_ns() < until:
             after = self.scene.latest
             if (
@@ -1039,27 +1203,39 @@ class StepController:
                 and after.frame.frame_number > last
                 and executed_ns < after.frame.capture_ns < until
                 and self._fresh(after)
-                and after.state.stability is Stability.STABLE
                 and not after.state.playing
             ):
                 last = after.frame.frame_number
                 if after.frame.transform_version != before.frame.transform_version:
                     return StepStatus.UNKNOWN
-                unchanged = after.observation_scope is before.observation_scope
                 if decision is not None and decision.evidence.proposed is None:
-                    verified = (
-                        after.state.verdict is Verdict.SCREEN
+                    destination = (
+                        after.state.screen
+                        if after.state.verdict is Verdict.SCREEN
                         and after.state.screen != decision.evidence.screen
+                        else None
                     )
-                elif expected.kind is EffectKind.CHANGED:
-                    verified = (
-                        before.frame.pixels != after.frame.pixels
-                        and after.state.verdict is not Verdict.AMBIGUOUS
+                    before_deadline = deadline is None or after.frame.capture_ns < deadline
+                    # 过了截止才稳定时，须有执行后、截止前已进入同一画面的签名证据。
+                    if before_deadline or after.state.screen == decision.evidence.screen:
+                        early_destination = destination
+                    verified = after.state.stability is Stability.STABLE and (
+                        destination is not None
+                        and (before_deadline or destination == early_destination)
                     )
-                elif expected.kind is EffectKind.UNCHANGED:
-                    verified = unchanged
                 else:
-                    verified = not unchanged and await self._matches(expected, after)
+                    verified = False
+                    if after.state.stability is Stability.STABLE:
+                        unchanged = after.observation_scope is before.observation_scope
+                        if expected.kind is EffectKind.CHANGED:
+                            verified = (
+                                before.frame.pixels != after.frame.pixels
+                                and after.state.verdict is not Verdict.AMBIGUOUS
+                            )
+                        elif expected.kind is EffectKind.UNCHANGED:
+                            verified = unchanged
+                        else:
+                            verified = not unchanged and await self._matches(expected, after)
                 if verified:
                     self._verified_scope = after.observation_scope
                     return StepStatus.VERIFIED

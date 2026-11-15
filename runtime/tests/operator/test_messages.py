@@ -32,11 +32,13 @@ SAMPLES: list[tuple[type[BaseModel], dict[str, Any]]] = [
             "confirmed": ["window-visible"],
             "goal": None,
             "ends_at_ns": 1,
+            "goal_revision": 4,
         },
     ),
     (messages.DecisionOpened, opened()),
+    (messages.DecisionUpdated, {"id": "d1", "candidates": [1, 0], "deadline_ns": 4_000_000_000}),
     (messages.DecisionResolved, {"id": "d1", "index": 1}),
-    (messages.DecisionClosed, {"id": "d1", "index": None, "by": "withdrawn"}),
+    (messages.DecisionClosed, {"id": "d1", "index": None, "by": "unknown", "executed_at_ns": 1}),
     (messages.Action, {"category": "advance", "summary": "回车"}),
 ]
 
@@ -82,6 +84,8 @@ def test_closing_by_withdrawal_or_unknown_has_no_index() -> None:
         messages.DecisionClosed(id="d", index=None, by=by)
         with pytest.raises(ValidationError):
             messages.DecisionClosed(id="d", index=0, by=by)
+    with pytest.raises(ValidationError, match="没有已执行的动作"):
+        messages.DecisionClosed(id="d", index=None, by="withdrawn", executed_at_ns=1)
 
 
 def test_unknown_states_and_categories_are_refused() -> None:

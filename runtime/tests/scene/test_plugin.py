@@ -511,7 +511,7 @@ def test_new_pixels_invalidate_old_evidence_before_analysis_finishes(data_dir: P
 
 def test_no_signature_can_use_observed_dialogue_with_same_frame_ocr(synthetic: Adapter) -> None:
     adapter = Adapter.model_validate(
-        {**synthetic.model_dump(), "signatures": (), "dialogue_boxes": ()}
+        {**synthetic.model_dump(), "signatures": (), "dialogue_boxes": (), "restarts": {}}
     )
     analyzer = SceneAnalyzer(SignatureJudge(adapter, {}))
     hub = SceneHub(problems=(), uncalibrated=())

@@ -1,7 +1,7 @@
 """决策点的身份、计时与选项。选项坐标由控制器在执行前重新读取。"""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from game_runtime.adapter.schema import DecisionTimer
@@ -77,6 +77,13 @@ class PendingDecision:
     deadline_ns: int | None
     opened_frame: int
     selected: int | None = None
+    selected_at_ns: int = 0
+    last_timing_frame: int = 0
+    executed_at_ns: int | None = None
+
+    @property
+    def view(self) -> DecisionView:
+        return replace(self.evidence.view, deadline_ns=self.deadline_ns)
 
     def refresh_deadline(self, deadline: int | None) -> None:
         if deadline is not None and self.deadline_ns is not None:
@@ -90,6 +97,7 @@ class PendingDecision:
             and (self.deadline_ns is None or now_ns < self.deadline_ns - margin_ns)
         ):
             self.selected = resolved.index
+            self.selected_at_ns = now_ns
 
     def choose(
         self, now_ns: int, margin_ns: int
@@ -97,6 +105,7 @@ class PendingDecision:
         if self.deadline_ns is not None:
             if now_ns >= self.deadline_ns:
                 return None
-            if now_ns >= self.deadline_ns - margin_ns and self.selected is None:
+            cutoff = self.deadline_ns - margin_ns
+            if now_ns >= cutoff and (self.selected is None or self.selected_at_ns >= cutoff):
                 return (self.candidates[0], "default") if self.candidates else None
         return None if self.selected is None else (self.selected, "operator")

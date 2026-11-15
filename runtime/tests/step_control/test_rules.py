@@ -117,6 +117,47 @@ def test_forbidden_text_and_business_choice_are_independent() -> None:
     assert not assess(adapter, choice, click, target("测试选项", box), authorized_decision=True)
 
 
+def test_restart_needs_an_exact_signed_target_and_respects_other_restrictions() -> None:
+    adapter = load_adapter(GAMES_DIR / "synthetic-game")
+    ending = frame("bad-ending", ScreenType.BAD_ENDING)
+    restart = replace(
+        proposal("重来", "ending-retry"),
+        expected=ExpectedEffect(EffectKind.SIGNATURE, signature="dialogue"),
+    )
+    box = adapter.roi("ending-retry").to_pixels(1280, 720)
+    found = target("重来", box)
+    assert not assess(adapter, ending, restart, found, authorized_restart=True)
+    with pytest.raises(ActionRefusedError, match="screen-blocked"):
+        assess(adapter, ending, restart, found)
+    with pytest.raises(ActionRefusedError, match="screen-blocked"):
+        assess(
+            adapter,
+            ending,
+            restart,
+            target("重来", PixelRect(20, 30, 40, 50)),
+            authorized_restart=True,
+        )
+    restriction = ScreenObservation(screen_type=ScreenType.SETTINGS, confidence=0.9)
+    conflicting = replace(ending.screen_state, observations=(restriction,))
+    with pytest.raises(ActionRefusedError, match="screen-blocked"):
+        assess(
+            adapter,
+            replace(ending, screen_state=conflicting),
+            restart,
+            found,
+            authorized_restart=True,
+        )
+    risk = adapter.risk.model_copy(update={"forbidden_words": ("重来",)})
+    with pytest.raises(ActionRefusedError, match="target-text-forbidden"):
+        assess(
+            adapter.model_copy(update={"risk": risk}),
+            ending,
+            restart,
+            found,
+            authorized_restart=True,
+        )
+
+
 def test_timer_validation_and_single_selection_cutoff() -> None:
     timer = DecisionTimer(roi="timer-text", prefix="剩余", suffix="秒")
     assert timer_deadline(timer, "剩余 ４.６ 秒", 100) == 4_500_000_100
@@ -133,3 +174,20 @@ def test_timer_validation_and_single_selection_cutoff() -> None:
     assert decision.choose(80, 10) is None
     decision.candidates = ()
     assert decision.choose(74, 10) is None
+
+
+def test_shortened_deadline_rechecks_an_operator_reply_received_under_the_old_cutoff() -> None:
+    options = (
+        OcrLine("甲", PixelRect(1, 1, 3, 3), 1),
+        OcrLine("乙", PixelRect(1, 4, 3, 6), 1),
+    )
+    evidence = DecisionEvidence("timed-choice", "选择", options, 100)
+    original = PendingDecision("id", evidence, (1, 0), 100, 1)
+    early_enough = replace(original)
+    late = messages.DecisionResolved(id="id", index=0)
+    original.accept(late, 85, 10)
+    original.refresh_deadline(90)
+    assert original.choose(86, 10) == (1, "default")
+    early_enough.accept(late, 78, 10)
+    early_enough.refresh_deadline(90)
+    assert early_enough.choose(86, 10) == (0, "operator")

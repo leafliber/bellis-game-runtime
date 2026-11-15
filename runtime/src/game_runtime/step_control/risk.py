@@ -13,6 +13,7 @@ from game_runtime.scene import SceneService, SceneUpdate, ScreenSource
 from game_runtime.step_control.contracts import (
     Category,
     Click,
+    EffectKind,
     Press,
     Scroll,
     StepProposal,
@@ -171,6 +172,32 @@ def _safe_return(
     return _inside(rect, found.line.box)
 
 
+def _built_in_restart(
+    adapter: Adapter, update: SceneUpdate, proposal: StepProposal, found: Located
+) -> bool:
+    screen = update.state.screen
+    target = None if screen is None else adapter.restarts.get(screen)
+    if (
+        target is None
+        or update.screen_state.classification.source is not ScreenSource.SIGNATURE
+        or update.screen_state.classification.screen_type is not ScreenType.BAD_ENDING
+        or update.screen_state.restrictions - {ScreenType.BAD_ENDING}
+        or proposal.category is not Category.NAVIGATE
+        or proposal.action != Click(TextTarget(text=target.text, roi=target.roi))
+        or proposal.expected.kind is not EffectKind.SIGNATURE
+        or proposal.expected.signature != target.success_signature
+        or found.line is None
+        or text_key(found.line.text) != text_key(target.text)
+    ):
+        return False
+    rect = adapter.roi(target.roi).to_pixels(update.frame.width, update.frame.height)
+    box = found.line.box
+    return _inside(rect, box) and found.point == (
+        (box.left + box.right) // 2,
+        (box.top + box.bottom) // 2,
+    )
+
+
 def assess(
     adapter: Adapter,
     update: SceneUpdate,
@@ -178,13 +205,18 @@ def assess(
     found: Located,
     *,
     authorized_decision: bool = False,
+    authorized_restart: bool = False,
 ) -> bool:
     """返回是否仍需打开决策点。异常表示拒绝。"""
     status = update.screen_state
     classification = status.classification
     restrictions = status.restrictions | {classification.screen_type}
     rule = None if update.state.screen is None else adapter.risk.screens.get(update.state.screen)
-    if update.state.playing or restrictions & STOPPED or rule is ScreenRisk.BLOCKED:
+    if update.state.playing or rule is ScreenRisk.BLOCKED:
+        raise ActionRefusedError("screen-blocked")
+    if restrictions & STOPPED and (
+        not authorized_restart or not _built_in_restart(adapter, update, proposal, found)
+    ):
         raise ActionRefusedError("screen-blocked")
     if (restrictions & RETURN_ONLY or rule is ScreenRisk.RETURN_ONLY) and not _safe_return(
         adapter, update, proposal, found

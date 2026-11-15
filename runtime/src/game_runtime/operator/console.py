@@ -161,6 +161,7 @@ class EventKind(StrEnum):
     INPUT_RESIDUAL = "input_residual"
     INPUT_VERIFICATION = "input_verification"
     DECISION_OPENED = "decision_opened"
+    DECISION_UPDATED = "decision_updated"
     DECISION_CHOSEN = "decision_chosen"
     DECISION_CLOSED = "decision_closed"
     ACTION = "action"
@@ -284,6 +285,7 @@ class OperatorConsole:
         self._answered = 0
         self._state = SessionState.WAITING
         self._goal: str | None = None
+        self._goal_revision = 0
         self._ends_at_ns: int | None = None
         self._token = 0
         self._granted: int | None = None
@@ -399,6 +401,7 @@ class OperatorConsole:
             confirmed=self.confirmed,
             goal=self._goal,
             ends_at_ns=self._ends_at_ns,
+            goal_revision=self._goal_revision,
         )
 
     def add_listener(self, listener: Listener) -> None:
@@ -572,7 +575,8 @@ class OperatorConsole:
         if goal is not None and len(goal) > 2000:
             raise ConsoleError("目标太长（至多 2000 字）")
         self._goal = goal
-        self._emit(EventKind.GOAL, goal=goal)
+        self._goal_revision += 1
+        self._emit(EventKind.GOAL, goal=goal, goal_revision=self._goal_revision)
         self._publish()
 
     def choose(self, index: int) -> messages.DecisionResolved:
@@ -754,6 +758,7 @@ class OperatorConsole:
         peer = RpcPeer(connection, timeout=self.options.rpc_timeout)
         handlers: Sequence[tuple[str, Callable[[dict[str, Any]], None]]] = (
             (messages.DECISION_OPENED, lambda params: self._on_decision_opened(peer, params)),
+            (messages.DECISION_UPDATED, lambda params: self._on_decision_updated(peer, params)),
             (messages.DECISION_CLOSED, lambda params: self._on_decision_closed(peer, params)),
             (messages.ACTION, lambda params: self._on_action(peer, params)),
         )
@@ -839,6 +844,30 @@ class OperatorConsole:
         self._seen.add(decision.id)
         self._open[decision.id] = decision
         self._emit(EventKind.DECISION_OPENED, **decision.params())
+
+    def _on_decision_updated(self, peer: RpcPeer, params: dict[str, Any]) -> None:
+        if self._main is not peer:
+            return
+        update = _parse(messages.DecisionUpdated, messages.DECISION_UPDATED, params)
+        if update is None or (current := self._open.get(update.id)) is None:
+            return
+        deadline = update.deadline_ns
+        if (deadline is None) != (current.deadline_ns is None):
+            return
+        if (
+            deadline is not None
+            and current.deadline_ns is not None
+            and deadline > current.deadline_ns
+        ):
+            return
+        decision = _parse(
+            messages.DecisionOpened,
+            messages.DECISION_UPDATED,
+            current.params() | update.params(),
+        )
+        if decision is not None and decision != current:
+            self._open[update.id] = decision
+            self._emit(EventKind.DECISION_UPDATED, **decision.params())
 
     def _on_decision_closed(self, peer: RpcPeer, params: dict[str, Any]) -> None:
         if self._main is not peer:

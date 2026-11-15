@@ -43,10 +43,11 @@ def game_at(width: int = 1280, height: int = 720, *, target: str | None = None) 
 
 
 def with_signatures(adapter: Adapter, *signatures: dict[str, Any]) -> Adapter:
-    """按 `adapter` 的 ROI 与画面另写签名；对白框引用原来的签名，一并去掉。"""
+    """按 `adapter` 的 ROI 与画面另写签名，去掉引用原签名的对白框与重来入口。"""
     data = adapter.model_dump(mode="python")
     data["signatures"] = list(signatures)
     data["dialogue_boxes"] = []
+    data["restarts"] = {}
     return Adapter.model_validate(data)
 
 
