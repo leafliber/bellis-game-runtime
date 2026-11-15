@@ -207,6 +207,8 @@ class PlannerContext:
     notes: str = ""
     paused: bool = False
     pause_reason: str | None = None
+    planning: bool = False
+    restarting: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +220,7 @@ class DecisionEvent:
     frame_number: int
     index: int | None = None
     by: Literal["operator", "default"] | None = None
+    executed_at_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,6 +14,8 @@ SESSION: Final = "operator.session"
 """控制台 → 主进程，通知：会话状态。连上后立即发一次，此后每次变化都发。"""
 DECISION_OPENED: Final = "operator.decision_opened"
 """主进程 → 控制台，通知：打开一个决策点。"""
+DECISION_UPDATED: Final = "operator.decision_updated"
+"""主进程 → 控制台，通知：已打开决策点的排行或截止时刻更新。"""
 DECISION_RESOLVED: Final = "operator.decision_resolved"
 """控制台 → 主进程，通知：操作员的选择。"""
 DECISION_CLOSED: Final = "operator.decision_closed"
@@ -58,6 +60,8 @@ class Session(_Message):
     """当前目标的文字；没有时为 None。"""
     ends_at_ns: NonNegative | None
     """到时的时刻；还没开始时为 None。"""
+    goal_revision: NonNegative = 0
+    """本会话的目标指令序号。每次提交或清除递增。"""
 
 
 class DecisionOption(_Message):
@@ -102,6 +106,12 @@ class DecisionResolved(_Message):
     index: NonNegative
 
 
+class DecisionUpdated(_Message):
+    id: Text
+    candidates: tuple[NonNegative, ...]
+    deadline_ns: NonNegative | None
+
+
 class DecisionClosed(_Message):
     """`operator.decision_closed` 的 params。"""
 
@@ -110,11 +120,15 @@ class DecisionClosed(_Message):
     """确认执行的选项，撤回或结果未知时为 None。"""
     by: Literal["operator", "default", "withdrawn", "unknown"]
     """确认按操作员选择或缺省候选执行，执行前撤回，或执行结果未知。"""
+    executed_at_ns: NonNegative | None = None
+    """实时核确认已交给输入后端的时刻。结果未知时也可能已执行。"""
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
         if (self.by in {"withdrawn", "unknown"}) != (self.index is None):
             raise ValueError("withdrawn 和 unknown 时 index 为 null，其余须给出 index")
+        if self.by == "withdrawn" and self.executed_at_ns is not None:
+            raise ValueError("撤回的决策点没有已执行的动作")
         return self
 
 

@@ -165,6 +165,9 @@ class OperatorClient:
         """打开一个决策点，由操作员给出选择。"""
         self._notify(messages.DECISION_OPENED, decision.params())
 
+    def update_decision(self, update: messages.DecisionUpdated) -> None:
+        self._notify(messages.DECISION_UPDATED, update.params())
+
     def close_decision(self, closed: messages.DecisionClosed) -> None:
         """报告决策点已关闭：按操作员的选择、按排第一的候选，或画面已变而撤回。"""
         self._notify(messages.DECISION_CLOSED, closed.params())

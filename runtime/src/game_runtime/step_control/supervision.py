@@ -1,22 +1,49 @@
 """认证操作员目标的转发和会话内 planner 实例核对。"""
 
+from dataclasses import dataclass, field
 from weakref import ReferenceType, ref
 
 from game_runtime.step_control.contracts import Goal, PlannerPort
+from game_runtime.step_control.decisions import DecisionKey
+
+
+@dataclass(slots=True)
+class SessionProgress:
+    """控制产出者重建后仍有效的步数账目和未决输入状态。"""
+
+    goal: Goal | None = None
+    steps: int = 0
+    goal_done: bool = False
+    stuck: bool = False
+    closed_choices: set[DecisionKey] = field(default_factory=set[DecisionKey])
+    unknown_choice_revision: int | None = None
+    ending: tuple[str, int] | None = None
+    restart_attempt_revision: int | None = None
+
+    def select_goal(self, goal: Goal | None) -> None:
+        if goal != self.goal:
+            self.goal = goal
+            self.steps = 0
+            self.goal_done = False
+            self.stuck = False
+
+    def choice_held(self, operator: "OperatorGoalRelay") -> bool:
+        blocked_at = self.unknown_choice_revision
+        return blocked_at is not None and (operator.goal is None or operator.revision <= blocked_at)
 
 
 class OperatorGoalRelay:
-    """按认证会话和目标文本的变化递交。控制插件重建时沿用递交进度。"""
+    """递交认证会话中的目标指令。控制插件重建时沿用递交进度。"""
 
     def __init__(self) -> None:
         self.goal: Goal | None = None
         self.revision = 0
-        self._source: tuple[str, str | None] | None = None
+        self._source: tuple[str, int, str | None] | None = None
         self._sent = 0
         self._recipient: ReferenceType[PlannerPort] | None = None
 
-    def update(self, session_id: str, text: str | None) -> None:
-        source = (session_id, text)
+    def update(self, session_id: str, revision: int, text: str | None) -> None:
+        source = (session_id, revision, text)
         if self._source != source:
             self._source = source
             self.revision += 1

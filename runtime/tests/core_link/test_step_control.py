@@ -95,6 +95,8 @@ class World:
         self.presenting = False
         self.ignore_choice = False
         self.bad_timer = False
+        self.timer_override: str | None = None
+        self.first_choice_label: str | None = None
         self.freeze_after_input = False
         self.inputs: list[tuple[GameScene, GameClick | GamePress]] = []
         self.submitted_click: tuple[int, int] | None = None
@@ -106,6 +108,20 @@ class World:
         rect = next(item.rect for item in self.game.truth().targets if item.id == target)
         self.game.handle(GameClick(*rect.center))
 
+    def show_choice(self, *, timed: bool = False) -> None:
+        self.click("menu.start")
+        for _ in range(3):
+            self.clock.advance(0.5)
+            self.click("dialogue.box")
+        assert self.game.truth().scene is GameScene.CHOICE
+        if timed:
+            self.click("choice.0")
+            for _ in range(2):
+                self.clock.advance(0.5)
+                self.click("dialogue.box")
+            self.click("popup.ok")
+            assert self.game.truth().scene is GameScene.TIMED_CHOICE
+
     def _text(self, text: str, box: PixelRect) -> OcrLine:
         return OcrLine(text, PixelRect(box.left + 2, box.top + 2, box.right - 2, box.bottom - 2), 1)
 
@@ -114,10 +130,13 @@ class World:
         for target in truth.targets:
             if target.label:
                 rect = target.rect
+                label = (
+                    self.first_choice_label or target.label
+                    if target.id == "choice.0"
+                    else target.label
+                )
                 lines.append(
-                    self._text(
-                        target.label, PixelRect(rect.left, rect.top, rect.right, rect.bottom)
-                    )
+                    self._text(label, PixelRect(rect.left, rect.top, rect.right, rect.bottom))
                 )
         if truth.scene is GameScene.DIALOGUE and truth.visible_text:
             lines.append(self._text(truth.visible_text, self.rect("dialogue")))
@@ -125,7 +144,9 @@ class World:
             lines.append(self._text(truth.text, self.rect("choice-prompt")))
         if truth.timer_remaining is not None:
             seconds = math.ceil(truth.timer_remaining * 10) / 10
-            timing = "无法识别" if self.bad_timer else f"剩余 {seconds:.1f} 秒"
+            timing = self.timer_override or (
+                "无法识别" if self.bad_timer else f"剩余 {seconds:.1f} 秒"
+            )
             lines.append(self._text(timing, self.rect("timer-text")))
         return tuple(lines)
 
@@ -330,6 +351,7 @@ async def rig(
     policy: Policy | None = None,
     freeze_test: bool = False,
     planner: RecordingPlanner | Callable[[], RecordingPlanner] | None = None,
+    decision_margin: float = 0.75,
 ) -> AsyncGenerator[Rig]:
     source = GAMES_DIR / "synthetic-game" / "adapter.toml"
     directory = root / "games" / "synthetic-game"
@@ -407,6 +429,7 @@ async def rig(
                         effect_timeout=0.85,
                         max_frame_age=0.15 if freeze_test else 0.5,
                         action_valid_for=0.45 if freeze_test else 0.25,
+                        decision_margin=decision_margin,
                     ),
                     admission=AdmissionPolicy(max_rate=20, idle_interval=0.08),
                     extra_plugins=()
@@ -492,7 +515,13 @@ def test_host_advances_then_resolves_operator_and_timed_choices(core_exe: Path, 
                 if event.kind is EventKind.DECISION_OPENED
                 and event.fields["deadline_ns"] is not None
             ]
-            assert not timed_opened.fields["candidates"]  # 到余量线才取得准备好的排序
+            assert not timed_opened.fields["candidates"]
+            assert any(
+                event.kind is EventKind.DECISION_UPDATED
+                and event.fields["id"] == timed_opened.fields["id"]
+                and event.fields["candidates"] == [1, 0]
+                for event in r.events
+            )
 
             await r.run.kernel.disable(STEP_ENTRY)
             await until(lambda: r.released(models.ReleaseReason.GENERATION_REVOKED))
@@ -529,11 +558,16 @@ def test_execution_receipt_without_choice_effect_closes_unknown_once(
         async with rig(core_exe, root) as r:
             r.world.presenting = True
             r.world.ignore_choice = True
+            r.console.set_goal("合成授权")
             await r.start()
-            await until(lambda: r.console.current_decision)
+            opened = await until(lambda: r.console.current_decision)
             r.console.choose(0)
             await until(lambda: r.closed("unknown", None))
             assert r.console.current_decision is None
+            [closed] = [event for event in r.events if event.kind is EventKind.DECISION_CLOSED]
+            assert closed.fields["executed_at_ns"] is not None
+            r.world.first_choice_label = "推門进去"
+            r.world.game.handle(GamePress(Key.DOWN))
             await asyncio.sleep(0.2)
             assert sum(screen is GameScene.CHOICE for screen, _ in r.world.inputs) == 1
             assert r.world.game.truth().scene is GameScene.CHOICE
@@ -543,6 +577,117 @@ def test_execution_receipt_without_choice_effect_closes_unknown_once(
             await asyncio.sleep(0.2)
             assert r.console.current_decision is None
             assert sum(screen is GameScene.CHOICE for screen, _ in r.world.inputs) == 1
+            r.console.set_goal("合成授权")
+            reopened = await until(lambda: r.console.current_decision)
+            assert reopened.id != opened.id
+            assert reopened.options[0].text == "推門进去"
+            assert sum(screen is GameScene.CHOICE for screen, _ in r.world.inputs) == 1
+
+    asyncio.run(main())
+
+
+def test_planning_previews_timed_choice_without_authorizing_input(
+    core_exe: Path, root: Path
+) -> None:
+    async def main() -> None:
+        planner = RecordingPlanner(PlannerContext(None, paused=True, planning=True))
+        async with rig(core_exe, root, planner=planner) as r:
+            r.world.show_choice(timed=True)
+            r.console.set_goal("合成授权")
+            r.world.presenting = True
+            await r.start()
+            opened = await until(lambda: r.console.current_decision)
+            assert not opened.candidates
+            assert opened.deadline_ns is not None
+            await until(
+                lambda: (
+                    r.console.current_decision
+                    if r.console.current_decision is not None
+                    and r.console.current_decision.candidates == (1, 0)
+                    else None
+                )
+            )
+            assert r.console.choose(0).id == opened.id
+            await asyncio.sleep(0.12)
+            assert not r.world.inputs
+            planner.context = PlannerContext(Goal("合成子目标", generation=31))
+            await until(lambda: r.closed("operator", 0))
+            assert len(r.world.inputs) == 1
+            assert [
+                item.fields["id"] for item in r.events if item.kind is EventKind.DECISION_OPENED
+            ] == [opened.id]
+
+    asyncio.run(main())
+
+
+def test_new_timer_evidence_preserves_default_against_a_late_operator_reply(
+    core_exe: Path, root: Path
+) -> None:
+    async def main() -> None:
+        planner = RecordingPlanner(PlannerContext(None, paused=True, planning=True))
+        async with rig(core_exe, root, planner=planner) as r:
+            r.world.show_choice(timed=True)
+            r.console.set_goal("合成授权")
+            r.world.presenting = True
+            await r.start()
+            opened = await until(lambda: r.console.current_decision)
+            original_deadline = opened.deadline_ns
+            assert original_deadline is not None
+            await until(
+                lambda: next(
+                    (
+                        e
+                        for e in r.events
+                        if e.kind is EventKind.DECISION_UPDATED and e.fields["candidates"] == [1, 0]
+                    ),
+                    None,
+                )
+            )
+            r.console.choose(0)
+            r.world.timer_override = "剩余 0.6 秒"
+            shortened = await until(
+                lambda: next(
+                    (
+                        e
+                        for e in r.events
+                        if e.kind is EventKind.DECISION_UPDATED
+                        and e.fields["deadline_ns"] < original_deadline - 1_000_000_000
+                    ),
+                    None,
+                )
+            )
+            assert shortened.fields["id"] == opened.id
+            assert not r.world.inputs
+            planner.context = PlannerContext(Goal("合成子目标", generation=31))
+            await until(lambda: r.closed("default", 1))
+            assert sum(screen is GameScene.TIMED_CHOICE for screen, _ in r.world.inputs) == 1
+            assert r.world.game.truth().node == "roof"
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("ignored", [False, True])
+def test_timed_execution_receipt_and_screen_verification_are_separate(
+    core_exe: Path, root: Path, ignored: bool
+) -> None:
+    async def main() -> None:
+        planner = RecordingPlanner(PlannerContext(None))
+        async with rig(core_exe, root, planner=planner, decision_margin=0.19) as r:
+            r.world.show_choice(timed=True)
+            r.world.ignore_choice = ignored
+            r.world.presenting = True
+            await r.start()
+            opened = await until(lambda: r.console.current_decision)
+            assert opened.deadline_ns is not None
+            await until(
+                lambda: r.closed("unknown" if ignored else "default", None if ignored else 1)
+            )
+            [closed] = [event for event in r.events if event.kind is EventKind.DECISION_CLOSED]
+            assert closed.fields["executed_at_ns"] < opened.deadline_ns
+            assert closed.at_ns > opened.deadline_ns
+            assert sum(screen is GameScene.TIMED_CHOICE for screen, _ in r.world.inputs) == 1
+            if ignored:
+                assert r.world.game.truth().node == "late"
 
     asyncio.run(main())
 
@@ -889,6 +1034,7 @@ def test_replaced_planner_cannot_authorize_a_plan_created_before_replacement(
         policy = SlowMenu()
         async with rig(core_exe, root, policy=policy, planner=lambda: active[0]) as r:
             r.world.presenting = True
+            r.console.set_goal("明确继续")
             await r.start()
             await asyncio.wait_for(policy.started.wait(), WAIT)
             await r.run.kernel.disable("plan")
@@ -903,5 +1049,66 @@ def test_replaced_planner_cannot_authorize_a_plan_created_before_replacement(
             )
             await until(lambda: True if r.world.inputs else None)
             assert [g.text for g in replacement.goals if g is not None] == ["明确继续"]
+
+    asyncio.run(main())
+
+
+def test_controller_reactivation_keeps_the_current_goal_step_budget(
+    core_exe: Path, root: Path
+) -> None:
+    class HoldAfterFirst(Journey):
+        def __init__(self) -> None:
+            self.waiting = asyncio.Event()
+            self.resume = asyncio.Event()
+
+        async def propose(self, inputs: PolicyInput) -> Plan:
+            plan = await super().propose(inputs)
+            if inputs.scene.screen_state.classification.screen_type is ScreenType.MENU:
+                return replace(plan, steps=plan.steps[:1])
+            self.waiting.set()
+            await self.resume.wait()
+            return plan
+
+    async def main() -> None:
+        goal = Goal("只推进两步", generation=17, max_steps=2)
+        planner = RecordingPlanner(PlannerContext(goal))
+        policy = HoldAfterFirst()
+        async with rig(core_exe, root, policy=policy, planner=planner) as r:
+            r.world.presenting = True
+            await r.start()
+            await asyncio.wait_for(policy.waiting.wait(), WAIT)
+            assert len(r.world.inputs) == 1
+            await r.run.kernel.disable(STEP_ENTRY)
+            policy.resume.set()
+            await r.run.kernel.enable(STEP_ENTRY)
+            await until(lambda: GoalEvent(17, "step-limit", 2) in planner.events or None)
+            assert len(r.world.inputs) == 2
+
+    asyncio.run(main())
+
+
+def test_bad_ending_restarts_only_after_new_authorization(core_exe: Path, root: Path) -> None:
+    class NoActions:
+        async def propose(self, inputs: PolicyInput) -> Plan:
+            return Plan()
+
+    async def main() -> None:
+        planner = RecordingPlanner(PlannerContext(Goal("旧目标", generation=7), restarting=True))
+        async with rig(core_exe, root, policy=NoActions(), planner=planner) as r:
+            c = r.run.controller
+            assert c is not None
+            r.console.set_goal("继续")
+            r.world.show_choice()
+            r.world.click("choice.2")
+            r.world.presenting = True
+            await r.start()
+            await until(lambda: "screen-blocked" in {item.detail for item in c.recent} or None)
+            assert not r.world.inputs
+            r.console.set_goal("继续")
+            await until(lambda: "screen-verified" in {item.detail for item in c.recent} or None)
+            assert r.world.game.truth().scene is GameScene.DIALOGUE
+            [(source, click)] = r.world.inputs
+            assert source is GameScene.BAD_ENDING
+            assert isinstance(click, GameClick)
 
     asyncio.run(main())

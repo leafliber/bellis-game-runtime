@@ -107,6 +107,11 @@ options = "choices"
 prompt = "choice-prompt"
 timer = { roi = "timer-text", prefix = "剩余", suffix = "秒" }
 
+[restarts.bad-ending]
+roi = "ending-retry"
+text = "重来"
+success_signature = "dialogue"
+
 # ROI 是 tools/synthetic-game/src/synthetic_game/layout.py 在设计稿 1280×720 下的矩形除以 1280×720，
 # 由 runtime/tests/adapter/test_packages.py 核对。
 [rois]
