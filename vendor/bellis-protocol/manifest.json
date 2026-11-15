@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "repository": "https://github.com/leafliber/bellis",
+  "commit": "4274d54cce2da97a29fad1e7e19e31d60e3c95c5",
+  "files": {
+    "schemas/game-bridge.schema.json": {
+      "source": "packages/protocol/schemas/game-bridge.schema.json",
+      "sha256": "b5fc98be20a385d827bf87c6a613544d4c712e876dcee88c97e0fb5dbd1677cc"
+    },
+    "models/game_bridge.py": {
+      "source": "packages/protocol/models/game_bridge.py",
+      "sha256": "9d124cb6e67c111772a9ecccba42d07f2d303c13dc4fc1aca0d73d677d04eeb8"
+    },
+    "fixtures/game-control.json": {
+      "source": "packages/protocol/test/fixtures/game-control.json",
+      "sha256": "4a43aa0c960fdac73e74ee5b6f43e52637beadeaa2bacc2351d759dfdcf3ea65"
+    }
+  }
+}

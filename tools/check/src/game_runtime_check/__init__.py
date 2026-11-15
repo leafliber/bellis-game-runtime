@@ -51,6 +51,7 @@ STEPS: tuple[Step, ...] = (
     Step("pytest", (PYTHON, "-m", "pytest")),
     # 生成物核对：重新生成到临时目录，与入库的逐字节比较（game_runtime_check.generate）。
     Step("generated files", (PYTHON, "-m", "game_runtime_check.generate", "--check")),
+    Step("Bellis protocol pin", (PYTHON, "-m", "game_runtime_check.vendor")),
     # 校验 games/ 下的每个适配包，即 uv run check-adapters（docs/modules/game-adapter.md）。
     Step("game adapters", (PYTHON, "-m", "game_runtime.adapter.check")),
 )
