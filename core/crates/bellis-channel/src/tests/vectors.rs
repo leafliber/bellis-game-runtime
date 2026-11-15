@@ -384,7 +384,7 @@ fn client_handshake_cases() {
 
 impl MemoryTransport {
     fn write_all_bytes(&self, bytes: &[u8]) {
-        crate::transport::Transport::write_all(self, bytes).expect("内存写入");
+        crate::transport::Transport::write_all(self, bytes, None).expect("内存写入");
     }
 }
 

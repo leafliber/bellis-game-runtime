@@ -1,6 +1,6 @@
 //! 字节流层：Windows 命名管道与 POSIX UDS 放在同一个 `Transport` 后面（Bellis D-12）。
 //!
-//! 实时核不用异步运行时，所以读取是阻塞的，但每次读都可以带截止时间；
+//! 实时核不用异步运行时，阻塞读写都可以带截止时间。
 //! `shutdown` 从任一线程唤醒阻塞中的读写。
 
 use std::io;
@@ -32,8 +32,8 @@ pub trait Transport: Send + Sync {
     ///
     /// # Errors
     ///
-    /// 对端已关闭或 `shutdown` 之后返回错误。
-    fn write_all(&self, buf: &[u8]) -> io::Result<()>;
+    /// 截止时返回 `ErrorKind::TimedOut`，此前可能已写出部分字节。对端关闭或 `shutdown` 后返回错误。
+    fn write_all(&self, buf: &[u8], deadline: Option<Instant>) -> io::Result<()>;
 
     /// 断开连接：唤醒阻塞中的读写，之后的读写都失败。可以重复调用。
     fn shutdown(&self);

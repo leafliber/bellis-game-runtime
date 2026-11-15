@@ -12,7 +12,7 @@ import contextlib
 import secrets
 import sys
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -91,7 +91,9 @@ class FakeMain:
         self._connected: asyncio.Future[RpcPeer] = asyncio.get_running_loop().create_future()
 
     @contextlib.asynccontextmanager
-    async def running(self) -> AsyncGenerator["FakeMain"]:
+    async def running(
+        self, *, extra_args: Sequence[str] = (), extra_env: Mapping[str, str] | None = None
+    ) -> AsyncGenerator["FakeMain"]:
         with session_credentials(f"t{secrets.token_hex(4)}") as credentials:
             server: ChannelServer = await listen(
                 credentials.path,
@@ -105,6 +107,7 @@ class FakeMain:
                 ENV_CHANNEL_PATH: credentials.path,
                 ENV_CHANNEL_KEY: credentials.encoded_key,
                 ENV_ROLE: CORE_ROLE,
+                **(extra_env or {}),
             }
             argv = [
                 str(self.exe),
@@ -112,6 +115,7 @@ class FakeMain:
                 str(round(HEARTBEAT_TIMEOUT * 1000)),
                 "--health-interval-ms",
                 str(round(HEALTH_INTERVAL * 1000)),
+                *extra_args,
             ]
             try:
                 with self.log_path.open("wb") as log:

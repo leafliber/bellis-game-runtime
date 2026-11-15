@@ -124,7 +124,7 @@ impl Transport for MemoryTransport {
         self.inbound.read(buf, deadline)
     }
 
-    fn write_all(&self, buf: &[u8]) -> io::Result<()> {
+    fn write_all(&self, buf: &[u8], _deadline: Option<Instant>) -> io::Result<()> {
         if self.is_shut() {
             return Err(shut_down());
         }
@@ -144,8 +144,8 @@ impl Transport for Arc<MemoryTransport> {
         (**self).read(buf, deadline)
     }
 
-    fn write_all(&self, buf: &[u8]) -> io::Result<()> {
-        (**self).write_all(buf)
+    fn write_all(&self, buf: &[u8], deadline: Option<Instant>) -> io::Result<()> {
+        (**self).write_all(buf, deadline)
     }
 
     fn shutdown(&self) {

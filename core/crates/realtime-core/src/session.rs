@@ -48,8 +48,9 @@ use frame_ring::FrameRingWriter;
 use serde_json::{Map, Value, json};
 
 use crate::audio::{self, Audio, AudioStatus, AudioThread, audio_opener_for};
+use crate::bellis_control::{BellisControl, ReleaseQueue};
 use crate::config::{FakePermit, HELLO_TIMEOUT, InputSetup, Launch, Options, PermitSource};
-use crate::control::{Configured, Control, Limits, Notice, Notices};
+use crate::control::{Configured, Control, Limits, Notice, Notices, ReleasedInput};
 use crate::fake::{DeviceRole, FakeBackend, connect_test_device};
 use crate::frames::{Capture, CaptureThread, FrameStatus, TargetError, opener_for};
 use crate::ledger::InputBackend;
@@ -108,6 +109,10 @@ pub enum StartError {
     Connect(ChannelError),
     /// 连不上操作员控制台或握手失败（只在给了操作员许可连接时连接）。
     Operator(ChannelError),
+    /// 正式控制连接读取或核对会话信息失败。
+    BellisSession(io::Error),
+    /// Bellis 控制连接无法认证。
+    Bellis(ChannelError),
     /// 连不上测试设备或握手失败（只在假后端时连接）。
     TestDevice(ChannelError),
     /// `core.hello` 没有得到合法的接受。
@@ -122,6 +127,8 @@ impl fmt::Display for StartError {
         match self {
             Self::Connect(error) => write!(f, "cannot connect to the main process: {error}"),
             Self::Operator(error) => write!(f, "cannot connect to the operator console: {error}"),
+            Self::BellisSession(error) => write!(f, "cannot load Bellis control session: {error}"),
+            Self::Bellis(error) => write!(f, "cannot connect to Bellis control: {error}"),
             Self::TestDevice(error) => write!(f, "cannot connect to the test device: {error}"),
             Self::Hello(reason) => write!(f, "core.hello failed: {reason}"),
             Self::Thread(error) => write!(f, "cannot start a thread: {error}"),
@@ -134,7 +141,7 @@ impl std::error::Error for StartError {}
 
 /// 运行一次会话直到结束。返回成功前已处理抬起，真实后端还须完成物理核验。
 ///
-/// `input` 是输入后端与许可源的组合（[`InputSetup::select`] 已核对门禁）；`stdin` 是生命线：读到 EOF
+/// `input` 是输入后端与许可源的组合（[`Launch::select_input`] 核对门禁）；`stdin` 是生命线：读到 EOF
 /// 即结束。
 ///
 /// # Errors
@@ -148,38 +155,8 @@ pub fn run(
     stdin: impl Read + Send + 'static,
 ) -> Result<Ended, StartError> {
     let frames = Arc::new(FrameStatus::default());
-    let limits = Limits {
-        heartbeat_timeout: options.heartbeat_timeout,
-        max_frame_age: options.max_frame_age,
-    };
-    let (control, outbox, sides, target) = start_input(input, limits, &frames, &launch.role)?;
-    // 每次启动先释放全部输入，再接受任何产出者与动作。操作员控制台随即收到 `core_start`。
-    let started = control.release_on_start();
-    log_released(&started);
-    outbox.mirror(&started);
-
-    let credentials = &launch.credentials;
-    let connection = match connect(
-        &credentials.path,
-        &launch.role,
-        &credentials.key,
-        &ConnectionOptions::default(),
-    ) {
-        Ok(connection) => connection,
-        Err(error) => {
-            sides.finish();
-            return Err(StartError::Connect(error));
-        }
-    };
-    let greeted = hello(&connection).and_then(|()| {
-        connection
-            .send(&notification::<InputReleased>(&started))
-            .map_err(StartError::Connect)
-    });
-    if let Err(error) = greeted {
-        sides.finish();
-        return Err(error);
-    }
+    let ((control, outbox, sides, target), connection) =
+        open_session(options, launch, input, &frames)?;
 
     let invalidate_capture = {
         let (control, outbox) = (Arc::clone(&control), Arc::clone(&outbox));
@@ -259,10 +236,11 @@ pub fn run(
         .ok_or(StartError::UnverifiedRelease)
 }
 
-/// 旁路连接：操作员许可连接与测试设备连接，各自可能没有。
+/// 核连接之外的许可与测试设备连接。
 #[derive(Default)]
 struct Sides {
     operator: Option<SideConnection>,
+    bellis: Option<BellisControl>,
     device: Option<SideConnection>,
 }
 
@@ -271,6 +249,9 @@ impl Sides {
     fn finish(self) {
         if let Some(operator) = self.operator {
             operator.finish(OPERATOR_FLUSH_WAIT);
+        }
+        if let Some(bellis) = self.bellis {
+            bellis.finish(OUTBOX_FLUSH_WAIT);
         }
         if let Some(device) = self.device {
             device.finish(DEVICE_FLUSH_WAIT);
@@ -285,6 +266,65 @@ impl Sides {
 /// [`start_input`] 交出的东西：控制状态、通知出口、旁路连接与目标窗口句柄。
 type Started = (Arc<Control>, Arc<Outbox>, Sides, Arc<TargetWindow>);
 
+fn open_session(
+    options: &Options,
+    launch: &Launch,
+    input: InputSetup,
+    frames: &Arc<FrameStatus>,
+) -> Result<(Started, Connection), StartError> {
+    let limits = Limits {
+        heartbeat_timeout: options.heartbeat_timeout,
+        max_frame_age: options.max_frame_age,
+    };
+    let bellis = match input.permit_source() {
+        Some(PermitSource::Bellis(settings)) => Some(settings.clone()),
+        _ => None,
+    };
+    let (control, outbox, mut sides, target) = start_input(input, limits, frames, &launch.role)?;
+    let startup_release = control.release_on_start();
+    log_released(&startup_release.params);
+    outbox.mirror(&startup_release);
+
+    let opened = (|| {
+        if let Some(settings) = bellis {
+            let releases = outbox.bellis.clone().ok_or_else(|| {
+                StartError::BellisSession(io::Error::other("no Bellis release queue"))
+            })?;
+            let post: Post = {
+                let outbox = Arc::clone(&outbox);
+                Arc::new(move |notices| outbox.post(notices))
+            };
+            sides.bellis = Some(BellisControl::start(
+                settings,
+                Arc::clone(&control),
+                post,
+                releases,
+                options.health_interval,
+            )?);
+        }
+        let credentials = &launch.credentials;
+        let connection = connect(
+            &credentials.path,
+            &launch.role,
+            &credentials.key,
+            &ConnectionOptions::default(),
+        )
+        .map_err(StartError::Connect)?;
+        hello(&connection)?;
+        connection
+            .send(&notification::<InputReleased>(&startup_release.params))
+            .map_err(StartError::Connect)?;
+        Ok(connection)
+    })();
+    match opened {
+        Ok(connection) => Ok(((control, outbox, sides, target), connection)),
+        Err(error) => {
+            sides.finish();
+            Err(error)
+        }
+    }
+}
+
 /// 交出的 [`Outbox`] 是发给主进程的通知的出口；有操作员许可连接时，它把每条 `input.released`、
 /// `input.residual` 也放进那条连接的发送队列。真实后端通过 [`TargetWindow`] 读取最近写入帧的窗口。
 fn start_input(
@@ -293,8 +333,20 @@ fn start_input(
     frames: &Arc<FrameStatus>,
     role: &str,
 ) -> Result<Started, StartError> {
-    let operator_queue = input.operator().map(|_| Arc::new(SendQueue::default()));
-    let outbox = Arc::new(Outbox::new(operator_queue.clone()));
+    if matches!(&input, InputSetup::Real { source: PermitSource::Bellis(launch), .. }
+        if launch.source.is_test())
+    {
+        return Err(StartError::BellisSession(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "test SessionInfo cannot be used with real input",
+        )));
+    }
+    let source = input.permit_source();
+    let operator_queue =
+        matches!(source, Some(PermitSource::Operator(_))).then(|| Arc::new(SendQueue::default()));
+    let bellis_queue = matches!(source, Some(PermitSource::Bellis(_)))
+        .then(|| Arc::new(ReleaseQueue::new(OUTBOX_FLUSH_WAIT)));
+    let outbox = Arc::new(Outbox::new(operator_queue.clone(), bellis_queue));
     let target = Arc::new(TargetWindow::new(
         matches!(input, InputSetup::Real { .. }),
         Arc::clone(frames),
@@ -337,6 +389,7 @@ fn start_input(
                     log!("lease source: the operator console");
                     DeviceRole::EventsOnly
                 }
+                FakePermit::Source(PermitSource::Bellis(_)) => DeviceRole::EventsOnly,
             };
             let connection =
                 connect_test_device(&test_device, role).map_err(StartError::TestDevice)?;
@@ -382,7 +435,6 @@ fn start_real_input(
     operator_queue: Option<Arc<SendQueue>>,
     target: Arc<TargetWindow>,
 ) -> Result<Started, StartError> {
-    let PermitSource::Operator(operator) = source;
     let (backend, wiring) =
         crate::sendinput::windows::build_backend(emergency, Arc::clone(&target))
             .map_err(StartError::Thread)?;
@@ -397,13 +449,15 @@ fn start_real_input(
         Arc::new(move |notices| outbox.post(notices))
     };
     let mut sides = Sides::default();
-    let connection = connect_operator(&operator, role).map_err(StartError::Operator)?;
-    let queue = operator_queue.unwrap_or_default();
-    sides.operator = Some(
-        connection
-            .start(queue, &control, &post)
-            .map_err(StartError::Thread)?,
-    );
+    if let PermitSource::Operator(operator) = source {
+        let connection = connect_operator(&operator, role).map_err(StartError::Operator)?;
+        let queue = operator_queue.unwrap_or_default();
+        sides.operator = Some(
+            connection
+                .start(queue, &control, &post)
+                .map_err(StartError::Thread)?,
+        );
+    }
     crate::sendinput::windows::start(&control, &post, wiring).map_err(StartError::Thread)?;
     log!("input backend: sendinput (real input)");
     Ok((control, Arc::clone(outbox), sides, target))
@@ -548,6 +602,7 @@ struct Outbox {
     peer: OnceLock<Weak<RpcPeer>>,
     queue: SendQueue,
     operator: Option<Arc<SendQueue>>,
+    bellis: Option<Arc<ReleaseQueue>>,
 }
 
 fn to_params(method: &str, params: &impl serde::Serialize) -> Option<Map<String, Value>> {
@@ -560,11 +615,12 @@ fn to_params(method: &str, params: &impl serde::Serialize) -> Option<Map<String,
 }
 
 impl Outbox {
-    fn new(operator: Option<Arc<SendQueue>>) -> Self {
+    fn new(operator: Option<Arc<SendQueue>>, bellis: Option<Arc<ReleaseQueue>>) -> Self {
         Self {
             peer: OnceLock::new(),
             queue: SendQueue::default(),
             operator,
+            bellis,
         }
     }
 
@@ -589,10 +645,13 @@ impl Outbox {
         }
     }
 
-    /// 把一次释放的 `input.released` 放进操作员许可连接的发送队列；没有这条连接时什么也不做。
-    fn mirror(&self, released: &InputReleasedParams) {
+    /// 启动与主连接已断开的路径也把释放交给已选的许可连接。
+    fn mirror(&self, released: &ReleasedInput) {
+        if let Some(queue) = &self.bellis {
+            queue.released(released);
+        }
         if let Some(queue) = &self.operator
-            && let Some(params) = to_params(OperatorInputReleased::NAME, released)
+            && let Some(params) = to_params(OperatorInputReleased::NAME, &released.params)
         {
             queue.push(OperatorInputReleased::NAME, params);
         }
@@ -602,7 +661,7 @@ impl Outbox {
     fn log(&self, notices: &Notices) {
         for notice in &notices.0 {
             if let Notice::Released(released) = notice {
-                log_released(released);
+                log_released(&released.params);
                 self.mirror(released);
             }
         }
@@ -612,10 +671,13 @@ impl Outbox {
         for notice in notices.0 {
             let (method, params) = match &notice {
                 Notice::Released(released) => {
-                    log_released(released);
+                    log_released(&released.params);
+                    if let Some(queue) = &self.bellis {
+                        queue.released(released);
+                    }
                     (
                         InputReleased::NAME,
-                        to_params(InputReleased::NAME, released),
+                        to_params(InputReleased::NAME, &released.params),
                     )
                 }
                 Notice::Receipt(receipt) => {
@@ -634,6 +696,9 @@ impl Outbox {
                     )
                 }
                 Notice::Verification(verification) => {
+                    if let Some(queue) = &self.bellis {
+                        queue.checked(*verification);
+                    }
                     log!(
                         "input verification #{}: {:?}",
                         verification.release_id,

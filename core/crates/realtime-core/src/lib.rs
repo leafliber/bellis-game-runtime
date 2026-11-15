@@ -18,6 +18,8 @@ macro_rules! log {
 }
 
 mod audio;
+mod bellis_control;
+mod bellis_session;
 pub mod config;
 mod control;
 mod fake;

@@ -21,7 +21,7 @@ use core_protocol::messages::{Empty, LeaseGrantParams, LeaseRevokeParams};
 use core_protocol::methods::error_code;
 use serde_json::{Map, Value};
 
-use crate::control::{Control, Notices};
+use crate::control::{Control, LeaseGrant, Notices};
 use crate::queue::SendQueue;
 
 /// 旁路连接上请求的截止时间。实时核在这些连接上不发请求，只用于 `RpcPeer` 的配置。
@@ -188,8 +188,15 @@ pub(crate) fn with_lease_handlers(
         let (control, post) = (Arc::clone(control), Arc::clone(post));
         move |params: &Map<String, Value>| {
             let params: LeaseGrantParams = parse(grant, params)?;
-            let (result, notices) = control.grant_lease(&params, mono_clock::now_ns());
+            let (result, notices) = control.grant_lease(&params, mono_clock::now_ns);
             post(notices);
+            let result = result.and_then(|grant| match grant {
+                LeaseGrant::Applied => Ok(()),
+                LeaseGrant::Verifying(release_id) => {
+                    control.wait_for_lease_proof(release_id)?;
+                    control.confirm_lease_grant(&params, release_id, mono_clock::now_ns)
+                }
+            });
             match result {
                 Ok(()) => Ok(empty()),
                 Err(refusal) => {
@@ -207,7 +214,7 @@ pub(crate) fn with_lease_handlers(
         move |params: &Map<String, Value>| {
             let params: LeaseRevokeParams = parse(revoke, params)?;
             // 释放完成后才回应。
-            post(control.revoke_lease(params.token, mono_clock::now_ns()));
+            post(control.revoke_lease(params.token, mono_clock::now_ns));
             Ok(empty())
         }
     };

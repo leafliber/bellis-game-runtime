@@ -492,6 +492,50 @@ fn local_close_wakes_the_blocked_reader() {
 }
 
 #[test]
+fn local_close_wakes_a_blocked_write_without_peer_reads() {
+    let key = create_session_key();
+    let (resume, stalled) = mpsc::channel();
+    let (path, server) = serve(move |mut stream: ServerStream| {
+        assert_eq!(stream.handshake(&key), ROLE);
+        // 对端在写入与关闭完成前不读取应用帧。上限只用于故障时清理测试。
+        let _ = stalled.recv_timeout(Duration::from_secs(5));
+    });
+    let connection = connect(&path, ROLE, &key, &options()).expect("握手成功");
+    let (started, writing) = mpsc::channel();
+    let (sent, finished) = mpsc::channel();
+    let (closed, shutdown) = mpsc::channel();
+    let timeout = Duration::from_secs(2);
+    std::thread::scope(|threads| {
+        let payload = vec![1; 512 * 1024];
+        let client = &connection;
+        threads.spawn(move || {
+            started.send(()).unwrap();
+            let mut result = client.send_binary(&payload);
+            while result.is_ok() {
+                result = client.send_binary(&payload);
+            }
+            sent.send(result).unwrap();
+        });
+        writing.recv_timeout(timeout).unwrap();
+        assert!(matches!(
+            finished.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        threads.spawn(move || {
+            client.close();
+            closed.send(()).unwrap();
+        });
+        assert_eq!(shutdown.recv_timeout(timeout), Ok(()));
+        assert_eq!(
+            code_of(finished.recv_timeout(timeout).unwrap()),
+            ErrorCode::Closed
+        );
+    });
+    resume.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn after_reply_runs_once_the_reply_is_written() {
     let key = create_session_key();
     let (hooked, hook_fired) = mpsc::channel();

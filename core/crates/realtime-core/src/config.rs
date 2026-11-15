@@ -2,13 +2,16 @@
 //!
 //! 凭据按 Bellis 的子进程约定（`ChildEnv`）从环境变量取得：通道地址、base64url 编码的会话密钥与连接时使用
 //! 的角色；操作员许可连接与只用于测试的测试设备连接各另用一组环境变量。时限与输入后端从命令行参数取得，
-//! 缺省值的依据见模块文档。输入后端与许可源的门禁由 [`InputSetup::select`] 强制：许可源只有一个，测试许可源
+//! 缺省值的依据见模块文档。输入后端与许可源的门禁由 [`Launch::select_input`] 强制：许可源只有一个，测试许可源
 //! 只能与假输入后端一起、且只在没有操作员许可连接时启用。
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use bellis_channel::ChannelCredentials;
+use game_bridge_protocol::RuntimeId;
 
+use crate::bellis_session::{SessionSource, is_session_id};
 use crate::sendinput::Combo;
 
 /// 通道地址，Windows 上是命名管道，其它平台是 UDS 路径。
@@ -25,6 +28,10 @@ pub const ENV_TEST_DEVICE_KEY: &str = "GAME_RUNTIME_TEST_DEVICE_KEY";
 pub const ENV_OPERATOR_PATH: &str = "GAME_RUNTIME_OPERATOR_PATH";
 /// 操作员许可连接的会话密钥（base64url 无填充）。
 pub const ENV_OPERATOR_KEY: &str = "GAME_RUNTIME_OPERATOR_KEY";
+/// 主进程从 Bellis 的 `SessionInfo` 读到的会话号。
+pub const ENV_BELLIS_SESSION_ID: &str = "BELLIS_SESSION_ID";
+/// 仅假输入联调读取的临时 `SessionInfo` 文件。
+const ENV_TEST_BELLIS_SESSION_FILE: &str = "GAME_RUNTIME_TEST_BELLIS_SESSION_FILE";
 
 /// 心跳超时的缺省值：主进程以 100ms 为周期发心跳，连续丢失约 5 次才算超时。
 pub const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -57,6 +64,8 @@ pub struct Options {
     pub input_backend: Option<InputBackendKind>,
     /// 急停组合键；只在给出 `--emergency-hotkey` 时为 `Some`，只与真实后端一起给出。
     pub emergency_hotkey: Option<Combo>,
+    /// 选择 Bellis 控制连接，同时指定同一次 Runtime 在两条游戏桥连接中使用的编号。
+    pub bellis_runtime_id: Option<RuntimeId>,
 }
 
 impl Default for Options {
@@ -67,6 +76,7 @@ impl Default for Options {
             max_frame_age: DEFAULT_MAX_FRAME_AGE,
             input_backend: None,
             emergency_hotkey: None,
+            bellis_runtime_id: None,
         }
     }
 }
@@ -74,7 +84,8 @@ impl Default for Options {
 /// 用法说明，参数不合法时打印。
 pub const USAGE: &str = "usage: realtime-core [--heartbeat-timeout-ms <ms>] \
                          [--health-interval-ms <ms>] [--max-frame-age-ms <ms>] \
-                         [--input-backend fake|sendinput] [--emergency-hotkey <combo>]";
+                         [--input-backend fake|sendinput] [--emergency-hotkey <combo>] \
+                         [--bellis-control <runtimeId>]";
 
 impl Options {
     /// 解析命令行参数（不含程序名）。
@@ -106,6 +117,14 @@ impl Options {
                 options.emergency_hotkey = Some(Combo::parse(&combo)?);
                 continue;
             }
+            if arg == "--bellis-control" {
+                let id = RuntimeId::new(args.next().ok_or_else(value)?)
+                    .ok_or("--bellis-control needs a valid runtimeId")?;
+                if options.bellis_runtime_id.replace(id).is_some() {
+                    return Err("--bellis-control can only be specified once".into());
+                }
+                continue;
+            }
             let slot = match arg.as_str() {
                 "--heartbeat-timeout-ms" => &mut options.heartbeat_timeout,
                 "--health-interval-ms" => &mut options.health_interval,
@@ -133,6 +152,8 @@ pub struct Launch {
     pub test_device: Option<ChannelCredentials>,
     /// 操作员许可连接的地址与密钥；没有给出时为 `None`。
     pub operator: Option<ChannelCredentials>,
+    bellis_session_id: Option<String>,
+    test_bellis_session: Option<PathBuf>,
 }
 
 impl Launch {
@@ -165,16 +186,71 @@ impl Launch {
             role,
             test_device,
             operator,
+            bellis_session_id: optional(ENV_BELLIS_SESSION_ID),
+            test_bellis_session: optional(ENV_TEST_BELLIS_SESSION_FILE).map(PathBuf::from),
         })
+    }
+
+    /// 从已解析的启动信息选出唯一的许可源。
+    ///
+    /// # Errors
+    /// 双源、缺少 Bellis 会话号、测试凭据与真实输入混用或其它后端门禁不成立。
+    pub fn select_input(&mut self, options: &Options) -> Result<InputSetup, String> {
+        if self.test_bellis_session.is_some()
+            && (options.input_backend != Some(InputBackendKind::Fake)
+                || options.bellis_runtime_id.is_none()
+                || self.test_device.is_none())
+        {
+            return Err(format!(
+                "{ENV_TEST_BELLIS_SESSION_FILE} requires Bellis control and an explicit fake test device"
+            ));
+        }
+        let source = match (self.operator.take(), &options.bellis_runtime_id) {
+            (Some(_), Some(_)) => return Err("select either the operator console or Bellis".into()),
+            (Some(operator), None) => Some(PermitSource::Operator(operator)),
+            (None, Some(runtime_id)) => {
+                let expected_session_id = self
+                    .bellis_session_id
+                    .take()
+                    .filter(|id| is_session_id(id))
+                    .ok_or(format!(
+                        "--bellis-control needs a valid {ENV_BELLIS_SESSION_ID}"
+                    ))?;
+                Some(PermitSource::Bellis(BellisLaunch {
+                    runtime_id: runtime_id.clone(),
+                    expected_session_id,
+                    source: self
+                        .test_bellis_session
+                        .take()
+                        .map_or(SessionSource::CredentialManager, SessionSource::TestFile),
+                }))
+            }
+            (None, None) => None,
+        };
+        InputSetup::select(
+            options.input_backend,
+            self.test_device.take(),
+            source,
+            options.emergency_hotkey.clone(),
+        )
     }
 }
 
-/// 生产许可源：真实后端只能与它一起选出（G2 第 2 步），没有自己给自己许可的路径。G3 的 Bellis 控制连接
-/// 也加在这里。
+/// Bellis 控制连接的会话身份与实时核独立读取凭据的来源。
+#[derive(Clone, Debug)]
+pub struct BellisLaunch {
+    pub(crate) runtime_id: RuntimeId,
+    pub(crate) expected_session_id: String,
+    pub(crate) source: SessionSource,
+}
+
+/// 真实后端只与经认证的许可源一起选出。
 #[derive(Debug)]
 pub enum PermitSource {
     /// 操作员许可连接：独立运行中操作员控制台的测试会话授予许可（GR-36）。
     Operator(ChannelCredentials),
+    /// G3 的 Bellis 宿主。
+    Bellis(BellisLaunch),
 }
 
 /// 假输入后端的许可源。
@@ -186,7 +262,7 @@ pub enum FakePermit {
     Source(PermitSource),
 }
 
-/// 输入后端与许可源的组合，只由 [`InputSetup::select`] 构造。许可源只有一个：测试许可源只在
+/// 输入后端与许可源的组合，由 [`Launch::select_input`] 核对。许可源只有一个：测试许可源只在
 /// [`InputSetup::Fake`] 里、且只在没有生产许可源时出现；真实后端（[`InputSetup::Real`]）只带
 /// [`PermitSource`]，不能与测试许可源一起出现，也不能同时给测试设备的凭据。
 #[derive(Debug)]
@@ -210,17 +286,17 @@ pub enum InputSetup {
 }
 
 impl InputSetup {
-    /// 按 `--input-backend`、测试设备的凭据、操作员许可连接的凭据与急停组合键选出组合。
+    /// 按输入后端、测试设备、已选许可源和急停组合键选出组合。
     ///
     /// # Errors
     ///
     /// 以下情形返回说明：假后端没有测试设备的凭据；给了测试设备的凭据却不是假后端；给了操作员许可连接的
-    /// 凭据却没有输入后端；真实后端没有生产许可源、或同时给了测试设备的凭据、或不在 Windows 上；
+    /// 或 Bellis 控制连接却没有输入后端；真实后端没有生产许可源、或同时给了测试设备的凭据、或不在 Windows 上；
     /// 给了 `--emergency-hotkey` 却不是真实后端。
-    pub fn select(
+    fn select(
         backend: Option<InputBackendKind>,
         test_device: Option<ChannelCredentials>,
-        operator: Option<ChannelCredentials>,
+        source: Option<PermitSource>,
         emergency: Option<Combo>,
     ) -> Result<Self, String> {
         if emergency.is_some() && backend != Some(InputBackendKind::SendInput) {
@@ -229,11 +305,16 @@ impl InputSetup {
                     .into(),
             );
         }
-        match (backend, test_device, operator) {
+        match (backend, test_device, source) {
             (None, None, None) => Ok(Self::None),
-            (None, _, Some(_)) => Err(format!(
-                "the operator lease connection ({ENV_OPERATOR_PATH}) needs an input backend"
-            )),
+            (None, _, Some(source)) => Err(match source {
+                PermitSource::Operator(_) => {
+                    format!(
+                        "the operator lease connection ({ENV_OPERATOR_PATH}) needs an input backend"
+                    )
+                }
+                PermitSource::Bellis(_) => "--bellis-control needs an input backend".into(),
+            }),
             (None, Some(_), None) => Err(format!(
                 "the test lease source ({ENV_TEST_DEVICE_PATH}) is only available with \
                  --input-backend fake"
@@ -242,12 +323,9 @@ impl InputSetup {
                 "--input-backend fake needs the test device: set {ENV_TEST_DEVICE_PATH} and \
                  {ENV_TEST_DEVICE_KEY}"
             )),
-            (Some(InputBackendKind::Fake), Some(test_device), operator) => Ok(Self::Fake {
+            (Some(InputBackendKind::Fake), Some(test_device), source) => Ok(Self::Fake {
                 test_device,
-                permit: match operator {
-                    Some(operator) => FakePermit::Source(PermitSource::Operator(operator)),
-                    None => FakePermit::TestLease,
-                },
+                permit: source.map_or(FakePermit::TestLease, FakePermit::Source),
             }),
             (Some(InputBackendKind::SendInput), _, _) if !cfg!(windows) => Err(
                 "the real input backend (--input-backend sendinput) is only available on Windows"
@@ -259,27 +337,22 @@ impl InputSetup {
             )),
             (Some(InputBackendKind::SendInput), None, None) => Err(format!(
                 "the real input backend needs a production lease source (the operator lease \
-                 connection {ENV_OPERATOR_PATH})"
+                 connection {ENV_OPERATOR_PATH} or --bellis-control)"
             )),
-            (Some(InputBackendKind::SendInput), None, Some(operator)) => Ok(Self::Real {
-                source: PermitSource::Operator(operator),
+            (Some(InputBackendKind::SendInput), None, Some(source)) => Ok(Self::Real {
+                source,
                 emergency: emergency.unwrap_or_else(Combo::default_hotkey),
             }),
         }
     }
 
-    /// 操作员许可连接的地址与密钥；没有时为 `None`。
-    #[must_use]
-    pub fn operator(&self) -> Option<&ChannelCredentials> {
+    pub(crate) fn permit_source(&self) -> Option<&PermitSource> {
         match self {
             Self::Fake {
-                permit: FakePermit::Source(PermitSource::Operator(operator)),
+                permit: FakePermit::Source(source),
                 ..
             }
-            | Self::Real {
-                source: PermitSource::Operator(operator),
-                ..
-            } => Some(operator),
+            | Self::Real { source, .. } => Some(source),
             Self::None
             | Self::Fake {
                 permit: FakePermit::TestLease,
@@ -292,9 +365,10 @@ impl InputSetup {
 #[cfg(test)]
 mod tests {
     use super::{
-        Combo, DEFAULT_MAX_FRAME_AGE, ENV_CHANNEL_KEY, ENV_CHANNEL_PATH, ENV_OPERATOR_KEY,
-        ENV_OPERATOR_PATH, ENV_ROLE, ENV_TEST_DEVICE_KEY, ENV_TEST_DEVICE_PATH, FakePermit,
-        InputBackendKind, InputSetup, Launch, Options, PermitSource,
+        Combo, DEFAULT_MAX_FRAME_AGE, ENV_BELLIS_SESSION_ID, ENV_CHANNEL_KEY, ENV_CHANNEL_PATH,
+        ENV_OPERATOR_KEY, ENV_OPERATOR_PATH, ENV_ROLE, ENV_TEST_BELLIS_SESSION_FILE,
+        ENV_TEST_DEVICE_KEY, ENV_TEST_DEVICE_PATH, FakePermit, InputBackendKind, InputSetup,
+        Launch, Options, PermitSource,
     };
     use bellis_channel::{ChannelCredentials, create_session_key, encode_session_key};
     use std::collections::HashMap;
@@ -337,6 +411,9 @@ mod tests {
             &["--health-interval-ms", "1.5"],
             &["--max-frame-age-ms", "0"],
             &["--input-backend"],
+            &["--bellis-control"],
+            &["--bellis-control", "-invalid"],
+            &["--bellis-control", "run-1", "--bellis-control", "run-2"],
         ] {
             assert!(Options::parse(args(bad)).is_err(), "{bad:?}");
         }
@@ -399,8 +476,10 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert_eq!(setup.operator().unwrap().path, "operator-path");
-            assert!(matches!(setup, InputSetup::Real { .. }));
+            assert!(
+                matches!(setup, InputSetup::Real { source: PermitSource::Operator(credentials), .. }
+                if credentials.path == "operator-path")
+            );
             // 真实后端不能同时给测试设备的凭据。
             let error = InputSetup::select(
                 Some(InputBackendKind::SendInput),
@@ -421,8 +500,8 @@ mod tests {
         credentials("device-path")
     }
 
-    fn operator() -> ChannelCredentials {
-        credentials("operator-path")
+    fn operator() -> PermitSource {
+        PermitSource::Operator(credentials("operator-path"))
     }
 
     /// 门禁：测试许可源只能与假后端一起启用，假后端也离不开测试设备。
@@ -430,7 +509,7 @@ mod tests {
     fn the_test_lease_source_only_comes_with_the_fake_backend() {
         let setup = InputSetup::select(None, None, None, None).unwrap();
         assert!(matches!(setup, InputSetup::None));
-        assert!(setup.operator().is_none());
+        assert!(setup.permit_source().is_none());
         match InputSetup::select(Some(InputBackendKind::Fake), Some(device()), None, None) {
             Ok(InputSetup::Fake {
                 test_device,
@@ -457,7 +536,6 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(setup.operator().unwrap().path, "operator-path");
         match setup {
             InputSetup::Fake {
                 test_device,
@@ -478,6 +556,61 @@ mod tests {
         let error = InputSetup::select(Some(InputBackendKind::Fake), None, Some(operator()), None)
             .unwrap_err();
         assert!(error.contains(ENV_TEST_DEVICE_PATH), "{error}");
+    }
+
+    #[test]
+    fn bellis_and_operator_are_exclusive_and_tests_cannot_attach_real_input() {
+        let key = encode_session_key(&create_session_key());
+        let mut env = HashMap::from([
+            (ENV_CHANNEL_PATH, "core-path".to_owned()),
+            (ENV_CHANNEL_KEY, key.clone()),
+            (ENV_ROLE, "game-runtime.core".to_owned()),
+            (ENV_TEST_DEVICE_PATH, "device-path".to_owned()),
+            (ENV_TEST_DEVICE_KEY, key.clone()),
+        ]);
+        let fake = Options::parse(args(&[
+            "--input-backend",
+            "fake",
+            "--bellis-control",
+            "run-1",
+        ]))
+        .unwrap();
+        let real = Options::parse(args(&[
+            "--input-backend",
+            "sendinput",
+            "--bellis-control",
+            "run-1",
+        ]))
+        .unwrap();
+        let select = |env: &HashMap<&str, String>, options: &Options| {
+            Launch::from_env(|name| env.get(name).cloned())
+                .unwrap()
+                .select_input(options)
+        };
+
+        assert!(
+            select(&env, &fake)
+                .unwrap_err()
+                .contains(ENV_BELLIS_SESSION_ID)
+        );
+        env.insert(ENV_BELLIS_SESSION_ID, "sess01".into());
+        env.insert(ENV_TEST_BELLIS_SESSION_FILE, "test-session.json".into());
+        assert!(matches!(select(&env, &fake).unwrap(), InputSetup::Fake {
+            permit: FakePermit::Source(PermitSource::Bellis(launch)), ..
+        } if launch.expected_session_id == "sess01" && launch.source.is_test()));
+        assert!(
+            select(&env, &real)
+                .unwrap_err()
+                .contains(ENV_TEST_BELLIS_SESSION_FILE)
+        );
+        assert!(
+            select(&env, &Options::default())
+                .unwrap_err()
+                .contains(ENV_TEST_BELLIS_SESSION_FILE)
+        );
+        env.insert(ENV_OPERATOR_PATH, "operator-path".into());
+        env.insert(ENV_OPERATOR_KEY, key);
+        assert!(select(&env, &fake).unwrap_err().contains("either"));
     }
 
     #[test]
