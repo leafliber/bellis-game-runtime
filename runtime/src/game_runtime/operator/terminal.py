@@ -211,13 +211,18 @@ class TerminalConsole:
             case EventKind.REJECTED:
                 return [f"拒绝了一个连接（{fields['role']}）：{fields['reason']}"]
             case EventKind.INPUT_RELEASED:
-                return [f"实时核释放了全部输入：{fields['reason']}"]
-            case EventKind.INPUT_RESIDUAL:
-                reason = fields.get("reason")
-                tail = "" if reason is None else f"，{reason}"
                 return [
-                    f"实时核核验出残留（{fields['cause']}{tail}）：{fields['items']} 项，已补发抬起"
+                    f"释放回执 #{fields['release_id']} {fields['reason']}"
+                    f"（{fields['verification']}）"
                 ]
+            case EventKind.INPUT_RESIDUAL:
+                accepted = "已提交" if fields["repair_accepted"] else "有事件被拒收"
+                return [
+                    f"释放 #{fields['release_id']} 检测到 {fields['items']} 项残留，"
+                    f"补发抬起{accepted}"
+                ]
+            case EventKind.INPUT_VERIFICATION:
+                return [f"释放 #{fields['release_id']} 物理核验 {fields['result']}"]
             case EventKind.DECISION_OPENED:
                 return self._decision(fields)
             case EventKind.DECISION_CHOSEN:

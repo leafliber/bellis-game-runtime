@@ -19,17 +19,18 @@ use crate::messages::{
     FakeAxisRelease, FakeAxisSet, FakeClick, FakeInputEvent, FakeInputEventParams, FakeKeyDown,
     FakeKeyPress, FakeKeyUp, FakeMouseDown, FakeMouseMove, FakeMouseUp, FakeReleaseAll, FakeScroll,
     FakeTarget, FrameRingAttachParams, HeldAxis, HeldInput, HeldKey, HeldMouseButton, InputPolicy,
-    InputReleasedParams, InputResidualParams, KeyPress, LatestAudio, LatestFrame, LeaseGrantParams,
-    LeaseRevokeParams, LeaseStatus, MouseButton, MouseMove, NormRect, Producer,
-    ProducerHeartbeatParams, ProducerRevokeParams, RejectReason, Rejected, ReleaseReason,
-    ResidualCause, Scroll, WindowTarget,
+    InputReleasedParams, InputResidualParams, InputVerificationParams, KeyPress, LatestAudio,
+    LatestFrame, LeaseGrantParams, LeaseRevokeParams, LeaseStatus, MouseButton, MouseMove,
+    NormRect, Producer, ProducerHeartbeatParams, ProducerRevokeParams, ProducerRevokeResult,
+    RejectReason, Rejected, ReleaseReason, ReleaseVerification, ResidualCause, Scroll,
+    VerificationResult, WindowTarget,
 };
 use crate::methods::{
     ActionReceipt, ActionSubmit, AudioRingAttach, AudioSetTarget, CaptureSetTarget, CoreHealth,
     CoreHello, CoreStop, FakeInput, FrameRingAttach, InputConfigure, InputReleased, InputResidual,
-    Method, MethodInfo, OperatorInputResidual, OperatorLeaseGrant, OperatorLeaseRevoke,
-    ProducerHeartbeat, ProducerRevoke, Request, TestLeaseGrant, TestLeaseRevoke, catalog,
-    error_code, operator_catalog, test_device_catalog,
+    InputVerification, Method, MethodInfo, OperatorInputResidual, OperatorLeaseGrant,
+    OperatorLeaseRevoke, ProducerHeartbeat, ProducerRevoke, Request, TestLeaseGrant,
+    TestLeaseRevoke, catalog, error_code, operator_catalog, test_device_catalog,
 };
 use crate::{audio_ring, frame_ring};
 
@@ -431,7 +432,12 @@ pub fn fixtures() -> Vec<Fixture> {
             }),
         ),
         Fixture::params::<ProducerRevoke>(None, &ProducerRevokeParams { generation: 3 }),
-        Fixture::result::<ProducerRevoke>(None, &Empty {}),
+        Fixture::result::<ProducerRevoke>(
+            None,
+            &ProducerRevokeResult {
+                release_id: Some(3),
+            },
+        ),
         Fixture::params::<CoreStop>(None, &Empty {}),
         Fixture::result::<CoreStop>(None, &Empty {}),
         Fixture::params::<ActionReceipt>(
@@ -473,22 +479,27 @@ pub fn fixtures() -> Vec<Fixture> {
         Fixture::params::<InputReleased>(
             Some("revoked"),
             &InputReleasedParams {
+                release_id: 3,
                 reason: ReleaseReason::GenerationRevoked,
                 producer: Some(step_control()),
                 released_at_ns: 5_600_000_000,
+                verification: ReleaseVerification::Unverified,
             },
         ),
         Fixture::params::<InputReleased>(
             Some("takeover"),
             &InputReleasedParams {
+                release_id: 4,
                 reason: ReleaseReason::Takeover,
                 producer: Some(step_control()),
                 released_at_ns: 5_650_000_000,
+                verification: ReleaseVerification::UpFailed,
             },
         ),
         Fixture::params::<InputResidual>(
             Some("release"),
             &InputResidualParams {
+                release_id: 5,
                 cause: ResidualCause::Release,
                 reason: Some(ReleaseReason::EmergencyStop),
                 items: vec![
@@ -498,34 +509,73 @@ pub fn fixtures() -> Vec<Fixture> {
                     }),
                 ],
                 checked_at_ns: 5_700_050_000,
+                repair_accepted: false,
             },
         ),
         Fixture::params::<InputResidual>(
             Some("core-start"),
             &InputResidualParams {
+                release_id: 1,
                 cause: ResidualCause::CoreStart,
                 reason: None,
                 items: vec![HeldInput::Key(HeldKey { scan_code: 0x1E })],
                 checked_at_ns: 1_050_000,
+                repair_accepted: true,
             },
         ),
         Fixture::params::<OperatorInputResidual>(
             None,
             &InputResidualParams {
+                release_id: 4,
                 cause: ResidualCause::Release,
                 reason: Some(ReleaseReason::Takeover),
                 items: vec![HeldInput::MouseButton(HeldMouseButton {
                     button: MouseButton::Left,
                 })],
                 checked_at_ns: 5_700_050_000,
+                repair_accepted: true,
             },
         ),
         Fixture::params::<InputReleased>(
             Some("core-start"),
             &InputReleasedParams {
+                release_id: 1,
                 reason: ReleaseReason::CoreStart,
                 producer: None,
                 released_at_ns: 1_000_000,
+                verification: ReleaseVerification::Unverified,
+            },
+        ),
+        Fixture::params::<InputVerification>(
+            Some("verified"),
+            &InputVerificationParams {
+                release_id: 3,
+                result: VerificationResult::Verified,
+                checked_at_ns: 5_650_000_000,
+            },
+        ),
+        Fixture::params::<InputVerification>(
+            Some("residual"),
+            &InputVerificationParams {
+                release_id: 5,
+                result: VerificationResult::Residual,
+                checked_at_ns: 5_700_050_000,
+            },
+        ),
+        Fixture::params::<InputVerification>(
+            Some("unavailable"),
+            &InputVerificationParams {
+                release_id: 4,
+                result: VerificationResult::Unavailable,
+                checked_at_ns: 5_700_050_000,
+            },
+        ),
+        Fixture::params::<InputVerification>(
+            Some("superseded"),
+            &InputVerificationParams {
+                release_id: 2,
+                result: VerificationResult::Superseded,
+                checked_at_ns: 5_650_000_000,
             },
         ),
         Fixture::params::<CoreHealth>(
@@ -663,8 +713,9 @@ mod tests {
 
     use super::{fixtures, schema};
     use crate::methods::{
-        InputReleased, InputResidual, Method, MethodInfo, OperatorInputReleased,
-        OperatorInputResidual, catalog, operator_catalog, test_device_catalog,
+        InputReleased, InputResidual, InputVerification, Method, MethodInfo, OperatorInputReleased,
+        OperatorInputResidual, OperatorInputVerification, catalog, operator_catalog,
+        test_device_catalog,
     };
 
     /// 三组方法：核连接上的、操作员许可连接上的与测试设备连接上的。
@@ -824,7 +875,7 @@ mod tests {
     }
 
     /// 测试设备连接与核连接、操作员许可连接没有同名的方法；操作员许可连接与核连接只共有
-    /// `input.released` 与 `input.residual`，两处的 params 相同。
+    /// 输入释放与核验的通知，两处的 params 相同。
     #[test]
     fn the_groups_share_only_the_core_to_operator_notifications() {
         let core: BTreeSet<&str> = catalog().iter().map(|method| method.name).collect();
@@ -838,11 +889,23 @@ mod tests {
         }
         let mut shared: Vec<&str> = core.intersection(&operator).copied().collect();
         shared.sort_unstable();
-        assert_eq!(shared, [InputReleased::NAME, InputResidual::NAME]);
+        assert_eq!(
+            shared,
+            [
+                InputReleased::NAME,
+                InputResidual::NAME,
+                InputVerification::NAME
+            ]
+        );
         assert_eq!(OperatorInputReleased::NAME, InputReleased::NAME);
         assert_eq!(OperatorInputResidual::NAME, InputResidual::NAME);
+        assert_eq!(OperatorInputVerification::NAME, InputVerification::NAME);
         let schema = schema();
-        for name in [InputReleased::NAME, InputResidual::NAME] {
+        for name in [
+            InputReleased::NAME,
+            InputResidual::NAME,
+            InputVerification::NAME,
+        ] {
             assert_eq!(
                 schema["x-operator-methods"][name]["params"],
                 schema["x-methods"][name]["params"]

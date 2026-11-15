@@ -14,29 +14,28 @@ use std::collections::BTreeSet;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-use capture::WindowSelector;
 use core_protocol::messages::{
     Action, HeldInput, HeldKey, HeldMouseButton, MouseButton, ReleaseReason, ResidualCause,
 };
+#[cfg(any(windows, test))]
+use core_protocol::messages::{InputResidualParams, InputVerificationParams, VerificationResult};
 
+#[cfg(any(windows, test))]
+use crate::control::Control;
+use crate::frames::FrameStatus;
 use crate::ledger::{Inject, InputBackend, Momentary};
 
-/// 当前窗口选择器（`capture.set_target` 的 `window`）：真实后端注入前据它找目标窗口；假显示面时为 `None`。
-/// 由主进程一侧随 `capture.set_target` 更新。
-#[derive(Default)]
+/// 真实输入只使用最近写入帧所对应的采集窗口。
 pub(crate) struct TargetWindow {
-    selector: Mutex<Option<WindowSelector>>,
+    frames: Arc<FrameStatus>,
     /// 以真实后端运行：注入要有窗口，`capture.set_target` 的假显示面回 -32003。
     real: bool,
 }
 
 impl TargetWindow {
     /// `real` 为真表示以真实后端运行。
-    pub(crate) fn new(real: bool) -> Self {
-        Self {
-            selector: Mutex::new(None),
-            real,
-        }
+    pub(crate) fn new(real: bool, frames: Arc<FrameStatus>) -> Self {
+        Self { frames, real }
     }
 
     /// 以真实后端运行时采集目标必须是窗口：假显示面没有可注入的窗口。
@@ -44,16 +43,9 @@ impl TargetWindow {
         !(self.real && matches!(target, core_protocol::messages::CaptureTarget::Fake(_)))
     }
 
-    /// 设定当前目标窗口的识别规则；`None` 表示没有窗口（假显示面）。
-    pub(crate) fn set(&self, selector: Option<WindowSelector>) {
-        if let Ok(mut held) = self.selector.lock() {
-            *held = selector;
-        }
-    }
-
-    /// 当前的识别规则。
-    pub(crate) fn get(&self) -> Option<WindowSelector> {
-        self.selector.lock().ok().and_then(|held| held.clone())
+    #[cfg(windows)]
+    fn get(&self) -> Option<(capture::WindowIdentity, crate::frames::Geometry)> {
+        self.frames.captured_window()
     }
 }
 
@@ -118,7 +110,7 @@ pub(crate) struct Desktop {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VerifyKey {
     Scan(u16),
-    Mouse(MouseButton),
+    Mouse(PhysicalButton),
 }
 
 /// 把客户区物理像素 `(cx, cy)` 加客户区原点换算成虚拟桌面的 0–65535 绝对坐标。
@@ -298,11 +290,11 @@ impl Combo {
 
     /// 所有修饰键都按住、且最终键正是刚按下的这个时，算触发。
     fn triggered(&self, final_key: u16, down: &BTreeSet<u16>) -> bool {
-        final_key == self.key
+        normalize_vk(final_key) == self.key
             && self
                 .modifiers
                 .iter()
-                .all(|modifier| down.contains(modifier))
+                .all(|modifier| down.iter().any(|vk| normalize_vk(*vk) == *modifier))
     }
 }
 
@@ -336,6 +328,8 @@ pub(crate) enum Class {
     Takeover,
     /// 急停组合键：不论许可是否有效。
     Emergency,
+    /// 钩子线程已退出。
+    HookLost,
     /// 不触发任何动作（抬起、未过阈值的移动、许可无效时的输入等）。
     Ignore,
 }
@@ -366,10 +360,9 @@ impl HookState {
         combo: &Combo,
         lease_valid: bool,
     ) -> Class {
-        // 先更新按住的键，急停组合键据此判断（不论是否注入）；修饰键不分左右。
+        // 按住集合保存左右两侧的原始键码，判断组合键时才归并。
         match event {
             RawEvent::KeyDown { vk } => {
-                let vk = normalize_vk(vk);
                 let emergency = combo.triggered(vk, &self.down);
                 self.down.insert(vk);
                 if emergency {
@@ -377,7 +370,7 @@ impl HookState {
                 }
             }
             RawEvent::KeyUp { vk } => {
-                self.down.remove(&normalize_vk(vk));
+                self.down.remove(&vk);
             }
             _ => {}
         }
@@ -424,7 +417,10 @@ pub(crate) trait Win32: Send + Sync {
     /// [`self_check_count`] 记下钩子自检要看到的事件数。
     fn send(&self, events: &[Event]) -> u32;
     /// 某个键或鼠标键现在是否按下（`GetAsyncKeyState` 的高位）。读物理鼠标键，不随左右键交换。
-    fn is_down(&self, key: VerifyKey) -> bool;
+    /// 线程能读取当前活动输入桌面的状态。
+    fn can_verify(&self) -> bool;
+    /// `None` 表示这项输入的状态不可读。
+    fn is_down(&self, key: VerifyKey) -> Option<bool>;
 }
 
 /// 钩子自检要计的事件数：SendInput 按顺序接受了前 `sent` 个事件，其中键、鼠标键与滚轮的个数。移动不计：
@@ -462,33 +458,55 @@ impl SelfCheck {
 
 // ---------------------------------------------------------------- 核验残留
 
-/// 核验输入策略里的键与鼠标键：仍读作按住的补发一次抬起（带标记），返回这些项（报进 `input.residual`）。
-pub(crate) fn verify_residual(
+/// 读取白名单内按住的项，连同与读取使用同一物理键的抬起事件。
+fn read_residual(
     win32: &dyn Win32,
     keys: &[u16],
     buttons: &[MouseButton],
-) -> Vec<HeldInput> {
-    let mut items = Vec::new();
-    let mut ups = Vec::new();
+) -> Option<Vec<(HeldInput, Event)>> {
+    if !win32.can_verify() {
+        return None;
+    }
+    let mut down = Vec::new();
     for &scan_code in keys {
-        if win32.is_down(VerifyKey::Scan(scan_code)) {
-            ups.push(key_up_events(scan_code));
-            items.push(HeldInput::Key(HeldKey { scan_code }));
+        if win32.is_down(VerifyKey::Scan(scan_code))? {
+            down.push((
+                HeldInput::Key(HeldKey { scan_code }),
+                key_up_events(scan_code),
+            ));
         }
     }
     let swapped = win32.buttons_swapped();
     for &button in buttons {
-        if win32.is_down(VerifyKey::Mouse(button)) {
-            ups.push(Event::MouseUp {
-                button: physical_button(button, swapped),
-            });
-            items.push(HeldInput::MouseButton(HeldMouseButton { button }));
+        let physical = physical_button(button, swapped);
+        if win32.is_down(VerifyKey::Mouse(physical))? {
+            down.push((
+                HeldInput::MouseButton(HeldMouseButton { button }),
+                Event::MouseUp { button: physical },
+            ));
         }
     }
-    if !ups.is_empty() {
-        win32.send(&ups);
-    }
-    items
+    (win32.can_verify() && swapped == win32.buttons_swapped()).then_some(down)
+}
+
+/// 返回读作按住的项、以及系统是否接受全部补发的抬起事件。
+pub(crate) fn verify_residual(
+    win32: &dyn Win32,
+    keys: &[u16],
+    buttons: &[MouseButton],
+) -> Option<(Vec<HeldInput>, bool)> {
+    let (items, ups): (Vec<_>, Vec<_>) = read_residual(win32, keys, buttons)?.into_iter().unzip();
+    let repair_accepted = ups.is_empty() || win32.send(&ups) as usize == ups.len();
+    Some((items, repair_accepted))
+}
+
+/// 补发抬起后只复查状态。
+pub(crate) fn no_residual(
+    win32: &dyn Win32,
+    keys: &[u16],
+    buttons: &[MouseButton],
+) -> Option<bool> {
+    Some(read_residual(win32, keys, buttons)?.is_empty())
 }
 
 // ---------------------------------------------------------------- 真实后端
@@ -496,6 +514,7 @@ pub(crate) fn verify_residual(
 /// 请求一次残留核验（释放后或收到输入策略时），由核验线程处理。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VerifyRequest {
+    pub(crate) release_id: u64,
     pub(crate) cause: ResidualCause,
     /// `cause` 为 `release` 时那次释放的原因。
     pub(crate) reason: Option<ReleaseReason>,
@@ -504,8 +523,77 @@ pub(crate) struct VerifyRequest {
 /// 核验线程读写的策略里的键与鼠标键。
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VerifyKeys {
+    pub(crate) configured: bool,
+    pub(crate) swapped: bool,
     pub(crate) keys: Vec<u16>,
     pub(crate) buttons: Vec<MouseButton>,
+}
+
+impl VerifyKeys {
+    fn can_check(&self, win32: &dyn Win32) -> bool {
+        self.configured && (self.buttons.is_empty() || win32.buttons_swapped() == self.swapped)
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn check_release(
+    control: &Control,
+    win32: &dyn Win32,
+    keys: &VerifyKeys,
+    request: VerifyRequest,
+    report_residual: impl FnOnce(InputResidualParams),
+    wait_for_repair: impl FnOnce(),
+) -> InputVerificationParams {
+    let id = request.release_id;
+    let mut residual = None;
+    let read = control
+        .with_verification(id, || {
+            let observed = keys
+                .can_check(win32)
+                .then(|| verify_residual(win32, &keys.keys, &keys.buttons))
+                .flatten();
+            let repair_rejected = observed.as_ref().is_some_and(|(_, accepted)| !accepted);
+            (observed, repair_rejected)
+        })
+        .flatten();
+    let result = match read {
+        None => VerificationResult::Unavailable,
+        Some((items, _)) if items.is_empty() => VerificationResult::Verified,
+        Some((items, repair_accepted)) => {
+            residual = Some(InputResidualParams {
+                release_id: id,
+                cause: request.cause,
+                reason: request.reason,
+                items,
+                repair_accepted,
+                checked_at_ns: mono_clock::now_ns(),
+            });
+            if repair_accepted {
+                wait_for_repair();
+                match control
+                    .with_verification(id, || {
+                        let clear = keys
+                            .can_check(win32)
+                            .then(|| no_residual(win32, &keys.keys, &keys.buttons))
+                            .flatten();
+                        (clear, false)
+                    })
+                    .flatten()
+                {
+                    Some(true) => VerificationResult::Verified,
+                    Some(false) => VerificationResult::Residual,
+                    None => VerificationResult::Unavailable,
+                }
+            } else {
+                VerificationResult::Residual
+            }
+        }
+    };
+    let result = control.finish_verification(id, result);
+    if let Some(residual) = residual {
+        report_residual(residual);
+    }
+    result
 }
 
 /// 真实输入后端：用 `SendInput` 注入，注入前核对前台、注入后再核对一次，被拦截即 `Blocked`。释放后与收到
@@ -515,6 +603,8 @@ pub(crate) struct SendInputBackend {
     win32: Arc<dyn Win32>,
     verify: Sender<VerifyRequest>,
     verify_keys: Arc<Mutex<VerifyKeys>>,
+    startup: Option<VerifyRequest>,
+    configured_swap: Option<bool>,
 }
 
 impl SendInputBackend {
@@ -527,6 +617,8 @@ impl SendInputBackend {
             win32,
             verify,
             verify_keys,
+            startup: None,
+            configured_swap: None,
         }
     }
 
@@ -548,21 +640,36 @@ impl SendInputBackend {
     }
 
     /// 抬起类的事件：安全方向，不核对前台，直接注入。
-    fn inject_up(&self, events: &[Event]) {
-        self.win32.send(events);
+    fn inject_up(&self, events: &[Event]) -> bool {
+        self.win32.send(events) as usize == events.len()
+    }
+
+    fn mouse_button(&self, button: MouseButton) -> PhysicalButton {
+        physical_button(
+            button,
+            self.configured_swap
+                .unwrap_or_else(|| self.win32.buttons_swapped()),
+        )
+    }
+
+    fn mouse_mapping_matches(&self) -> bool {
+        self.configured_swap
+            .is_none_or(|swapped| self.win32.buttons_swapped() == swapped)
     }
 }
 
 impl InputBackend for SendInputBackend {
     fn press(&mut self, input: &HeldInput) -> Inject {
-        let swapped = self.win32.buttons_swapped();
         match input {
             HeldInput::Key(key) => {
                 let scan = key.scan_code;
                 self.inject_down(move |_, _| vec![key_down_events(scan)])
             }
             HeldInput::MouseButton(button) => {
-                let physical = physical_button(button.button, swapped);
+                if !self.mouse_mapping_matches() {
+                    return Inject::Blocked;
+                }
+                let physical = self.mouse_button(button.button);
                 self.inject_down(move |_, _| vec![Event::MouseDown { button: physical }])
             }
             // 轴不在真实后端的白名单内（提交时已拒绝）；保险起见不注入。
@@ -570,14 +677,13 @@ impl InputBackend for SendInputBackend {
         }
     }
 
-    fn release(&mut self, input: &HeldInput) {
-        let swapped = self.win32.buttons_swapped();
+    fn release(&mut self, input: &HeldInput) -> bool {
         match input {
             HeldInput::Key(key) => self.inject_up(&[key_up_events(key.scan_code)]),
             HeldInput::MouseButton(button) => self.inject_up(&[Event::MouseUp {
-                button: physical_button(button.button, swapped),
+                button: self.mouse_button(button.button),
             }]),
-            HeldInput::Axis(_) => {}
+            HeldInput::Axis(_) => true,
         }
     }
 
@@ -596,10 +702,12 @@ impl InputBackend for SendInputBackend {
     }
 
     fn begin_momentary(&mut self, momentary: &Momentary) -> Inject {
-        let swapped = self.win32.buttons_swapped();
         match *momentary {
             Momentary::Click { x, y, button } => {
-                let physical = physical_button(button, swapped);
+                if !self.mouse_mapping_matches() {
+                    return Inject::Blocked;
+                }
+                let physical = self.mouse_button(button);
                 self.inject_down(move |target, desktop| {
                     let (ax, ay) = absolute(x, y, target, desktop);
                     vec![
@@ -614,25 +722,39 @@ impl InputBackend for SendInputBackend {
         }
     }
 
-    fn end_momentary(&mut self, momentary: &Momentary) {
-        let swapped = self.win32.buttons_swapped();
+    fn end_momentary(&mut self, momentary: &Momentary) -> bool {
         match *momentary {
             Momentary::Click { button, .. } => self.inject_up(&[Event::MouseUp {
-                button: physical_button(button, swapped),
+                button: self.mouse_button(button),
             }]),
             Momentary::Key { scan_code } => self.inject_up(&[key_up_events(scan_code)]),
         }
     }
 
-    fn released_all(&mut self, reason: ReleaseReason) {
-        // 释放后 50 ms 由核验线程以 GetAsyncKeyState 核验残留；不在锁内等。
-        let _ = self.verify.send(VerifyRequest {
-            cause: ResidualCause::Release,
-            reason: Some(reason),
-        });
+    fn verifies_release(&self) -> bool {
+        true
+    }
+
+    fn released_all(&mut self, reason: ReleaseReason, release_id: u64) {
+        if reason == ReleaseReason::CoreStart {
+            // 启动时还没有输入策略，收到策略后才知道要查哪些键。
+            self.startup = Some(VerifyRequest {
+                release_id,
+                cause: ResidualCause::CoreStart,
+                reason: None,
+            });
+        } else {
+            let _ = self.verify.send(VerifyRequest {
+                release_id,
+                cause: ResidualCause::Release,
+                reason: Some(reason),
+            });
+        }
     }
 
     fn configured(&mut self, policy: &core_protocol::messages::InputPolicy) {
+        let swapped = self.win32.buttons_swapped();
+        self.configured_swap = Some(swapped);
         if let Ok(mut keys) = self.verify_keys.lock() {
             keys.keys = policy
                 .press_keys
@@ -646,12 +768,13 @@ impl InputBackend for SendInputBackend {
                 .chain(&policy.hold_buttons)
                 .copied()
                 .collect();
+            keys.configured = true;
+            keys.swapped = swapped;
         }
         // 新实例收到输入策略时核验一次：旧实例可能留下了按住的键。
-        let _ = self.verify.send(VerifyRequest {
-            cause: ResidualCause::CoreStart,
-            reason: None,
-        });
+        if let Some(request) = self.startup.take() {
+            let _ = self.verify.send(request);
+        }
     }
 }
 

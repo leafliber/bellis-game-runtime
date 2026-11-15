@@ -1,8 +1,10 @@
 {
+  "release_id": 3,
   "reason": "generation_revoked",
   "producer": {
     "id": "step-control",
     "generation": 3
   },
-  "released_at_ns": 5600000000
+  "released_at_ns": 5600000000,
+  "verification": "unverified"
 }

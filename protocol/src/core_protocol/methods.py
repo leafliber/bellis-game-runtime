@@ -12,7 +12,7 @@ from typing import Final
 from core_protocol import models
 from core_protocol.rpc import Direction, Method, Notification, Request
 
-PROTOCOL_VERSION: Final = 1
+PROTOCOL_VERSION: Final = 2
 """核协议版本。握手时两端都核对，不相等即拒绝。"""
 
 CORE_HELLO: Final = Request(
@@ -40,7 +40,10 @@ ACTION_SUBMIT: Final = Request(
     "action.submit", Direction.MAIN_TO_CORE, models.ActionBlock, models.ActionSubmitResult
 )
 PRODUCER_REVOKE: Final = Request(
-    "producer.revoke", Direction.MAIN_TO_CORE, models.ProducerRevokeParams, models.Empty
+    "producer.revoke",
+    Direction.MAIN_TO_CORE,
+    models.ProducerRevokeParams,
+    models.ProducerRevokeResult,
 )
 CORE_STOP: Final = Request("core.stop", Direction.MAIN_TO_CORE, models.Empty, models.Empty)
 ACTION_RECEIPT: Final = Notification(
@@ -51,6 +54,9 @@ INPUT_RELEASED: Final = Notification(
 )
 INPUT_RESIDUAL: Final = Notification(
     "input.residual", Direction.CORE_TO_MAIN, models.InputResidualParams
+)
+INPUT_VERIFICATION: Final = Notification(
+    "input.verification", Direction.CORE_TO_MAIN, models.InputVerificationParams
 )
 CORE_HEALTH: Final = Notification("core.health", Direction.CORE_TO_MAIN, models.CoreHealthParams)
 
@@ -68,6 +74,7 @@ METHODS: Final[Mapping[str, Method]] = {
     ACTION_RECEIPT.name: ACTION_RECEIPT,
     INPUT_RELEASED.name: INPUT_RELEASED,
     INPUT_RESIDUAL.name: INPUT_RESIDUAL,
+    INPUT_VERIFICATION.name: INPUT_VERIFICATION,
     CORE_HEALTH.name: CORE_HEALTH,
 }
 """核连接上的全部方法，按方法名索引。"""
@@ -84,12 +91,16 @@ OPERATOR_INPUT_RELEASED: Final = Notification(
 OPERATOR_INPUT_RESIDUAL: Final = Notification(
     "input.residual", Direction.CORE_TO_OPERATOR, models.InputResidualParams
 )
+OPERATOR_INPUT_VERIFICATION: Final = Notification(
+    "input.verification", Direction.CORE_TO_OPERATOR, models.InputVerificationParams
+)
 
 OPERATOR_METHODS: Final[Mapping[str, Method]] = {
     OPERATOR_LEASE_GRANT.name: OPERATOR_LEASE_GRANT,
     OPERATOR_LEASE_REVOKE.name: OPERATOR_LEASE_REVOKE,
     OPERATOR_INPUT_RELEASED.name: OPERATOR_INPUT_RELEASED,
     OPERATOR_INPUT_RESIDUAL.name: OPERATOR_INPUT_RESIDUAL,
+    OPERATOR_INPUT_VERIFICATION.name: OPERATOR_INPUT_VERIFICATION,
 }
 """操作员许可连接上的全部方法，按方法名索引。"""
 

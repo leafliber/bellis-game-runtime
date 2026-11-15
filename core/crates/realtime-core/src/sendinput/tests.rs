@@ -13,17 +13,22 @@
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use core_protocol::messages::{
-    Action, Click, HeldInput, HeldKey, HeldMouseButton, KeyPress, MouseButton, ReleaseReason,
-    ResidualCause, Scroll,
+    Action, ActionBlock, ActionSubmitResult, Click, ControlStep, HeldInput, HeldKey,
+    HeldMouseButton, KeyPress, LatestFrame, LeaseGrantParams, MouseButton, Producer,
+    ProducerHeartbeatParams, RejectReason, ReleaseReason, ReleaseVerification, ResidualCause,
+    Scroll, VerificationResult,
 };
 
 use super::{
     Class, Combo, Desktop, Event, HookState, PhysicalButton, RawEvent, SelfCheck, Target,
-    VerifyKey, VerifyKeys, Win32, absolute, normalize_vk, physical_button, self_check_count,
-    verify_residual,
+    VerifyKey, VerifyKeys, Win32, absolute, check_release, normalize_vk, physical_button,
+    self_check_count, verify_residual,
 };
+use crate::control::{Control, Limits, Notice};
+use crate::frames::{FrameStatus, Geometry};
 use crate::ledger::{Inject, InputBackend, Momentary};
 use crate::sendinput::SendInputBackend;
 
@@ -43,7 +48,8 @@ struct FakeInner {
     accept: Option<usize>,
     /// 读作按下的键与鼠标键。
     down_scans: Vec<u16>,
-    down_buttons: Vec<MouseButton>,
+    down_buttons: Vec<PhysicalButton>,
+    desktop_unavailable: bool,
     sent: Vec<Vec<Event>>,
 }
 
@@ -94,12 +100,16 @@ impl Win32 for FakeWin32 {
         accepted as u32
     }
 
-    fn is_down(&self, key: VerifyKey) -> bool {
+    fn can_verify(&self) -> bool {
+        !self.inner().desktop_unavailable
+    }
+
+    fn is_down(&self, key: VerifyKey) -> Option<bool> {
         let inner = self.inner();
-        match key {
+        Some(match key {
             VerifyKey::Scan(scan) => inner.down_scans.contains(&scan),
             VerifyKey::Mouse(button) => inner.down_buttons.contains(&button),
-        }
+        })
     }
 }
 
@@ -179,6 +189,24 @@ fn combo_parses_and_triggers() {
     assert!(Combo::parse("ctrl+ctrl+a").is_err(), "修饰键重复");
     assert!(Combo::parse("ctrl+a+b").is_err(), "多个最终键");
     assert!(Combo::parse("ctrl+nope").is_err());
+}
+
+#[test]
+fn regression_emergency_modifier_survives_other_side_key_up() {
+    let mut state = HookState::default();
+    let combo = Combo::default_hotkey();
+    for event in [
+        RawEvent::KeyDown { vk: 0xA2 }, // VK_LCONTROL
+        RawEvent::KeyDown { vk: 0xA3 }, // VK_RCONTROL
+        RawEvent::KeyDown { vk: 0xA0 }, // VK_LSHIFT
+        RawEvent::KeyUp { vk: 0xA2 },
+    ] {
+        state.classify(event, false, false, &combo, false);
+    }
+    assert_eq!(
+        state.classify(RawEvent::KeyDown { vk: 0x7B }, false, false, &combo, false),
+        Class::Emergency
+    );
 }
 
 // ---------------------------------------------------------------- 钩子分类
@@ -622,13 +650,15 @@ fn verify_resends_ups_for_still_held_keys() {
     let win32 = Arc::new(FakeWin32 {
         inner: Mutex::new(FakeInner {
             down_scans: vec![0x11],
-            down_buttons: vec![MouseButton::Left],
+            down_buttons: vec![PhysicalButton::Left],
             ..FakeInner::default()
         }),
     });
-    let items = verify_residual(win32.as_ref(), &[0x11, 0x1C], &[MouseButton::Left]);
+    let (items, repair_accepted) =
+        verify_residual(win32.as_ref(), &[0x11, 0x1C], &[MouseButton::Left]).unwrap();
     // 只有读作按下的两项（0x1C 没按下不补）。
     assert_eq!(items.len(), 2);
+    assert!(repair_accepted);
     assert!(items.contains(&HeldInput::Key(HeldKey { scan_code: 0x11 })));
     assert!(items.contains(&HeldInput::MouseButton(HeldMouseButton {
         button: MouseButton::Left
@@ -646,35 +676,504 @@ fn verify_resends_ups_for_still_held_keys() {
 }
 
 #[test]
+fn regression_verify_queries_the_physical_button_when_swapped() {
+    let win32 = FakeWin32 {
+        inner: Mutex::new(FakeInner {
+            swapped: true,
+            down_buttons: vec![PhysicalButton::Right],
+            ..FakeInner::default()
+        }),
+    };
+    let (items, repair_accepted) = verify_residual(&win32, &[], &[MouseButton::Left]).unwrap();
+    assert!(repair_accepted);
+    assert_eq!(
+        items,
+        [HeldInput::MouseButton(HeldMouseButton {
+            button: MouseButton::Left
+        })]
+    );
+    assert_eq!(
+        win32.inner().sent,
+        [vec![Event::MouseUp {
+            button: PhysicalButton::Right
+        }]]
+    );
+}
+
+#[test]
 fn verify_sends_nothing_when_nothing_is_held() {
     let win32 = Arc::new(FakeWin32::default());
-    let items = verify_residual(win32.as_ref(), &[0x11], &[MouseButton::Left]);
+    let (items, _) = verify_residual(win32.as_ref(), &[0x11], &[MouseButton::Left]).unwrap();
     assert!(items.is_empty());
     assert!(win32.inner().sent.is_empty());
 }
 
 #[test]
-fn released_all_and_configured_request_verification() {
+fn verify_reports_a_rejected_repair() {
+    let win32 = FakeWin32 {
+        inner: Mutex::new(FakeInner {
+            accept: Some(0),
+            down_scans: vec![0x11],
+            ..FakeInner::default()
+        }),
+    };
+    let (items, repair_accepted) = verify_residual(&win32, &[0x11], &[]).unwrap();
+    assert_eq!(items, [HeldInput::Key(HeldKey { scan_code: 0x11 })]);
+    assert!(!repair_accepted);
+}
+
+#[test]
+fn regression_rejected_key_up_is_reported() {
     let win32 = FakeWin32::with_target(target(1));
-    let (mut backend, rx) = backend(&win32);
-    backend.released_all(ReleaseReason::EmergencyStop);
-    let request = rx.try_recv().unwrap();
-    assert_eq!(request.cause, ResidualCause::Release);
-    assert_eq!(request.reason, Some(ReleaseReason::EmergencyStop));
-    backend.configured(&core_protocol::messages::InputPolicy {
+    let (backend, _verify) = backend(&win32);
+    let frames = Arc::new(FrameStatus::default());
+    frames.record(
+        LatestFrame {
+            frame_number: 1,
+            capture_ns: 100,
+        },
+        Geometry {
+            width: 320,
+            height: 180,
+            dpi: 96,
+        },
+        None,
+    );
+    let control = Control::new(
+        Limits {
+            heartbeat_timeout: Duration::from_secs(1),
+            max_frame_age: Duration::from_secs(1),
+        },
+        frames,
+        Some(Box::new(backend)),
+        false,
+    );
+    let producer = Producer {
+        id: "fake-win32".into(),
+        generation: 1,
+    };
+    control
+        .grant_lease(
+            &LeaseGrantParams {
+                token: 1,
+                expires_ns: 500,
+            },
+            100,
+        )
+        .0
+        .unwrap();
+    control
+        .heartbeat(
+            &ProducerHeartbeatParams {
+                producer: producer.clone(),
+                seq: 1,
+            },
+            100,
+        )
+        .unwrap();
+    let block = ActionBlock {
+        producer,
+        seq: 1,
+        base_frame: 1,
+        start_ns: 100,
+        deadline_ns: 400,
+        steps: vec![ControlStep {
+            offset_ns: 0,
+            held: vec![HeldInput::Key(HeldKey { scan_code: 0x11 })],
+            actions: Vec::new(),
+        }],
+    };
+    assert!(matches!(
+        control.submit(block, 100).0,
+        ActionSubmitResult::Accepted(_)
+    ));
+    control.tick(100);
+    win32.inner().accept = Some(0);
+
+    let (release_id, notices) = control.revoke(1);
+    assert_eq!(
+        win32.inner().sent,
+        [
+            vec![Event::KeyDown {
+                scan_code: 0x11,
+                extended: false
+            }],
+            vec![Event::KeyUp {
+                scan_code: 0x11,
+                extended: false
+            }],
+        ]
+    );
+    let [Notice::Released(released)] = notices.0.as_slice() else {
+        panic!("expected one release, got {notices:?}");
+    };
+    assert_eq!(release_id, Some(released.release_id));
+    assert_eq!(
+        serde_json::to_value(released).unwrap()["verification"],
+        "up_failed"
+    );
+    assert!(
+        control
+            .grant_lease(
+                &LeaseGrantParams {
+                    token: 2,
+                    expires_ns: 600
+                },
+                200
+            )
+            .0
+            .is_err(),
+        "the same instance cannot accept a new lease after a rejected up"
+    );
+}
+
+fn verification_policy() -> core_protocol::messages::InputPolicy {
+    core_protocol::messages::InputPolicy {
         click_buttons: vec![MouseButton::Left],
         press_keys: vec![0x1C],
         scroll: false,
-        click_regions: vec![],
+        click_regions: vec![core_protocol::messages::NormRect {
+            left: 0.0,
+            top: 0.0,
+            right: 1.0,
+            bottom: 1.0,
+        }],
         forbidden_zones: vec![],
         press_duration_ms: 50,
         max_rate: 1.0,
         hold_keys: vec![0x11],
         hold_buttons: vec![],
         max_hold_ms: Some(1000),
-    });
+    }
+}
+
+fn verifying_control(
+    win32: &Arc<FakeWin32>,
+) -> (
+    Control,
+    Arc<Mutex<VerifyKeys>>,
+    mpsc::Receiver<super::VerifyRequest>,
+) {
+    let (tx, rx) = mpsc::channel();
+    let keys = Arc::new(Mutex::new(VerifyKeys::default()));
+    let backend = SendInputBackend::new(Arc::clone(win32) as Arc<dyn Win32>, tx, Arc::clone(&keys));
+    let frames = Arc::new(FrameStatus::default());
+    frames.record(
+        LatestFrame {
+            frame_number: 1,
+            capture_ns: 100,
+        },
+        Geometry {
+            width: 320,
+            height: 180,
+            dpi: 96,
+        },
+        None,
+    );
+    let control = Control::new(
+        Limits {
+            heartbeat_timeout: Duration::from_secs(1),
+            max_frame_age: Duration::from_secs(1),
+        },
+        frames,
+        Some(Box::new(backend)),
+        true,
+    );
+    (control, keys, rx)
+}
+
+#[test]
+fn an_old_check_never_opens_a_new_release_gate() {
+    let win32 = FakeWin32::with_target(target(1));
+    let (control, keys, rx) = verifying_control(&win32);
+    let startup = control.release_on_start();
+    assert_eq!(startup.verification, ReleaseVerification::Unverified);
+    assert!(rx.try_recv().is_err());
+    control.configure(&verification_policy()).unwrap();
+    let old = rx.try_recv().unwrap();
+    assert_eq!(old.release_id, startup.release_id);
+    assert_eq!(old.cause, ResidualCause::CoreStart);
+    control.local_revoke(ReleaseReason::Takeover);
+    let new = rx.try_recv().unwrap();
+    let keys = keys.lock().unwrap().clone();
+    let observe = |request| {
+        check_release(
+            &control,
+            win32.as_ref(),
+            &keys,
+            request,
+            |_| unreachable!(),
+            || unreachable!(),
+        )
+    };
+    let old_result = observe(old);
+    assert_eq!(old_result.result, VerificationResult::Superseded);
+    control.verification_posted(old_result.release_id);
+
+    let lease = LeaseGrantParams {
+        token: 1,
+        expires_ns: 600,
+    };
+    control.grant_lease(&lease, 100).0.unwrap();
+    let producer = Producer {
+        id: "fake-win32".into(),
+        generation: 1,
+    };
+    control
+        .heartbeat(
+            &ProducerHeartbeatParams {
+                producer: producer.clone(),
+                seq: 1,
+            },
+            100,
+        )
+        .unwrap();
+    let inputs = ActionBlock {
+        producer,
+        seq: 1,
+        base_frame: 1,
+        start_ns: 100,
+        deadline_ns: 400,
+        steps: vec![ControlStep {
+            offset_ns: 0,
+            held: vec![HeldInput::Key(HeldKey { scan_code: 0x11 })],
+            actions: vec![],
+        }],
+    };
+    assert!(matches!(control.submit(inputs.clone(), 100).0,
+        ActionSubmitResult::Rejected(r) if r.reason == RejectReason::NotAllowed));
+    let new_result = observe(new);
+    assert_eq!(new_result.result, VerificationResult::Verified);
+    assert!(matches!(
+        control.submit(inputs.clone(), 100).0,
+        ActionSubmitResult::Rejected(_)
+    ));
+    control.verification_posted(new_result.release_id);
+    assert!(matches!(
+        control.submit(inputs, 100).0,
+        ActionSubmitResult::Accepted(_)
+    ));
+    control.tick(100);
+    assert_eq!(win32.inner().sent.len(), 1);
+    assert_eq!(observe(old).result, VerificationResult::Superseded);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "按顺序核对提交、心跳、许可替换共享的核验门禁"
+)]
+fn regression_a_replacement_producer_cannot_press_before_release_verification() {
+    let win32 = FakeWin32::with_target(target(1));
+    let (control, keys, rx) = verifying_control(&win32);
+    control.release_on_start();
+    control.configure(&verification_policy()).unwrap();
+    let keys = keys.lock().unwrap().clone();
+    let check = |request| {
+        let checked = check_release(
+            &control,
+            win32.as_ref(),
+            &keys,
+            request,
+            |_| unreachable!(),
+            || unreachable!(),
+        );
+        assert_eq!(checked.result, VerificationResult::Verified);
+        control.verification_posted(checked.release_id);
+    };
+    check(rx.try_recv().unwrap());
+    let lease = LeaseGrantParams {
+        token: 1,
+        expires_ns: 600,
+    };
+    control.grant_lease(&lease, 100).0.unwrap();
+    let old = Producer {
+        id: "old".into(),
+        generation: 1,
+    };
+    control
+        .heartbeat(
+            &ProducerHeartbeatParams {
+                producer: old,
+                seq: 1,
+            },
+            100,
+        )
+        .unwrap();
+    let new = Producer {
+        id: "new".into(),
+        generation: 2,
+    };
+    let block = ActionBlock {
+        producer: new.clone(),
+        seq: 1,
+        base_frame: 1,
+        start_ns: 200,
+        deadline_ns: 400,
+        steps: vec![ControlStep {
+            offset_ns: 0,
+            held: vec![HeldInput::Key(HeldKey { scan_code: 0x11 })],
+            actions: vec![],
+        }],
+    };
+    let (result, notices) = control.submit(block.clone(), 200);
+    assert!(matches!(result, ActionSubmitResult::Accepted(_)));
+    assert_eq!(notices.released(), [ReleaseReason::ProducerChanged]);
+    // 新代次在检查前也有心跳，确保不靠心跳缺失挡下它。
+    control
+        .heartbeat(
+            &ProducerHeartbeatParams {
+                producer: new,
+                seq: 1,
+            },
+            200,
+        )
+        .unwrap();
+    control.tick(200);
+    assert!(
+        win32.inner().sent.is_empty(),
+        "new inputs must wait for this release check"
+    );
+    check(rx.try_recv().unwrap());
+    control.tick(201);
+    assert_eq!(win32.inner().sent.len(), 1);
+
+    let next = Producer {
+        id: "next".into(),
+        generation: 3,
+    };
+    let heartbeat_release = control
+        .heartbeat(
+            &ProducerHeartbeatParams {
+                producer: next.clone(),
+                seq: 1,
+            },
+            202,
+        )
+        .unwrap();
+    assert_eq!(
+        heartbeat_release.released(),
+        [ReleaseReason::ProducerChanged]
+    );
+    let next_block = ActionBlock {
+        producer: next,
+        ..block
+    };
+    assert!(matches!(
+        control.submit(next_block.clone(), 202).0,
+        ActionSubmitResult::Rejected(_)
+    ));
+
+    let (grant, lease_release) = control.grant_lease(
+        &LeaseGrantParams {
+            token: 2,
+            expires_ns: 700,
+        },
+        203,
+    );
+    grant.unwrap();
+    assert_eq!(lease_release.released(), [ReleaseReason::LeaseRevoked]);
+    assert!(matches!(
+        control.submit(next_block.clone(), 203).0,
+        ActionSubmitResult::Rejected(_)
+    ));
+    control.tick(203);
+    assert_eq!(
+        win32.inner().sent.len(),
+        2,
+        "only the previous key up may follow"
+    );
+
+    let heartbeat_check = check_release(
+        &control,
+        win32.as_ref(),
+        &keys,
+        rx.try_recv().unwrap(),
+        |_| unreachable!(),
+        || unreachable!(),
+    );
+    assert_eq!(heartbeat_check.result, VerificationResult::Superseded);
+    control.verification_posted(heartbeat_check.release_id);
+    assert!(matches!(
+        control.submit(next_block.clone(), 203).0,
+        ActionSubmitResult::Rejected(_)
+    ));
+    check(rx.try_recv().unwrap());
+    assert!(matches!(
+        control.submit(next_block, 203).0,
+        ActionSubmitResult::Accepted(_)
+    ));
+    control.tick(203);
+    assert_eq!(win32.inner().sent.len(), 3);
+}
+
+#[test]
+fn a_rejected_residual_repair_or_unreadable_desktop_blocks_new_leases() {
+    for (unavailable, expected) in [
+        (false, VerificationResult::Residual),
+        (true, VerificationResult::Unavailable),
+    ] {
+        let win32 = FakeWin32::with_target(target(1));
+        let (control, keys, rx) = verifying_control(&win32);
+        control.release_on_start();
+        control.configure(&verification_policy()).unwrap();
+        let request = rx.try_recv().unwrap();
+        {
+            let mut state = win32.inner();
+            state.desktop_unavailable = unavailable;
+            state.down_scans = vec![0x11];
+            state.accept = Some(0);
+        }
+        let mut residual = None;
+        let checked = check_release(
+            &control,
+            win32.as_ref(),
+            &keys.lock().unwrap(),
+            request,
+            |report| residual = Some(report),
+            || unreachable!(),
+        );
+        assert_eq!(checked.release_id, request.release_id);
+        assert_eq!(checked.result, expected);
+        if unavailable {
+            assert!(residual.is_none());
+            assert!(win32.inner().sent.is_empty());
+        } else {
+            let residual = residual.unwrap();
+            assert_eq!(residual.release_id, request.release_id);
+            assert!(!residual.repair_accepted);
+        }
+        control.verification_posted(checked.release_id);
+        assert!(
+            control
+                .grant_lease(
+                    &LeaseGrantParams {
+                        token: 2,
+                        expires_ns: 600
+                    },
+                    200
+                )
+                .0
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn released_all_and_configured_request_verification() {
+    let win32 = FakeWin32::with_target(target(1));
+    let (mut backend, rx) = backend(&win32);
+    backend.released_all(ReleaseReason::CoreStart, 1);
+    assert!(rx.try_recv().is_err());
+    backend.released_all(ReleaseReason::EmergencyStop, 2);
+    let request = rx.try_recv().unwrap();
+    assert_eq!(request.cause, ResidualCause::Release);
+    assert_eq!(request.release_id, 2);
+    assert_eq!(request.reason, Some(ReleaseReason::EmergencyStop));
+    backend.configured(&verification_policy());
     let request = rx.try_recv().unwrap();
     assert_eq!(request.cause, ResidualCause::CoreStart);
+    assert_eq!(request.release_id, 1);
     assert_eq!(request.reason, None);
     let _ = Arc::clone(&win32);
 }
@@ -702,11 +1201,11 @@ fn the_real_backend_refuses_a_fake_display_target() {
         title: Some("Game".into()),
     });
     // 真实后端：假显示面没有可注入的窗口（回 -32003），窗口目标照常。
-    let real = super::TargetWindow::new(true);
+    let real = super::TargetWindow::new(true, Arc::default());
     assert!(!real.accepts(&fake));
     assert!(real.accepts(&window));
     // 没有真实后端时两种都接受。
-    let other = super::TargetWindow::new(false);
+    let other = super::TargetWindow::new(false, Arc::default());
     assert!(other.accepts(&fake));
     assert!(other.accepts(&window));
 }

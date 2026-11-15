@@ -117,18 +117,28 @@ class FakeCore:
     grants: list[LeaseGrantParams] = field(default_factory=list[LeaseGrantParams])
     revokes: list[LeaseRevokeParams] = field(default_factory=list[LeaseRevokeParams])
     refuse: bool = False
+    release_id: int = 0
 
     def released(self, reason: str) -> None:
+        self.release_id += 1
         params = InputReleasedParams.model_validate(
-            {"reason": reason, "producer": None, "released_at_ns": 123}
+            {
+                "release_id": self.release_id,
+                "reason": reason,
+                "producer": None,
+                "released_at_ns": 123,
+                "verification": "unverified",
+            }
         )
         self.peer.notify("input.released", params.model_dump(mode="json"))
 
-    def residual(self, cause: str, reason: str | None) -> None:
+    def residual(self, cause: str, reason: str | None, *, release_id: int) -> None:
         params = {
+            "release_id": release_id,
             "cause": cause,
             "reason": reason,
             "items": [{"type": "key", "scan_code": 0x11}],
+            "repair_accepted": True,
             "checked_at_ns": 456,
         }
         self.peer.notify("input.residual", params)
@@ -436,7 +446,7 @@ def test_residual_is_shown_and_logged(data_dir: Path) -> None:
             await b.confirm_all()
             await b.console.start()
             await until(lambda: core.grants or None)
-            core.residual("release", "emergency_stop")
+            core.residual("release", "emergency_stop", release_id=1)
             await until(
                 lambda: next(
                     (
@@ -447,7 +457,7 @@ def test_residual_is_shown_and_logged(data_dir: Path) -> None:
                     None,
                 )
             )
-            # 残留不改变状态。
+            # 系统接受补发抬起，控制台继续等待物理核验结果。
             assert b.console.state is SessionState.RUNNING
             await core.close()
         log = session_events(b.console.log_path or Path())
@@ -456,6 +466,8 @@ def test_residual_is_shown_and_logged(data_dir: Path) -> None:
         assert residual[0]["cause"] == "release"
         assert residual[0]["reason"] == "emergency_stop"
         assert residual[0]["items"] == 1
+        assert residual[0]["release_id"] == 1
+        assert residual[0]["repair_accepted"] is True
 
     run(main)
 

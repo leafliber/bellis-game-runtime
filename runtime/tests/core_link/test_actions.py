@@ -836,7 +836,7 @@ def test_killing_the_main_process_releases_held_inputs_via_the_lifeline(
             print(f"杀掉主进程 → 测试设备收到抬起：{ms(up.received_ns - killed):.1f} ms")
             assert gone(core_pid, 5), "实时核没有退出"
             text = log_path.read_text(encoding="utf-8", errors="replace")
-            assert "released all inputs, exiting" in text, text
+            assert "input release requested, exiting" in text, text
         finally:
             if main.poll() is None:
                 main.kill()

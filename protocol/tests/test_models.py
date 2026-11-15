@@ -78,16 +78,15 @@ def test_the_test_device_group_is_separate() -> None:
     assert not {method.direction for method in METHODS.values()} & test_directions
 
 
-def test_the_operator_group_shares_only_input_released() -> None:
-    """操作员许可连接上的方法单独成组，方向只在控制台与实时核之间；与核连接只共有 `input.released`
-    与 `input.residual`，params 相同。许可的 params 与测试许可源的相同。"""
+def test_the_operator_group_shares_the_input_release_and_verification_notices() -> None:
+    """操作员许可连接与核连接共有输入释放与核验通知，许可请求沿用测试许可源的 params。"""
     operator_directions = {Direction.CORE_TO_OPERATOR, Direction.OPERATOR_TO_CORE}
     assert {method.direction for method in OPERATOR_METHODS.values()} == operator_directions
     assert not {method.direction for method in METHODS.values()} & operator_directions
-    # 与核连接只共有发往控制台的两条通知：input.released 与 input.residual。
-    assert METHODS.keys() & OPERATOR_METHODS.keys() == {"input.released", "input.residual"}
-    assert OPERATOR_METHODS["input.released"].params is METHODS["input.released"].params
-    assert OPERATOR_METHODS["input.residual"].params is METHODS["input.residual"].params
+    shared = {"input.released", "input.residual", "input.verification"}
+    assert METHODS.keys() & OPERATOR_METHODS.keys() == shared
+    for method in shared:
+        assert OPERATOR_METHODS[method].params is METHODS[method].params
     for name in ("grant", "revoke"):
         operator = OPERATOR_METHODS[f"operator_lease.{name}"]
         test = TEST_DEVICE_METHODS[f"test_lease.{name}"]

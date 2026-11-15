@@ -15,8 +15,8 @@ use crate::messages::{
     ActionBlock, ActionReceiptParams, ActionSubmitResult, AudioRingAttachParams,
     AudioSetTargetParams, CaptureSetTargetParams, CoreHealthParams, CoreHelloParams,
     CoreHelloResult, Empty, FakeInputEventParams, FrameRingAttachParams, InputPolicy,
-    InputReleasedParams, InputResidualParams, LeaseGrantParams, LeaseRevokeParams,
-    ProducerHeartbeatParams, ProducerRevokeParams,
+    InputReleasedParams, InputResidualParams, InputVerificationParams, LeaseGrantParams,
+    LeaseRevokeParams, ProducerHeartbeatParams, ProducerRevokeParams, ProducerRevokeResult,
 };
 
 /// 消息的发送方。
@@ -146,16 +146,18 @@ methods! {
     ProducerHeartbeat = "producer.heartbeat", MainToCore, ProducerHeartbeatParams;
     /// 提交动作块。
     ActionSubmit = "action.submit", MainToCore, ActionBlock => ActionSubmitResult;
-    /// 作废代次；释放完成后才回应，回应即输入已释放的确认。
-    ProducerRevoke = "producer.revoke", MainToCore, ProducerRevokeParams => Empty;
+    /// 作废代次并返回对应的释放编号。
+    ProducerRevoke = "producer.revoke", MainToCore, ProducerRevokeParams => ProducerRevokeResult;
     /// 正常停止（Bellis R-06 停止顺序中的 RPC 一步）。
     CoreStop = "core.stop", MainToCore, Empty => Empty;
     /// 执行回执。
     ActionReceipt = "action.receipt", CoreToMain, ActionReceiptParams;
     /// 输入已释放的确认。
     InputReleased = "input.released", CoreToMain, InputReleasedParams;
-    /// 真实后端核验时仍读作按住、已补发抬起的项。
+    /// 真实后端读作按住的项与补发抬起的提交结果。
     InputResidual = "input.residual", CoreToMain, InputResidualParams;
+    /// 一次释放的物理核验结果。
+    InputVerification = "input.verification", CoreToMain, InputVerificationParams;
     /// 实时核健康。
     CoreHealth = "core.health", CoreToMain, CoreHealthParams;
 }
@@ -168,10 +170,12 @@ methods! {
     OperatorLeaseGrant = "operator_lease.grant", OperatorToCore, LeaseGrantParams => Empty;
     /// 操作员控制台吊销输入许可；释放完成后才回应。
     OperatorLeaseRevoke = "operator_lease.revoke", OperatorToCore, LeaseRevokeParams => Empty;
-    /// 输入已释放的确认，与核连接上的 `input.released` 同名、同 params。
+    /// 释放处理回执，与核连接上的 `input.released` 同名、同 params。
     OperatorInputReleased = "input.released", CoreToOperator, InputReleasedParams;
     /// 核验出残留时发出，与核连接上的 `input.residual` 同名、同 params。
     OperatorInputResidual = "input.residual", CoreToOperator, InputResidualParams;
+    /// 一次释放的物理核验结果，与核连接上的 `input.verification` 相同。
+    OperatorInputVerification = "input.verification", CoreToOperator, InputVerificationParams;
 }
 
 methods! {

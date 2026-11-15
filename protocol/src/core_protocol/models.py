@@ -503,7 +503,7 @@ class RejectReason(StrEnum):
 
 class ProducerRevokeParams(BaseModel):
     """
-    `producer.revoke` 的 params：作废代次。实时核释放完成后才回应，回应即输入已释放的确认。
+    `producer.revoke` 的 params：作废代次。
     """
 
     model_config = ConfigDict(
@@ -512,6 +512,20 @@ class ProducerRevokeParams(BaseModel):
     generation: Annotated[int, Field(ge=0, le=18446744073709551615)]
     """
     作废此代次及更早的全部代次。
+    """
+
+
+class ProducerRevokeResult(BaseModel):
+    """
+    `producer.revoke` 的 result：代次已作废，物理核验另行通知。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    release_id: Annotated[int | None, Field(ge=0, le=18446744073709551615)] = None
+    """
+    对应的释放编号。没有可关联的释放时为 `null`。
     """
 
 
@@ -595,7 +609,7 @@ class ReleaseReason(StrEnum):
     """
     GENERATION_REVOKED = "generation_revoked"
     """
-    当前代次被 `producer.revoke` 作废。
+    当前代次被 `producer.revoke` 或采集源变更作废。
     """
     PRODUCER_CHANGED = "producer_changed"
     """
@@ -647,7 +661,7 @@ class ReleaseReason(StrEnum):
     """
     HOOK_LOST = "hook_lost"
     """
-    真实后端：本实例的注入没有经过自己的钩子，钩子已失效；同时在本地撤权，随后重新装钩子。
+    真实后端：钩子失效；本实例释放并拒绝后续许可。
     """
     MAX_HOLD = "max_hold"
     """
@@ -667,6 +681,21 @@ class ReleaseReason(StrEnum):
     """
 
 
+class ReleaseVerification(StrEnum):
+    """
+    释放回执能提供的证据。物理按键状态由残留检查另行观察。
+    """
+
+    UNVERIFIED = "unverified"
+    """
+    抬起请求已处理，发出时没有物理释放证据。
+    """
+    UP_FAILED = "up_failed"
+    """
+    后端至少拒绝了一项抬起。
+    """
+
+
 class ResidualCause(StrEnum):
     """
     `input.residual` 的核验缘由。
@@ -679,6 +708,29 @@ class ResidualCause(StrEnum):
     CORE_START = "core_start"
     """
     新实例收到输入策略时的核验，旧实例可能留下了按住的键。
+    """
+
+
+class VerificationResult(StrEnum):
+    """
+    真实后端对一次释放的观察。
+    """
+
+    VERIFIED = "verified"
+    """
+    可读取输入桌面，白名单内的键与鼠标键均未读作按住。
+    """
+    RESIDUAL = "residual"
+    """
+    仍有残留，或系统拒绝了补发抬起。
+    """
+    UNAVAILABLE = "unavailable"
+    """
+    无法读取有效的按键状态，或释放时已有已知抬起失败。
+    """
+    SUPERSEDED = "superseded"
+    """
+    这次核验已被更新的释放取代。
     """
 
 
@@ -1210,12 +1262,16 @@ class ActionOutcome(RootModel[Executed | Dropped | Uncertain]):
 
 class InputReleasedParams(BaseModel):
     """
-    `input.released` 的 params：实时核释放了全部输入。
+    `input.released` 的 params：实时核已处理一次全部释放请求。
     """
 
     model_config = ConfigDict(
         extra="forbid",
     )
+    release_id: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    本实例内递增的释放编号，与后续物理核验关联。
+    """
     reason: ReleaseReason
     """
     释放的原因。
@@ -1226,19 +1282,27 @@ class InputReleasedParams(BaseModel):
     """
     released_at_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
     """
-    释放完成的时刻。
+    抬起请求处理完毕的时刻。
+    """
+    verification: ReleaseVerification
+    """
+    本次释放的证据状态。
     """
 
 
 class InputResidualParams(BaseModel):
     """
     `input.residual` 的 params：只在真实后端上。释放全部输入之后、以及收到输入策略时，实时核以
-    `GetAsyncKeyState` 核验输入策略里的键与鼠标键，仍读作按住的项已补发抬起，以这条通知报出。
+    `GetAsyncKeyState` 读输入策略里的键与鼠标键，报告读作按住的项及补发抬起的提交结果。
     """
 
     model_config = ConfigDict(
         extra="forbid",
     )
+    release_id: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    对应的释放编号。
+    """
     cause: ResidualCause
     """
     核验的缘由。
@@ -1249,11 +1313,37 @@ class InputResidualParams(BaseModel):
     """
     items: list[HeldInput]
     """
-    读作按住、已补发抬起的项，至少一项；只有 `key` 与 `mouse_button`。
+    读作按住的项，至少一项；只有 `key` 与 `mouse_button`。
+    """
+    repair_accepted: bool
+    """
+    系统是否接受了全部补发事件。
     """
     checked_at_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
     """
     读按键状态的时刻。
+    """
+
+
+class InputVerificationParams(BaseModel):
+    """
+    `input.verification` 的 params：对应一次释放的物理核验结果。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    release_id: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    本实例内对应的释放编号。
+    """
+    result: VerificationResult
+    """
+    只描述该次释放的核验。
+    """
+    checked_at_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
+    """
+    核验结果的时刻。
     """
 
 

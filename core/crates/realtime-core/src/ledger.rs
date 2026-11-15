@@ -50,16 +50,21 @@ pub(crate) enum Momentary {
 pub(crate) trait InputBackend: Send {
     /// 按下一个键或鼠标键并保持，或把轴设为给定的取值。
     fn press(&mut self, input: &HeldInput) -> Inject;
-    /// 抬起一个按住的键或鼠标键，或释放一个轴。
-    fn release(&mut self, input: &HeldInput);
+    /// 抬起一个按住的键或鼠标键，或释放一个轴。返回后端是否接受。
+    fn release(&mut self, input: &HeldInput) -> bool;
     /// 没有输入策略时执行一个一次性动作（单个事件，G0 的行为）。
     fn act(&mut self, action: &Action) -> Inject;
     /// 有输入策略时按下一个瞬时动作（点击或短按）。
     fn begin_momentary(&mut self, momentary: &Momentary) -> Inject;
-    /// 抬起一个瞬时动作。
-    fn end_momentary(&mut self, momentary: &Momentary);
-    /// 释放全部输入已完成：此前按住的每一项都已逐一抬起。
-    fn released_all(&mut self, reason: ReleaseReason);
+    /// 抬起一个瞬时动作。返回后端是否接受。
+    fn end_momentary(&mut self, momentary: &Momentary) -> bool;
+    /// 已逐项请求抬起，后端可据此安排残留核验。
+    fn released_all(&mut self, reason: ReleaseReason, release_id: u64);
+
+    /// 后端是否会异步核验该次释放。
+    fn verifies_release(&self) -> bool {
+        false
+    }
     /// 收到输入策略：真实后端据此知道要核验哪些键与鼠标键，并做一次 `core_start` 核验。缺省不做。
     fn configured(&mut self, policy: &InputPolicy) {
         let _ = policy;
@@ -128,16 +133,19 @@ impl InputLedger {
     }
 
     /// 抬起身份不在 `keep` 中的每一项持续状态。抬起不需要权威检查，瞬时按住不受它影响。
-    pub(crate) fn release_missing(&mut self, keep: &[HeldInput]) {
+    pub(crate) fn release_missing(&mut self, keep: &[HeldInput]) -> bool {
         let keep: Vec<HeldId> = keep.iter().map(HeldId::of).collect();
         let backend = &mut self.backend;
+        let mut accepted = true;
         self.held.retain(|held| {
-            let kept = keep.contains(&HeldId::of(&held.input));
-            if !kept && let Some(backend) = backend.as_mut() {
-                backend.release(&held.input);
+            if keep.contains(&HeldId::of(&held.input)) {
+                return true;
             }
-            kept
+            let released = backend.as_mut().is_none_or(|b| b.release(&held.input));
+            accepted &= released;
+            !released
         });
+        accepted
     }
 
     /// 按下一项持续状态，或把同名的轴改为新的取值。调用方已做过权威检查；`now` 用于最长按住时间核对。
@@ -190,15 +198,20 @@ impl InputLedger {
     }
 
     /// 抬起到 `now` 为止到期的瞬时按住（按按下的顺序）。
-    pub(crate) fn lift_due(&mut self, now: u64) {
+    pub(crate) fn lift_due(&mut self, now: u64) -> bool {
         let backend = &mut self.backend;
+        let mut accepted = true;
         self.transients.retain(|transient| {
-            let due = now >= transient.lift_ns;
-            if due && let Some(backend) = backend.as_mut() {
-                backend.end_momentary(&transient.momentary);
+            if now < transient.lift_ns {
+                return true;
             }
-            !due
+            let released = backend
+                .as_mut()
+                .is_none_or(|b| b.end_momentary(&transient.momentary));
+            accepted &= released;
+            !released
         });
+        accepted
     }
 
     /// 最早一个瞬时按住要抬起的时刻，供调度线程定时。
@@ -211,20 +224,21 @@ impl InputLedger {
         self.held.iter().map(|held| held.pressed_ns).min()
     }
 
-    /// 释放全部输入：先抬起全部瞬时按住，再按与按下相反的顺序逐项抬起持续状态，告诉后端已全部释放，
-    /// 再清空账目。
-    pub(crate) fn release_all(&mut self, reason: ReleaseReason) {
+    /// 先抬起全部瞬时按住，再逆序抬起持续状态并清空账目。任何一次抬起被拒绝即返回 `false`。
+    pub(crate) fn release_all(&mut self, reason: ReleaseReason, release_id: u64) -> bool {
+        let mut accepted = true;
         if let Some(backend) = self.backend.as_mut() {
             for transient in self.transients.iter().rev() {
-                backend.end_momentary(&transient.momentary);
+                accepted &= backend.end_momentary(&transient.momentary);
             }
             for held in self.held.iter().rev() {
-                backend.release(&held.input);
+                accepted &= backend.release(&held.input);
             }
-            backend.released_all(reason);
+            backend.released_all(reason, release_id);
         }
         self.transients.clear();
         self.held.clear();
+        accepted
     }
 }
 
@@ -279,11 +293,12 @@ pub(crate) mod tests {
             Inject::Done
         }
 
-        fn release(&mut self, input: &HeldInput) {
+        fn release(&mut self, input: &HeldInput) -> bool {
             self.0
                 .lock()
                 .unwrap()
                 .push(format!("up {}", describe(input)));
+            true
         }
 
         fn act(&mut self, action: &Action) -> Inject {
@@ -305,14 +320,15 @@ pub(crate) mod tests {
             Inject::Done
         }
 
-        fn end_momentary(&mut self, momentary: &Momentary) {
+        fn end_momentary(&mut self, momentary: &Momentary) -> bool {
             self.0
                 .lock()
                 .unwrap()
                 .push(format!("end {}", describe_momentary(momentary)));
+            true
         }
 
-        fn released_all(&mut self, reason: ReleaseReason) {
+        fn released_all(&mut self, reason: ReleaseReason, _release_id: u64) {
             self.0
                 .lock()
                 .unwrap()
@@ -343,7 +359,7 @@ pub(crate) mod tests {
             0,
         );
         ledger.press(axis("yaw", 0.5), 0);
-        ledger.release_all(ReleaseReason::LeaseExpired);
+        ledger.release_all(ReleaseReason::LeaseExpired, 1);
         assert!(ledger.is_empty());
         assert_eq!(
             recorder.take(),
@@ -358,7 +374,7 @@ pub(crate) mod tests {
             ]
         );
         // 账目为空时仍告诉后端释放了全部输入。
-        ledger.release_all(ReleaseReason::Stop);
+        ledger.release_all(ReleaseReason::Stop, 1);
         assert_eq!(recorder.take(), ["release all Stop"]);
     }
 
@@ -376,7 +392,7 @@ pub(crate) mod tests {
         assert!(!ledger.holds(&axis("yaw", -1.0)));
         ledger.press(axis("yaw", -1.0), 0);
         assert!(ledger.holds(&axis("yaw", -1.0)));
-        ledger.release_all(ReleaseReason::Stop);
+        ledger.release_all(ReleaseReason::Stop, 1);
         assert_eq!(
             recorder.take(),
             ["down axis yaw=-1", "up axis yaw=-1", "release all Stop"]
@@ -408,7 +424,7 @@ pub(crate) mod tests {
             ]
         );
         // 第二个瞬时按住由释放全部抬起。
-        ledger.release_all(ReleaseReason::MaxHold);
+        ledger.release_all(ReleaseReason::MaxHold, 1);
         assert!(ledger.is_empty());
         assert_eq!(
             recorder.take(),
@@ -425,7 +441,7 @@ pub(crate) mod tests {
             scan_code: 0x1C,
         }));
         assert!(!ledger.is_empty());
-        ledger.release_all(ReleaseReason::Stop);
+        ledger.release_all(ReleaseReason::Stop, 1);
         assert!(ledger.is_empty());
     }
 }

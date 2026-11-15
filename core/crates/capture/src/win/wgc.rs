@@ -422,6 +422,13 @@ impl WgcCapture {
 }
 
 impl CaptureSource for WgcCapture {
+    fn window_identity(&self) -> Option<crate::WindowIdentity> {
+        Some(crate::WindowIdentity {
+            handle: self.window.hwnd.0 as isize,
+            process_id: self.window.process_id,
+        })
+    }
+
     fn next_frame(&mut self, timeout: Duration, frame: &mut Frame) -> Result<bool, CaptureError> {
         let deadline = Instant::now().checked_add(timeout);
         loop {

@@ -25,6 +25,11 @@ pub const BYTES_PER_PIXEL: u32 = 4;
 ///
 /// 两次调用之间到达的旧帧被丢弃，帧号照样占用（见 [`FrameMeta::number`]）。
 pub trait CaptureSource {
+    /// 采集源绑定的原生窗口。没有原生窗口的采集源返回 `None`。
+    fn window_identity(&self) -> Option<WindowIdentity> {
+        None
+    }
+
     /// 等待下一帧并写入 `frame`，复用 `frame` 的像素缓冲。
     ///
     /// 返回 `Ok(true)` 表示 `frame` 已换成新的一帧；`timeout` 内没有新帧时返回 `Ok(false)`，`frame` 不变。
@@ -34,6 +39,15 @@ pub trait CaptureSource {
     /// 见 [`CaptureError`]。[`CaptureError::is_recoverable`] 为真的错误之后可以继续调用，其余错误之后
     /// 这个采集源不再产出帧。返回错误时 `frame` 的内容不确定，不能当作一帧使用。
     fn next_frame(&mut self, timeout: Duration, frame: &mut Frame) -> Result<bool, CaptureError>;
+}
+
+/// 创建采集源时选中的窗口及其所属进程。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowIdentity {
+    /// 原生窗口句柄。
+    pub handle: isize,
+    /// 窗口所属的进程 ID。
+    pub process_id: u32,
 }
 
 /// 一帧的元数据。坐标与尺寸一律是物理像素。

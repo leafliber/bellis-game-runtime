@@ -40,15 +40,19 @@ from pydantic import BaseModel, ValidationError
 from core_protocol.methods import (
     OPERATOR_INPUT_RELEASED,
     OPERATOR_INPUT_RESIDUAL,
+    OPERATOR_INPUT_VERIFICATION,
     OPERATOR_LEASE_GRANT,
     OPERATOR_LEASE_REVOKE,
 )
 from core_protocol.models import (
     InputReleasedParams,
     InputResidualParams,
+    InputVerificationParams,
     LeaseGrantParams,
     LeaseRevokeParams,
     ReleaseReason,
+    ReleaseVerification,
+    VerificationResult,
 )
 from game_runtime.adapter import Adapter
 from game_runtime.channel import (
@@ -155,6 +159,7 @@ class EventKind(StrEnum):
     REJECTED = "rejected"
     INPUT_RELEASED = "input_released"
     INPUT_RESIDUAL = "input_residual"
+    INPUT_VERIFICATION = "input_verification"
     DECISION_OPENED = "decision_opened"
     DECISION_CHOSEN = "decision_chosen"
     DECISION_CLOSED = "decision_closed"
@@ -725,6 +730,9 @@ class OperatorConsole:
         peer.on_notification(
             OPERATOR_INPUT_RESIDUAL.name, lambda params: self._on_residual(peer, params)
         )
+        peer.on_notification(
+            OPERATOR_INPUT_VERIFICATION.name, lambda params: self._on_verification(peer, params)
+        )
         self._core = peer
         peer.closed.add_done_callback(lambda _: self._detach_core(peer))
         self._emit(EventKind.CONNECTED, role="core")
@@ -781,7 +789,9 @@ class OperatorConsole:
         if released is None:
             return
         self._emit(EventKind.INPUT_RELEASED, **_dump(released))
-        if released.reason in self.options.pause_on and self._state is SessionState.RUNNING:
+        if released.verification is ReleaseVerification.UP_FAILED:
+            self._fail_input_release()
+        elif released.reason in self.options.pause_on and self._state is SessionState.RUNNING:
             # 真人接管、急停、注入被拦截或钩子失效：交还控制只能由操作员按“开始”。
             self._spawn(self._pause(f"released:{released.reason.value}"))
 
@@ -791,13 +801,31 @@ class OperatorConsole:
         residual = _parse(InputResidualParams, OPERATOR_INPUT_RESIDUAL.name, params)
         if residual is None:
             return
-        # 残留只显示并记入会话记录，不改变状态。
         self._emit(
             EventKind.INPUT_RESIDUAL,
+            release_id=residual.release_id,
             cause=residual.cause.value,
             reason=None if residual.reason is None else residual.reason.value,
             items=len(residual.items),
+            repair_accepted=residual.repair_accepted,
         )
+        if not residual.repair_accepted:
+            self._fail_input_release()
+
+    def _on_verification(self, peer: RpcPeer, params: dict[str, Any]) -> None:
+        if self._core is not peer:
+            return
+        verification = _parse(InputVerificationParams, OPERATOR_INPUT_VERIFICATION.name, params)
+        if verification is None:
+            return
+        self._emit(EventKind.INPUT_VERIFICATION, **_dump(verification))
+        if verification.result in (VerificationResult.RESIDUAL, VerificationResult.UNAVAILABLE):
+            self._fail_input_release()
+
+    def _fail_input_release(self) -> None:
+        self._stop_lease()
+        self._cancel_countdown()
+        self._spawn(self.end("input_release_failed"))
 
     def _on_decision_opened(self, peer: RpcPeer, params: dict[str, Any]) -> None:
         if self._main is not peer:

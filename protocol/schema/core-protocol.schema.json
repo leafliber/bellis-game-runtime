@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CoreProtocol",
   "description": "主进程与实时核之间核连接上的消息，由 core/crates/core-protocol 生成。",
-  "x-protocol-version": 1,
+  "x-protocol-version": 2,
   "x-methods": {
     "core.hello": {
       "direction": "core_to_main",
@@ -80,7 +80,7 @@
         "$ref": "#/$defs/ProducerRevokeParams"
       },
       "result": {
-        "$ref": "#/$defs/Empty"
+        "$ref": "#/$defs/ProducerRevokeResult"
       }
     },
     "core.stop": {
@@ -110,6 +110,13 @@
       "direction": "core_to_main",
       "params": {
         "$ref": "#/$defs/InputResidualParams"
+      },
+      "result": null
+    },
+    "input.verification": {
+      "direction": "core_to_main",
+      "params": {
+        "$ref": "#/$defs/InputVerificationParams"
       },
       "result": null
     },
@@ -151,6 +158,13 @@
       "direction": "core_to_operator",
       "params": {
         "$ref": "#/$defs/InputResidualParams"
+      },
+      "result": null
+    },
+    "input.verification": {
+      "direction": "core_to_operator",
+      "params": {
+        "$ref": "#/$defs/InputVerificationParams"
       },
       "result": null
     }
@@ -1153,7 +1167,24 @@
       "required": [
         "generation"
       ],
-      "description": "`producer.revoke` 的 params：作废代次。实时核释放完成后才回应，回应即输入已释放的确认。"
+      "description": "`producer.revoke` 的 params：作废代次。"
+    },
+    "ProducerRevokeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "release_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "description": "对应的释放编号。没有可关联的释放时为 `null`。",
+          "maximum": 18446744073709551615
+        }
+      },
+      "description": "`producer.revoke` 的 result：代次已作废，物理核验另行通知。"
     },
     "ActionReceiptParams": {
       "type": "object",
@@ -1322,6 +1353,13 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "release_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "本实例内递增的释放编号，与后续物理核验关联。",
+          "maximum": 18446744073709551615
+        },
         "reason": {
           "$ref": "#/$defs/ReleaseReason",
           "description": "释放的原因。"
@@ -1341,15 +1379,21 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0,
-          "description": "释放完成的时刻。",
+          "description": "抬起请求处理完毕的时刻。",
           "maximum": 18446744073709551615
+        },
+        "verification": {
+          "$ref": "#/$defs/ReleaseVerification",
+          "description": "本次释放的证据状态。"
         }
       },
       "required": [
+        "release_id",
         "reason",
-        "released_at_ns"
+        "released_at_ns",
+        "verification"
       ],
-      "description": "`input.released` 的 params：实时核释放了全部输入。"
+      "description": "`input.released` 的 params：实时核已处理一次全部释放请求。"
     },
     "ReleaseReason": {
       "oneOf": [
@@ -1361,7 +1405,7 @@
         {
           "type": "string",
           "const": "generation_revoked",
-          "description": "当前代次被 `producer.revoke` 作废。"
+          "description": "当前代次被 `producer.revoke` 或采集源变更作废。"
         },
         {
           "type": "string",
@@ -1426,7 +1470,7 @@
         {
           "type": "string",
           "const": "hook_lost",
-          "description": "真实后端：本实例的注入没有经过自己的钩子，钩子已失效；同时在本地撤权，随后重新装钩子。"
+          "description": "真实后端：钩子失效；本实例释放并拒绝后续许可。"
         },
         {
           "type": "string",
@@ -1451,10 +1495,32 @@
       ],
       "description": "释放全部输入的原因。"
     },
+    "ReleaseVerification": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "unverified",
+          "description": "抬起请求已处理，发出时没有物理释放证据。"
+        },
+        {
+          "type": "string",
+          "const": "up_failed",
+          "description": "后端至少拒绝了一项抬起。"
+        }
+      ],
+      "description": "释放回执能提供的证据。物理按键状态由残留检查另行观察。"
+    },
     "InputResidualParams": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "release_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "对应的释放编号。",
+          "maximum": 18446744073709551615
+        },
         "cause": {
           "$ref": "#/$defs/ResidualCause",
           "description": "核验的缘由。"
@@ -1475,7 +1541,11 @@
           "items": {
             "$ref": "#/$defs/HeldInput"
           },
-          "description": "读作按住、已补发抬起的项，至少一项；只有 `key` 与 `mouse_button`。"
+          "description": "读作按住的项，至少一项；只有 `key` 与 `mouse_button`。"
+        },
+        "repair_accepted": {
+          "type": "boolean",
+          "description": "系统是否接受了全部补发事件。"
         },
         "checked_at_ns": {
           "type": "integer",
@@ -1486,11 +1556,13 @@
         }
       },
       "required": [
+        "release_id",
         "cause",
         "items",
+        "repair_accepted",
         "checked_at_ns"
       ],
-      "description": "`input.residual` 的 params：只在真实后端上。释放全部输入之后、以及收到输入策略时，实时核以\n`GetAsyncKeyState` 核验输入策略里的键与鼠标键，仍读作按住的项已补发抬起，以这条通知报出。"
+      "description": "`input.residual` 的 params：只在真实后端上。释放全部输入之后、以及收到输入策略时，实时核以\n`GetAsyncKeyState` 读输入策略里的键与鼠标键，报告读作按住的项及补发抬起的提交结果。"
     },
     "ResidualCause": {
       "oneOf": [
@@ -1506,6 +1578,61 @@
         }
       ],
       "description": "`input.residual` 的核验缘由。"
+    },
+    "InputVerificationParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "release_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "本实例内对应的释放编号。",
+          "maximum": 18446744073709551615
+        },
+        "result": {
+          "$ref": "#/$defs/VerificationResult",
+          "description": "只描述该次释放的核验。"
+        },
+        "checked_at_ns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "核验结果的时刻。",
+          "maximum": 18446744073709551615
+        }
+      },
+      "required": [
+        "release_id",
+        "result",
+        "checked_at_ns"
+      ],
+      "description": "`input.verification` 的 params：对应一次释放的物理核验结果。"
+    },
+    "VerificationResult": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "verified",
+          "description": "可读取输入桌面，白名单内的键与鼠标键均未读作按住。"
+        },
+        {
+          "type": "string",
+          "const": "residual",
+          "description": "仍有残留，或系统拒绝了补发抬起。"
+        },
+        {
+          "type": "string",
+          "const": "unavailable",
+          "description": "无法读取有效的按键状态，或释放时已有已知抬起失败。"
+        },
+        {
+          "type": "string",
+          "const": "superseded",
+          "description": "这次核验已被更新的释放取代。"
+        }
+      ],
+      "description": "真实后端对一次释放的观察。"
     },
     "CoreHealthParams": {
       "type": "object",
