@@ -99,6 +99,12 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 
 不接 Bellis 的独立运行用于开发与受监督的真机测试（G0–G2），不用于直播；决策点由操作员给出结果。G0 只用测试用的本地许可源驱动假输入后端（[测试设备连接](core-protocol.md#测试设备连接)）；G2 起输入许可来自操作员控制台，只在测试许可下使用（GR-36）。
 
+### 模型游玩入口
+
+先在另一个终端运行 [操作员控制台](#操作员控制台)，再运行 `uv run supervise <适配包 id> --profile profiles/supervised.example.json`。默认运行不向游戏窗口注入，Windows 上确认要测试真实输入时再加 `--real-input`。每项前置条件、“不直播”确认、`start` 和 `goal` 都由在场操作员在控制台输入。
+
+启动器按参数顺序应用可重复的 `--patch <文件>`，使用同一内核按 [profile](plugin-kernel.md#profile) 加载服务。命令行选定的游戏同时用于操作员鉴别、实时核的输入策略和 `game-adapter` 条目。模型控制需要 `vlm@1` 和 `planner@1` 都可用。方舟凭据沿用 [模型接入](models.md#允许清单)的本机条目和 profile 授权。剧情记录和配音检测可以在 profile 中停用或省略。启用了配音检测并授予 `audio.read` 时，从同一个实时核采集游戏进程的音频。可用 `--core <路径>` 指定已经构建的实时核，`--data-dir <绝对路径>` 指定缺省的本地数据目录。
+
 ### 操作员控制台
 
 操作员在另一个终端以 `uv run operate <适配包 id>` 启动它（`game_runtime.operator`），`--max-minutes` 改会话的时长上限。拓扑与 G3 的 Bellis 宿主相同（[连接](#连接)）：控制台是 `bellis-channel/1` 的服务端，一个地址与密钥，按角色区分两条连接。
