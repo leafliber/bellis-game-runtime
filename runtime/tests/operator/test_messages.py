@@ -73,13 +73,15 @@ def test_a_decision_must_be_consistent(changes: dict[str, Any]) -> None:
         messages.DecisionOpened.model_validate(opened(**changes))
 
 
-def test_closing_by_withdrawal_has_no_index_and_otherwise_it_does() -> None:
+def test_closing_by_withdrawal_or_unknown_has_no_index() -> None:
     for by in ("operator", "default"):
         messages.DecisionClosed(id="d", index=0, by=by)
         with pytest.raises(ValidationError):
             messages.DecisionClosed(id="d", index=None, by=by)
-    with pytest.raises(ValidationError):
-        messages.DecisionClosed(id="d", index=0, by="withdrawn")
+    for by in ("withdrawn", "unknown"):
+        messages.DecisionClosed(id="d", index=None, by=by)
+        with pytest.raises(ValidationError):
+            messages.DecisionClosed(id="d", index=0, by=by)
 
 
 def test_unknown_states_and_categories_are_refused() -> None:

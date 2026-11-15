@@ -64,6 +64,7 @@ class OperatorClient:
         self._on_ended = on_ended
         self._timeout = timeout
         self._credentials: ChannelCredentials | None = None
+        self._session_id: str | None = None
         self._peer: RpcPeer | None = None
         self._session: messages.Session | None = None
         self._first: asyncio.Future[messages.Session] | None = None
@@ -82,6 +83,11 @@ class OperatorClient:
     def session(self) -> messages.Session | None:
         """最近一条 `operator.session`。"""
         return self._session
+
+    @property
+    def session_id(self) -> str | None:
+        """认证连接对应的测试会话编号。"""
+        return self._session_id
 
     @property
     def connected(self) -> bool:
@@ -131,6 +137,7 @@ class OperatorClient:
         peer.on_notification(messages.DECISION_RESOLVED, self._resolved_message)
         self._peer = peer
         self._credentials = credentials
+        self._session_id = info.session_id
         peer.closed.add_done_callback(lambda _: self._finish("disconnected"))
         try:
             async with asyncio.timeout(self._timeout):

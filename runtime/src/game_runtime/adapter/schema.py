@@ -11,6 +11,7 @@ from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from enum import StrEnum
 from typing import Annotated, Any, Literal, NamedTuple, Self, cast
+from unicodedata import normalize
 
 from pydantic import (
     AfterValidator,
@@ -335,8 +336,49 @@ class Precondition(_Model):
     text: Text
 
 
+class ScreenRisk(StrEnum):
+    DECISION_ONLY = "decision-only"
+    RETURN_ONLY = "return-only"
+    BLOCKED = "blocked"
+
+
+_RETURN_LABELS = frozenset(
+    {
+        "返回",
+        "关闭",
+        "离开",
+        "取消",
+        "返回上一级",
+        "back",
+        "close",
+        "cancel",
+        "return",
+        "leave",
+        "戻る",
+        "閉じる",
+        "キャンセル",
+        "뒤로",
+        "닫기",
+        "취소",
+    }
+)
+
+
+def _return_label(text: str) -> str:
+    if _squash(normalize("NFKC", text).casefold()) not in _RETURN_LABELS:
+        raise ValueError("返回目标须是明确的返回、关闭或取消按钮")
+    return text
+
+
+class ReturnTarget(_Model):
+    """通过当前帧的 OCR 核验的返回按钮。"""
+
+    roi: Ident
+    text: Annotated[Text, AfterValidator(_return_label)]
+
+
 class Risk(_Model):
-    """风险。按画面类型的风险等级与危险画面签名 unsupported（G2）。"""
+    """静态禁区、操作员前置条件和对通用画面策略的收紧。"""
 
     forbidden_words: tuple[Text, ...] = ()
     """本游戏的禁用词，与通用词表一起生效。"""
@@ -344,6 +386,8 @@ class Risk(_Model):
     """静态禁区：ROI 名。"""
     preconditions: tuple[Precondition, ...] = ()
     """操作员前置条件。"""
+    screens: Mapping[Ident, ScreenRisk] = Field(default_factory=dict[Ident, ScreenRisk])
+    returns: Mapping[Ident, ReturnTarget] = Field(default_factory=dict[Ident, ReturnTarget])
 
     @model_validator(mode="after")
     def _unique(self) -> Self:
@@ -353,6 +397,20 @@ class Risk(_Model):
             + _duplicates("preconditions", (p.id for p in self.preconditions))
         )
         return self
+
+
+class DecisionTimer(_Model):
+    roi: Ident
+    prefix: str = ""
+    suffix: str = ""
+
+
+class DecisionRegion(_Model):
+    """选择画面的选项区域及可选提问、计时文字。"""
+
+    options: Ident
+    prompt: Ident | None = None
+    timer: DecisionTimer | None = None
 
 
 # 参数与快路径
@@ -481,6 +539,7 @@ class Adapter(_Model):
     screens: tuple[Screen, ...]
     screen_types: tuple[ScreenTypeExtension, ...] = ()
     risk: Risk
+    decisions: Mapping[Ident, DecisionRegion] = Field(default_factory=dict[Ident, DecisionRegion])
     rois: Mapping[Ident, Roi] = Field(default_factory=dict[str, Roi])
     pacing: Pacing | None = None
     """本游戏的阅读节奏覆盖；没有即用通用缺省（由使用方定义，G2）。不是标定项。"""
@@ -520,6 +579,28 @@ class Adapter(_Model):
             elif roi.rect is None:
                 yield f"{where}：ROI {name} 尚未标定，不能引用"
         yield from self._dialogue_box_problems()
+        yield from self._control_problems(screens)
+
+    def _control_problems(self, screens: set[str]) -> Iterator[str]:
+        for screen in self.risk.returns:
+            if screen not in screens:
+                continue
+            if self.risk.screens.get(screen) is not ScreenRisk.RETURN_ONLY and self.generic_type(
+                screen
+            ) not in {ScreenType.SETTINGS, ScreenType.SAVE_LOAD, ScreenType.SHOP}:
+                yield f"risk.returns.{screen} 只能声明限制为返回的画面的目标"
+        for screen, decision in self.decisions.items():
+            if screen not in screens:
+                continue
+            match self.generic_type(screen):
+                case ScreenType.TIMED_CHOICE if decision.timer is None:
+                    yield f"decisions.{screen} 计时选择须声明 timer"
+                case ScreenType.CHOICE if decision.timer is not None:
+                    yield f"decisions.{screen} 无计时选择不能声明 timer"
+                case ScreenType.CHOICE | ScreenType.TIMED_CHOICE:
+                    pass
+                case _:
+                    yield f"decisions.{screen} 须为选择或计时选择画面"
 
     def _dialogue_box_problems(self) -> Iterator[str]:
         """对白框：写了画面的，画面是对话类，每个画面至多一项；不写画面的至多一项；引用的 ROI 与
@@ -569,6 +650,13 @@ class Adapter(_Model):
         return bases.get(screen_type, screen_type) == ScreenType.DIALOGUE
 
     def _screen_refs(self) -> Iterator[tuple[str, str]]:
+        for field, group in (
+            ("risk.screens", self.risk.screens),
+            ("risk.returns", self.risk.returns),
+            ("decisions", self.decisions),
+        ):
+            for screen in group:
+                yield f"{field}.{screen}", screen
         for index, item in enumerate(self.language.fixed_texts):
             yield f"language.fixed_texts[{index}].screen", item.screen
         for index, signature in enumerate(self.signatures):
@@ -582,6 +670,14 @@ class Adapter(_Model):
             yield f"whitelist.click_regions[{index}]", name
         for index, name in enumerate(self.risk.forbidden_zones):
             yield f"risk.forbidden_zones[{index}]", name
+        for screen, target in self.risk.returns.items():
+            yield f"risk.returns.{screen}.roi", target.roi
+        for screen, decision in self.decisions.items():
+            yield f"decisions.{screen}.options", decision.options
+            if decision.prompt is not None:
+                yield f"decisions.{screen}.prompt", decision.prompt
+            if decision.timer is not None:
+                yield f"decisions.{screen}.timer.roi", decision.timer.roi
         for index, item in enumerate(self.language.fixed_texts):
             yield f"language.fixed_texts[{index}].roi", item.roi
         for index, signature in enumerate(self.signatures):

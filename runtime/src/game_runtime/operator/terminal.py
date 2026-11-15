@@ -36,6 +36,7 @@ HELP: Final = (
 
 _ROLES: Final = {"core": "实时核", "main": "主进程"}
 _CLOSED_BY: Final = {
+    "unknown": "结果未知",
     "operator": "按操作员的选择执行",
     "default": "到余量线执行排第一的候选",
     "withdrawn": "画面已变，不再执行",
