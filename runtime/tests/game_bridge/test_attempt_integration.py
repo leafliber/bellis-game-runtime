@@ -51,6 +51,7 @@ from game_runtime.game_bridge.task_ledger import (
     EffectResult,
     FrameStamp,
     LedgerRefusedError,
+    LedgerUnavailableError,
     Resolution,
     TaskAccount,
     TaskEnd,
@@ -191,6 +192,7 @@ def ledger_and_spec(
     *,
     receipt_timeout_ns: int = 2_000_000_000,
     overall: ExpectedEffect | None = None,
+    limits: TaskLimits = LIMITS,
 ) -> tuple[TaskLedger, AttemptSpec, models.ControlStep]:
     TaskLedger.provision(path, TARGET)
     ledger = TaskLedger.start(path, TARGET)
@@ -201,7 +203,7 @@ def ledger_and_spec(
         expires_at_ns=now + 30_000_000_000,
         overall_completion=overall,
     )
-    ledger.open_task(request, LIMITS, release_verified=True)
+    ledger.open_task(request, limits, release_verified=True)
     spec = AttemptSpec(
         attempt_id="attempt",
         task_id=request.task_id,
@@ -250,6 +252,7 @@ async def task_session(
             clock,
             signals,
             ledger=ledger,
+            release_verified=lambda after_ns: rig.link.has_verified_release(after_ns=after_ns),
         )
         hub = SceneHub(problems=(), uncalibrated=())
         session.project = Projection(
@@ -363,6 +366,13 @@ def test_p04_goals_and_reconnect_share_budget_and_restart_ends_original_task(
                 assert goal is not None
                 assert goal.text == "恢复对主菜单的核验"
                 assert goal.completion == OVERALL
+                task = session.planning_task
+                assert task is not None
+                assert (task.task_id, task.objective, task.overall_completion) == (
+                    spec.task_id,
+                    "打开菜单",
+                    OVERALL,
+                )
                 assert not await first("old-goal", CallKind.POLICY)
                 second = session.model_budget(session.session.goal_revision)
                 assert second is not None
@@ -817,7 +827,9 @@ def test_committed_receipt_conflict_quarantines_through_restart(tmp_path: Path) 
             assert not ledger.status().receipt_quarantined
             rig.receipt(block, models.Dropped(id=executed.id, reason=models.DropReason.DUPLICATE))
             await asyncio.wait_for(rig.stop.wait(), WAIT)
-            assert ledger.status().receipt_quarantined
+            async with asyncio.timeout(WAIT):
+                while not ledger.status().receipt_quarantined:
+                    await asyncio.sleep(0.01)
         reopened = TaskLedger.start(path, TARGET)
         assert reopened.status().receipt_quarantined
         assert reopened.get_attempt(spec.attempt_id) == committed
@@ -1015,6 +1027,8 @@ def test_supervise_projects_original_pending_identity_and_refuses_unverified_rel
             limits=LIMITS,
         )
         async with supervised_rig(semantic_core, tmp_path, task_authority=authority) as rig:
+            with pytest.raises(LedgerUnavailableError, match="活动进程"):
+                TaskLedger.start(path, TARGET)
             links: dict[str, RpcPeer] = {}
             for _ in range(2):
                 conn = await asyncio.wait_for(rig.peers.get(), WAIT)
@@ -1058,6 +1072,10 @@ def test_supervise_projects_original_pending_identity_and_refuses_unverified_rel
             finally:
                 await main.close()
                 await core.close()
+        successor = TaskLedger.start(path, TARGET)
+        original = successor.status().outstanding
+        assert original is not None
+        assert original.spec == spec
 
     asyncio.run(run())
 

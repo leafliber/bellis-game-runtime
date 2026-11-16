@@ -140,6 +140,10 @@ class AttemptHandler:
             self._start_child(self._submit(work))
             record = await self._await_outcome(work)
             work.record = record
+            if record.phase is AttemptPhase.VERIFIED and (
+                work.conflict or work.invalid_reason == "core-receipt-conflict"
+            ):
+                raise SemanticPauseError("core-receipt-conflict")
             self._on_record(record)
             self._queue_late_receipt(work)
             return record
@@ -255,6 +259,7 @@ class AttemptHandler:
                 work.conflict = True
                 work.invalidate("core-receipt-conflict")
                 self._inspect_conflict(core, receipt, observed=work.receipt)
+                self._on_fault("core-receipt-conflict")
             return
         work.receipt = receipt
         work.changed.set()
@@ -365,18 +370,7 @@ class AttemptHandler:
         if record is not None and record.phase is AttemptPhase.PENDING and record.receipt is None:
             core, receipt = work.core, work.receipt
             if core is not None and receipt is not None:
-                self._start_child(self._persist_late(work, core, receipt))
-
-    async def _persist_late(self, work: _Work, core: CoreCorrelation, receipt: CoreReceipt) -> None:
-        async with self._admission:
-            try:
-                record = await in_thread(partial(self._ledger.get_attempt, work.spec.attempt_id))
-                if record is not None and record.phase is AttemptPhase.PENDING:
-                    work.record = await in_thread(
-                        partial(self._ledger.record_receipt, core, receipt)
-                    )
-            except LedgerError as error:
-                self._ledger_fault(error)
+                self._inspect_conflict(core, receipt)
 
     def _ledger_fault(self, error: LedgerError) -> None:
         logger.error("原尝试账目失效 %s", type(error).__name__)

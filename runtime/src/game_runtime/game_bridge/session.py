@@ -245,6 +245,15 @@ class BellisSession:
         return self._plan_goal
 
     @property
+    def planning_task(self) -> TaskRequest | None:
+        """供 planner 接收的原任务身份、根目标与整体完成条件。"""
+        status = self._ledger_status
+        task = None if status is None else status.active_task
+        if task is None or not self.live or not self._task_active(task.request.task_id):
+            return None
+        return task.request
+
+    @property
     def may_autoplay(self) -> bool:
         return self._active(self._authorization) and self.ready()
 
@@ -259,23 +268,26 @@ class BellisSession:
         )
 
     def _active(self, goal: _Goal | None) -> bool:
+        return goal is not None and self._goal_authorized(goal) and self._task_active(goal.task_id)
+
+    def _goal_authorized(self, goal: _Goal) -> bool:
         return (
-            goal is not None
-            and goal.connection == self._connection
+            goal.connection == self._connection
             and self.live
             and self._unknown is None
             and not self._manual
             and goal.mode in ("autonomous", "waiting_vote")
             and self.clock.now_ns() < goal.expires_ns
-            and self._task_active(goal.task_id)
         )
 
-    def _task_active(self, task_id: str | None) -> bool:
+    def _task_active(self, task_id: str | None, *, status: LedgerStatus | None = None) -> bool:
         if self._ledger is None:
             return True
-        status = self._ledger_status
+        if status is None:
+            status = self._ledger_status
         if (
             status is None
+            or status.receipt_quarantined
             or self._ledger_failed
             or self._wire_version.major != v2.GAME_BRIDGE_MAJOR
         ):
@@ -538,6 +550,9 @@ class BellisSession:
     async def _refresh_ledger(self, ledger: TaskLedger) -> None:
         revision = self._ledger_status_revision
         status = await self._read_ledger(ledger.status)
+        self._apply_ledger_status(revision, status)
+
+    def _apply_ledger_status(self, revision: int, status: LedgerStatus) -> None:
         if revision == self._ledger_status_revision:
             self._ledger_status = status
         if status.receipt_quarantined:
@@ -819,6 +834,9 @@ class BellisSession:
                 self._require_peer(peer)
                 status = await self._read_ledger(ledger.status)
                 self._require_peer(peer)
+                if status.receipt_quarantined:
+                    self.ledger_fault("core-receipt-conflict")
+                    raise _refuse("core-receipt-conflict")
                 task = status.active_task
                 if (
                     status.outstanding is not None
@@ -993,6 +1011,8 @@ class BellisSession:
             raise SemanticPauseError("completion-authority-revoked")
         grant = controller.grant
         origin = asyncio.current_task()
+        task_id = goal.task_id
+        admitted = False
 
         def current() -> bool:
             return (
@@ -1003,41 +1023,67 @@ class BellisSession:
                 and controller.grant is grant
                 and grant.is_open
                 and (origin is None or origin.cancelling() == 0)
-                and self._active(goal)
+                and self._goal_authorized(goal)
+                and not self._ledger_failed
                 and self.same_session()
             )
 
         def require_current() -> None:
-            if not current():
+            if not current() or not self._task_active(task_id):
                 raise SemanticPauseError("completion-authority-revoked")
 
         async def check_evidence() -> None:
+            nonlocal admitted
             require_current()
             if not self.ready():
                 raise SemanticPauseError("completion-evidence-unavailable")
             recheck()
             require_current()
+            admitted = True
 
-        async with self.admission:
-            require_current()
-            ledger = self._require_tasks()
-            if overall and (self._plan_goal is None or self._plan_goal.completion is None):
-                raise SemanticPauseError("task-completion-condition-missing")
-            loop = asyncio.get_running_loop()
+        async def record() -> T:
+            async with self.admission:
+                require_current()
+                ledger = self._require_tasks()
+                if overall and (self._plan_goal is None or self._plan_goal.completion is None):
+                    raise SemanticPauseError("task-completion-condition-missing")
+                loop = asyncio.get_running_loop()
 
-            def before_write() -> None:
-                # SQLite 持有写事务时，把最后一次取证复核交还给事件循环。
-                asyncio.run_coroutine_threadsafe(check_evidence(), loop).result()
+                def before_write() -> None:
+                    # SQLite 持有写事务时，把最后一次取证复核交还给事件循环。
+                    asyncio.run_coroutine_threadsafe(check_evidence(), loop).result()
 
-            result = await self._read_ledger(partial(write, ledger, goal.task_id, before_write))
-            if result is not False:
+                result = await self._read_ledger(partial(write, ledger, task_id, before_write))
+                revision = self._ledger_status_revision
+                status = await self._read_ledger(ledger.status)
                 try:
-                    # 暂停或撤权可以在写事务返回前发生。持久事实归原目标，事件还需当前授权。
-                    if current():
+                    if (
+                        admitted
+                        and result is not False
+                        and revision == self._ledger_status_revision
+                        and not status.receipt_quarantined
+                        and status.outstanding is None
+                        and current()
+                        and (overall or self._task_active(task_id, status=status))
+                    ):
                         on_recorded()
                 finally:
-                    await self._refresh_ledger(ledger)
-            return result
+                    self._apply_ledger_status(revision, status)
+                return result
+
+        owner = asyncio.create_task(record(), name="GR-38 完成账目")
+        try:
+            return await asyncio.shield(owner)
+        except asyncio.CancelledError:
+            # 等待方取消不丢弃可能已经提交的事实，读回后才交出取消。
+            while not owner.done():
+                try:
+                    await asyncio.wait((owner,))
+                except asyncio.CancelledError:
+                    continue
+            if not owner.cancelled():
+                owner.exception()
+            raise
 
     def _accept_choice(
         self, request: v1.GameDecisionResolveParams, parent: str | None

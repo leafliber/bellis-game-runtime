@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from collections.abc import AsyncGenerator, Sequence
-from contextlib import asynccontextmanager, suppress
+from contextlib import ExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -71,7 +71,7 @@ from game_runtime.voice_activity import VoiceActivityPlugin
 
 if TYPE_CHECKING:
     from game_runtime.game_bridge.attempts import AttemptHandler
-    from game_runtime.game_bridge.session import BellisConfig
+    from game_runtime.game_bridge.session import BellisConfig, BellisSession
 
 logger = logging.getLogger(__name__)
 STEP_ENTRY = "step-control"
@@ -335,25 +335,28 @@ async def supervise(
         bellis is not None and link_options.operator is not None
     ):
         raise ValueError("许可源由监督启动器选择，操作员与 Bellis 只能选一个")
-    client = None
-    semantic = None
+    client: OperatorClient | None = None
+    semantic: BellisSession | None = None
     attempts: AttemptHandler | None = None
     bellis_control = None
     core: CoreLink | None = None
     capture = link_options.capture or capture_config(adapter)
-    session: PlaySession
-    if bellis is None:
-        client = OperatorClient(
-            adapter,
-            store=store,
-            on_session=signals.session,
-            on_ended=signals.on_end,
-            on_decision_resolved=signals.resolved,
-        )
-        session = client
-    else:
+    ledger_owner = ExitStack()
+
+    async def open_session() -> PlaySession:
+        nonlocal client, semantic, bellis_control, attempts
+        if bellis is None:
+            client = OperatorClient(
+                adapter,
+                store=store,
+                on_session=signals.session,
+                on_ended=signals.on_end,
+                on_decision_resolved=signals.resolved,
+            )
+            return client
         from game_runtime.game_bridge.attempts import AttemptHandler as BridgeAttempts
-        from game_runtime.game_bridge.session import BellisSession, read_bellis_session
+        from game_runtime.game_bridge.session import BellisSession as BridgeSession
+        from game_runtime.game_bridge.session import read_bellis_session
         from game_runtime.game_bridge.task_ledger import TaskLedger
 
         info = read_bellis_session(bellis.session_store)
@@ -375,19 +378,23 @@ async def supervise(
                 raise ValueError("任务授权配置的适配包与选定游戏不匹配")
             if capture.target.type != "fake" and capture.target != adapter.window_rule():
                 raise ValueError("任务授权的采集目标须匹配选定游戏的窗口规则")
-            ledger = await in_thread(
-                partial(
-                    TaskLedger.start,
+
+            def start_ledger() -> TaskLedger:
+                owned = TaskLedger.start(
                     authority.ledger_path,
                     authority.control_target_id,
                     clock_ns=clock.now_ns,
+                    hold_owner=True,
                 )
-            )
+                ledger_owner.callback(owned.close)
+                return owned
+
+            ledger = await in_thread(start_ledger)
 
         def release_verified(after_ns: int) -> bool:
             return core is not None and core.has_verified_release(after_ns=after_ns)
 
-        semantic = BellisSession(
+        semantic = BridgeSession(
             bellis,
             info,
             runtime_id,
@@ -408,7 +415,7 @@ async def supervise(
                 runtime_id=runtime_id,
             )
             semantic.attempts = attempts
-        session = semantic
+        return semantic
 
     def released(message: InputReleasedParams) -> None:
         if semantic is not None and message.reason in _SEMANTIC_RELEASES:
@@ -539,6 +546,7 @@ async def supervise(
 
     reason = "error"
     try:
+        session = await open_session()
         policy_admission = admission or AdmissionPolicy()
         if record:
             preparing = asyncio.create_task(
@@ -669,4 +677,7 @@ async def supervise(
         else:
             reason = "enter"
     finally:
-        await _wait_shutdown(begin_shutdown(reason))
+        try:
+            await _wait_shutdown(begin_shutdown(reason))
+        finally:
+            ledger_owner.close()

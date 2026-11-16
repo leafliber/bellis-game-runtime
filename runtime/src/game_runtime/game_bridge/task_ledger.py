@@ -232,6 +232,7 @@ _LIVE = (AttemptPhase.RESERVED, AttemptPhase.AWAITING_RECEIPT, AttemptPhase.AWAI
 _OUTSTANDING = (*_LIVE, AttemptPhase.PENDING)
 _SCHEMA_VERSION = 2
 _LOCK_TIMEOUT_S = 0.25
+_OUTCOME_DEADLINE = "outcome-deadline"
 
 _RECEIPT_QUARANTINE = """CREATE TABLE receipt_quarantine (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -309,6 +310,22 @@ def _transaction(path: Path) -> Generator[sqlite3.Connection]:
                 yield db
     except sqlite3.Error as exc:
         raise LedgerUnavailableError("SQLite 账目事务未成功") from exc
+
+
+def _claim_process(path: Path) -> sqlite3.Connection:
+    lock_path = path.with_name(path.name + ".owner.sqlite3")
+    try:
+        lock = sqlite3.connect(lock_path, timeout=0, isolation_level=None, check_same_thread=False)
+        try:
+            lock.execute("BEGIN EXCLUSIVE")
+        except BaseException:
+            lock.close()
+            raise
+        return lock
+    except sqlite3.Error as exc:
+        if exc.sqlite_errorcode in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            raise LedgerUnavailableError("账目已有活动进程所有者") from exc
+        raise LedgerUnavailableError("账目进程所有权不可用") from exc
 
 
 def _owner(db: sqlite3.Connection, control_target_id: str, *, upgrade: bool = False) -> sqlite3.Row:
@@ -433,7 +450,7 @@ def _set_phase(
 
 def _expire_attempt(db: sqlite3.Connection, attempt: AttemptRecord, now_ns: int) -> AttemptRecord:
     if attempt.phase in _LIVE and now_ns >= attempt.spec.outcome_deadline_ns:
-        return _set_phase(db, attempt.spec.attempt_id, AttemptPhase.PENDING, "outcome-deadline")
+        return _set_phase(db, attempt.spec.attempt_id, AttemptPhase.PENDING, _OUTCOME_DEADLINE)
     return attempt
 
 
@@ -462,6 +479,9 @@ class TaskLedger:
         self._control_target_id = control_target_id
         self._epoch = epoch
         self._clock_ns = clock_ns
+        self._local_attempt_id: str | None = None
+        self._process_lock: sqlite3.Connection | None = None
+        self._closed = False
 
     @staticmethod
     def provision(path: Path, control_target_id: str) -> None:
@@ -482,23 +502,48 @@ class TaskLedger:
 
     @classmethod
     def start(
-        cls, path: Path, control_target_id: str, *, clock_ns: Callable[[], int] = perf_counter_ns
+        cls,
+        path: Path,
+        control_target_id: str,
+        *,
+        clock_ns: Callable[[], int] = perf_counter_ns,
+        hold_owner: bool = False,
     ) -> "TaskLedger":
-        """启动时换代，旧任务终止，未完成的尝试保守隔离。"""
-        path = path.absolute()
-        epoch = uuid4().hex
-        with _transaction(path) as db:
-            _owner(db, control_target_id, upgrade=True)
-            db.execute("UPDATE tasks SET ended = ? WHERE ended IS NULL", (TaskEnd.RESTARTED,))
-            db.execute(
-                "UPDATE attempts SET phase = ?, detail = ? WHERE phase IN (?, ?, ?)",
-                (AttemptPhase.PENDING, "process-restarted", *_LIVE),
-            )
-            db.execute("UPDATE owner SET process_epoch = ? WHERE singleton = 1", (epoch,))
-        return cls(path, control_target_id, epoch, clock_ns)
+        """在独占所有权下启动换代。监督宿主持有所有权到 close。"""
+        try:
+            path = path.resolve(strict=True)
+        except OSError as exc:
+            raise LedgerUnavailableError("账目路径不可用") from exc
+        lock = _claim_process(path)
+        try:
+            epoch = uuid4().hex
+            with _transaction(path) as db:
+                _owner(db, control_target_id, upgrade=True)
+                db.execute("UPDATE tasks SET ended = ? WHERE ended IS NULL", (TaskEnd.RESTARTED,))
+                db.execute(
+                    "UPDATE attempts SET phase = ?, detail = ? WHERE phase IN (?, ?, ?)",
+                    (AttemptPhase.PENDING, "process-restarted", *_LIVE),
+                )
+                db.execute("UPDATE owner SET process_epoch = ? WHERE singleton = 1", (epoch,))
+            ledger = cls(path, control_target_id, epoch, clock_ns)
+            if hold_owner:
+                ledger._process_lock, lock = lock, None
+            return ledger
+        finally:
+            if lock is not None:
+                lock.close()
+
+    def close(self) -> None:
+        """原尝试与受监督输入收尾后释放进程所有权。"""
+        self._closed = True
+        lock, self._process_lock = self._process_lock, None
+        if lock is not None:
+            lock.close()
 
     @contextmanager
     def _current(self) -> Generator[sqlite3.Connection]:
+        if self._closed:
+            raise LedgerUnavailableError("账目已关闭")
         try:
             with _transaction(self._path) as db:
                 if _owner(db, self._control_target_id)["process_epoch"] != self._epoch:
@@ -674,7 +719,8 @@ class TaskLedger:
                     AttemptPhase.RESERVED,
                 ),
             )
-            return True
+        self._local_attempt_id = spec.attempt_id
+        return True
 
     def bind_core(self, attempt_id: str, core: CoreCorrelation) -> bool:
         """先持久登记原核关联，再由调用方重核许可并至多写出一次。"""
@@ -715,7 +761,16 @@ class TaskLedger:
                 and attempt.detail == proof
             ):
                 return attempt
-            if attempt.phase not in (AttemptPhase.RESERVED, AttemptPhase.AWAITING_RECEIPT):
+            expired_here = (
+                attempt.phase is AttemptPhase.PENDING
+                and attempt.detail == _OUTCOME_DEADLINE
+                and attempt.receipt is None
+                and attempt_id == self._local_attempt_id
+            )
+            if (
+                attempt.phase not in (AttemptPhase.RESERVED, AttemptPhase.AWAITING_RECEIPT)
+                and not expired_here
+            ):
                 raise LedgerConflictError("尝试无法按未写出结案")
             return _set_phase(db, attempt_id, AttemptPhase.NOT_EXECUTED, proof)
 
@@ -733,14 +788,18 @@ class TaskLedger:
                 if attempt.receipt != receipt:
                     raise LedgerConflictError("回执与原事实冲突")
                 return attempt
-            if attempt.phase not in (AttemptPhase.AWAITING_RECEIPT, AttemptPhase.PENDING):
+            if attempt.phase not in (
+                AttemptPhase.AWAITING_RECEIPT,
+                AttemptPhase.PENDING,
+                AttemptPhase.OPERATOR_RESOLVED,
+            ):
                 raise LedgerConflictError("原尝试当前不接纳回执")
             attempt_id = attempt.spec.attempt_id
             db.execute(
                 "UPDATE attempts SET receipt = ? WHERE attempt_id = ?",
                 (_RECEIPT.dump_json(receipt), attempt_id),
             )
-            if attempt.phase is AttemptPhase.PENDING:
+            if attempt.phase in (AttemptPhase.PENDING, AttemptPhase.OPERATOR_RESOLVED):
                 return _known_attempt(db, attempt_id)
             phase = _receipt_phase(attempt, receipt, now_ns)
             detail = "receipt-uncertain" if phase is AttemptPhase.PENDING else None
@@ -753,7 +812,7 @@ class TaskLedger:
         *,
         observed: CoreReceipt | None = None,
     ) -> bool:
-        """隔离确证的同关联矛盾，保留原终态和两条核事实以供审计。"""
+        """补记迟到的原核事实，隔离确证的同关联矛盾。"""
         with self._current() as db:
             row = db.execute(
                 "SELECT * FROM attempts WHERE core = ?", (_CORE.dump_json(core),)
@@ -762,11 +821,22 @@ class TaskLedger:
                 return False
             attempt = _attempt(row)
             original = attempt.receipt or observed
-            if original is None or original == contradictory:
-                return False
             for receipt in (original, contradictory):
-                if not isinstance(receipt, Rejected) and receipt.id != core.action_id:
+                if (
+                    receipt is not None
+                    and not isinstance(receipt, Rejected)
+                    and receipt.id != core.action_id
+                ):
                     raise LedgerConflictError("矛盾回执与原核关联不符")
+            if original is None:
+                if attempt.phase in (AttemptPhase.PENDING, AttemptPhase.OPERATOR_RESOLVED):
+                    db.execute(
+                        "UPDATE attempts SET receipt = ? WHERE attempt_id = ?",
+                        (_RECEIPT.dump_json(contradictory), attempt.spec.attempt_id),
+                    )
+                return False
+            if original == contradictory:
+                return False
             db.execute(
                 """INSERT OR IGNORE INTO receipt_quarantine VALUES (1, ?, ?, ?)""",
                 (
@@ -792,6 +862,10 @@ class TaskLedger:
                 attempt.receipt, Executed
             ):
                 raise LedgerConflictError("效果须对应合时的已执行回执")
+            if _receipt_quarantined(db):
+                return _set_phase(
+                    db, attempt_id, AttemptPhase.PENDING, Refusal.RECEIPT_CONFLICT.value
+                )
             base, observed = attempt.spec.base_frame, evidence.frame
             if (
                 observed.number <= base.number
