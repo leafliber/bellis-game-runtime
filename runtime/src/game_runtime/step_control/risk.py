@@ -1,12 +1,13 @@
 """定位与主进程的风险门禁。最终输入白名单、静态禁区和前台由实时核执行。"""
 
+import asyncio
 import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Final
 
 from core_protocol import models
-from game_runtime.adapter import Adapter, PixelRect, ScreenType
+from game_runtime.adapter import Adapter, NotCalibratedError, PixelRect, ScreenType
 from game_runtime.adapter.schema import ScreenRisk
 from game_runtime.ocr import OcrLine, OcrResult, OcrService
 from game_runtime.scene import SceneService, SceneUpdate, ScreenSource
@@ -18,6 +19,12 @@ from game_runtime.step_control.contracts import (
     Scroll,
     StepProposal,
     TextTarget,
+)
+from game_runtime.step_control.phrase_location import (
+    PhraseIdentity,
+    PhraseLocationError,
+    find_phrase,
+    verify_phrase,
 )
 
 CHOICES: Final = frozenset({ScreenType.CHOICE, ScreenType.TIMED_CHOICE})
@@ -80,6 +87,7 @@ class Located:
     point: tuple[int, int] | None = None
     line: OcrLine | None = None
     reads: tuple[OcrResult, ...] = ()
+    phrase_identity: PhraseIdentity | None = None
 
 
 def _target_rect(update: SceneUpdate, point: tuple[int, int], radius: int) -> PixelRect:
@@ -102,6 +110,49 @@ def verify_ocr(update: SceneUpdate, result: OcrResult) -> None:
         raise ActionRefusedError("stale-ocr")
 
 
+async def _locate_phrase(
+    scene: SceneService,
+    ocr: OcrService,
+    update: SceneUpdate,
+    target: TextTarget,
+    timeout: float | None,
+) -> Located:
+    if target.roi is None or target.text is None or target.phrase is None:
+        raise ActionRefusedError("phrase-evidence-missing")
+    if timeout is None or timeout <= 0:
+        raise ActionRefusedError("phrase-ocr-timeout")
+    frame = update.frame
+    try:
+        rect = ocr.adapter.roi(target.roi).to_pixels(frame.width, frame.height)
+    except (LookupError, NotCalibratedError) as error:
+        raise ActionRefusedError("phrase-roi-unavailable") from error
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    try:
+        async with asyncio.timeout_at(deadline):
+            source = await ocr.recognize(frame, target.roi)
+        verify_ocr(update, source)
+        if source.roi != target.roi or source.rect != rect:
+            raise ActionRefusedError("stale-ocr")
+        if scene.with_ocr(update, (source,)) is None:
+            raise ActionRefusedError("scene-changed")
+        candidate = find_phrase(source, target.phrase, source_text=target.text)
+        verified = await verify_phrase(
+            frame, candidate, ocr.recognize_rect, timeout=deadline - loop.time()
+        )
+    except TimeoutError:
+        raise ActionRefusedError("phrase-ocr-timeout") from None
+    except PhraseLocationError as error:
+        raise ActionRefusedError(str(error)) from error
+    reads = (source, verified.verification)
+    current = scene.with_ocr(update, reads)
+    if current is None:
+        raise ActionRefusedError("scene-changed")
+    if candidate.source_line not in current.screen_state.text_targets:
+        raise ActionRefusedError("stale-ocr")
+    return Located(verified.point, candidate.source_line, reads, candidate.identity)
+
+
 async def locate(
     scene: SceneService,
     ocr: OcrService,
@@ -109,7 +160,10 @@ async def locate(
     target: TextTarget,
     *,
     radius: int,
+    phrase_timeout: float | None = None,
 ) -> Located:
+    if target.phrase is not None:
+        return await _locate_phrase(scene, ocr, update, target, phrase_timeout)
     rect = None if target.point is None else _target_rect(update, target.point, radius)
     if target.roi is not None:
         result = await ocr.recognize(update.frame, target.roi)
@@ -161,6 +215,7 @@ def _safe_return(
         or classification.source is not ScreenSource.SIGNATURE
         or proposal.category is not Category.NAVIGATE
         or not isinstance(proposal.action, Click)
+        or proposal.action.target.phrase is not None
         or proposal.action.button is not models.MouseButton.LEFT
         or found.line is None
         or text_key(found.line.text) != text_key(target.text)
@@ -226,6 +281,10 @@ def assess(
         raise ActionRefusedError("unknown-screen")
 
     action = proposal.action
+    if isinstance(action, Click) and action.target.phrase is not None:
+        decision = adapter.decisions.get(update.state.screen or "")
+        if ScreenType.TIMED_CHOICE in restrictions or (decision is not None and decision.timer):
+            raise ActionRefusedError("timed-phrase-unsupported")
     if isinstance(action, Click) and action.button not in adapter.whitelist.click_buttons:
         raise ActionRefusedError("button-not-allowed")
     if isinstance(action, Press) and action.scan_code not in adapter.whitelist.press_keys:

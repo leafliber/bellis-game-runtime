@@ -7,7 +7,8 @@ from typing import Literal
 from game_runtime.adapter.schema import DecisionTimer
 from game_runtime.ocr import OcrLine
 from game_runtime.operator import messages
-from game_runtime.step_control.contracts import DecisionView, StepProposal
+from game_runtime.step_control.contracts import Click, DecisionView, StepProposal, TextTarget
+from game_runtime.step_control.phrase_location import PhraseIdentity
 from game_runtime.step_control.risk import text_key
 
 _TIME = re.compile(
@@ -15,7 +16,9 @@ _TIME = re.compile(
     r"(?:(?P<separator>[.:])(?P<fraction>[0-9]{1,3}))?"
 )
 
-type DecisionKey = tuple[str, str, tuple[str, ...]]
+type DecisionKey = (
+    tuple[str, str, tuple[str, ...]] | tuple[str, str, tuple[str, ...], PhraseIdentity]
+)
 
 
 def timer_deadline(timer: DecisionTimer, text: str, capture_ns: int) -> int | None:
@@ -52,19 +55,23 @@ class DecisionEvidence:
     lines: tuple[OcrLine, ...]
     deadline_ns: int | None
     proposed: StepProposal | None = None
+    phrase_identity: PhraseIdentity | None = None
 
     @property
     def identity(self) -> DecisionKey:
-        return self.screen, text_key(self.prompt), tuple(text_key(line.text) for line in self.lines)
+        base = self.screen, text_key(self.prompt), tuple(text_key(line.text) for line in self.lines)
+        return base if self.phrase_identity is None else (*base, self.phrase_identity)
 
     @property
     def view(self) -> DecisionView:
+        match self.proposed:
+            case StepProposal(action=Click(target=TextTarget(phrase=str(phrase)))):
+                labels = (phrase,)
+            case _:
+                labels = tuple(line.text for line in self.lines)
         return DecisionView(
             self.prompt,
-            tuple(
-                messages.DecisionOption(index=i, text=line.text)
-                for i, line in enumerate(self.lines)
-            ),
+            tuple(messages.DecisionOption(index=i, text=text) for i, text in enumerate(labels)),
             self.deadline_ns,
         )
 
@@ -82,6 +89,7 @@ class PendingDecision:
     selected_traceparent: str | None = None
     last_timing_frame: int = 0
     executed_at_ns: int | None = None
+    opened_transform: int | None = None
 
     @property
     def view(self) -> DecisionView:

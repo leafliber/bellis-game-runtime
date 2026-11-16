@@ -56,10 +56,16 @@ class TextTarget:
     roi: str | None = None
     point: tuple[int, int] | None = None
     """模型坐标由调用方先还原为本帧的客户区物理像素。"""
+    phrase: str | None = None
+    """点击完整源行 `text` 内的词项，须提供已标定的 `roi`。"""
 
     def __post_init__(self) -> None:
         if self.roi is None and self.point is None:
             raise ValueError("定位须给出 ROI 或坐标")
+        if self.phrase is not None and (
+            not self.phrase.strip() or not self.text or not self.text.strip() or not self.roi
+        ):
+            raise ValueError("行内词项须给出完整源行与 ROI")
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +83,10 @@ class Press:
 class Scroll:
     target: TextTarget
     notches: int
+
+    def __post_init__(self) -> None:
+        if self.target.phrase is not None:
+            raise ValueError("行内词项仅用于点击")
 
 
 type Input = Click | Press | Scroll

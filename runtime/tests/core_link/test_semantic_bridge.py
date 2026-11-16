@@ -49,6 +49,7 @@ from game_runtime.step_control import (
     ExpectedEffect,
     Plan,
     PlannerContext,
+    Policy,
     PolicyInput,
     StepConfig,
     StepProposal,
@@ -64,7 +65,19 @@ from synthetic_game.anchors import anchor_templates
 from synthetic_game.layout import Layout, Rect
 from synthetic_game.render import Button, ChoiceView, DialogueView, MenuView, Renderer, View
 
-from .test_step_control import HEIGHT, WAIT, WIDTH, RecordingPlanner, planner_for, until
+from .test_step_control import (
+    HEIGHT,
+    PHRASE,
+    PHRASE_CHOICE_LINE,
+    WAIT,
+    WIDTH,
+    PhraseMenu,
+    RecordingPlanner,
+    observe_phrase_crops,
+    phrase_line,
+    planner_for,
+    until,
+)
 
 _TRACE = "00-11111111111111111111111111111111-2222222222222222-01"
 _DECISION_TRACE = "00-11111111111111111111111111111111-3333333333333333-01"
@@ -349,7 +362,7 @@ class Rig:
 
 
 @asynccontextmanager
-async def rig(exe: Path, folder: Path) -> AsyncGenerator[Rig]:
+async def rig(exe: Path, folder: Path, *, policy: Policy | None = None) -> AsyncGenerator[Rig]:
     if sys.platform == "win32":
         folder = Path("\\\\?\\" + str(folder.resolve()))
     source = GAMES_DIR / "synthetic-game" / "adapter.toml"
@@ -395,7 +408,7 @@ async def rig(exe: Path, folder: Path) -> AsyncGenerator[Rig]:
         try:
             async with supervise(
                 adapter.id,
-                FixturePolicy(),
+                policy or FixturePolicy(),
                 CoreLinkOptions(
                     exe,
                     health_interval=0.05,
@@ -649,6 +662,108 @@ def test_bellis_vote_and_action_fact_follow_authorized_effect(
                 assert nxt.traceparent == _TRACE
                 if not expires_during_vote:
                     assert [g for g in r.planner.goals if g is not None] == [accepted]
+            finally:
+                renew_task.cancel()
+                await asyncio.gather(renew_task, return_exceptions=True)
+                await main.close()
+                await core.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("expires_during_crop", [False, True], ids=["authorized", "expired"])
+def test_bellis_phrase_choice_rechecks_authorization_during_reread(
+    semantic_core: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, expires_during_crop: bool
+) -> None:
+    async def run() -> None:
+        policy = PhraseMenu(PHRASE_CHOICE_LINE, ScreenType.CHOICE)
+        async with rig(semantic_core, tmp_path, policy=policy) as r:
+            controller = r.run.controller
+            assert controller is not None
+            pixels = r.frames.render()
+            line = phrase_line(r.frames.adapter, PHRASE_CHOICE_LINE)
+            r.frames.recognized[pixels] = (*r.frames.recognized[pixels], line)
+            crop_entered_at: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+            crop_cancelled = asyncio.Event()
+            resolving = False
+
+            async def respond(result: OcrResult) -> OcrResult:
+                if resolving and not crop_entered_at.done():
+                    crop_entered_at.set_result(time.perf_counter_ns())
+                    if expires_during_crop:
+                        try:
+                            await asyncio.Event().wait()
+                        finally:
+                            crop_cancelled.set()
+                return result
+
+            reads = observe_phrase_crops(monkeypatch, controller.ocr, respond)
+            main, core, events = await r.connect(first=True)
+            assert core is not None
+            r.risk.append(RiskReading(0.23, False))
+            await ready(r, events)
+            renew_task = asyncio.create_task(renew(core, 1))
+            try:
+                assert await main.request("goal.submit", goal("phrase", 5_000)) == {}
+                opened = await until(lambda: events.points[0] if events.points else None)
+                assert opened.prompt == PHRASE_CHOICE_LINE
+                assert [option.label for option in opened.options] == [PHRASE]
+                assert not r.frames.down
+                assert len(reads) == 1
+                vote = goal(
+                    "phrase-vote",
+                    400 if expires_during_crop else 3_000,
+                    vote=opened.decisionPointId,
+                )
+                assert await main.request("goal.submit", vote) == {}
+                choice: dict[str, object] = {
+                    "decisionPointId": opened.decisionPointId,
+                    "optionId": "option-0",
+                    "source": "vote",
+                    "traceparent": _DECISION_TRACE,
+                }
+                resolving = True
+                assert await main.request("decision.resolve", choice) == {}
+                entered_at = await asyncio.wait_for(crop_entered_at, WAIT)
+                expiry_ms = cast(int, vote["expiresAtMs"])
+                assert entered_at < ns(expiry_ms)
+                assert len(reads) == 2
+                assert reads[1].frame_number > reads[0].frame_number
+                if expires_during_crop:
+                    await asyncio.wait_for(crop_cancelled.wait(), WAIT)
+                    await until(
+                        lambda: next(
+                            (
+                                h
+                                for h in events.health
+                                if h.atMs >= expiry_ms and h.mode == "paused"
+                            ),
+                            None,
+                        )
+                    )
+                    await refused(main, "decision.resolve", choice)
+                    assert not r.frames.down
+                    assert not events.actions
+                else:
+                    action = await until(lambda: events.actions[0] if events.actions else None)
+                    assert action.goalId == "phrase-vote"
+                    assert action.traceparent == _DECISION_TRACE
+                    assert action.selection == v1.Selection(
+                        decisionPointId=opened.decisionPointId, optionId="option-0", source="vote"
+                    )
+                    assert r.frames.down == ["menu"]
+                    await until(
+                        lambda: next(
+                            (
+                                h
+                                for h in events.health
+                                if h.atMs >= action.atMs
+                                and h.mode == "autonomous"
+                                and h.goalId == "phrase"
+                            ),
+                            None,
+                        )
+                    )
             finally:
                 renew_task.cancel()
                 await asyncio.gather(renew_task, return_exceptions=True)

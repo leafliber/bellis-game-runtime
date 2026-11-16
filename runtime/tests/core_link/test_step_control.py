@@ -5,7 +5,7 @@ import json
 import math
 import sys
 import time
-from collections.abc import AsyncGenerator, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -119,7 +119,9 @@ class World:
             self.clock,
         )
         self.reads: dict[int, tuple[OcrLine, ...]] = {}
+        self.extra_lines: tuple[OcrLine, ...] = ()
         self.capture_by_frame: dict[int, int] = {}
+        self.transform_version = 1
         self.presenting = False
         self.advance_game_clock = True
         self.ignore_choice = False
@@ -131,6 +133,7 @@ class World:
         self.freeze_after_input = False
         self.inputs: list[tuple[GameScene, GameClick | GamePress]] = []
         self.submitted_click: tuple[int, int] | None = None
+        self.submitted_click_frame: int | None = None
 
     def rect(self, roi: str) -> PixelRect:
         return self.adapter.roi(roi).to_pixels(WIDTH, HEIGHT)
@@ -179,7 +182,7 @@ class World:
                 "无法识别" if self.bad_timer else f"剩余 {seconds:.1f} 秒"
             )
             lines.append(self._text(timing, self.rect("timer-text")))
-        return tuple(lines)
+        return (*lines, *self.extra_lines)
 
     async def present(self, display: FakeDisplay) -> None:
         last = time.perf_counter()
@@ -192,7 +195,13 @@ class World:
                 frame = self.game.frame()
                 captured = time.perf_counter_ns()
                 self.reads[captured] = self._lines(self.game.truth())
-                display.present(frame.data, WIDTH, HEIGHT, capture_ns=captured)
+                display.present(
+                    frame.data,
+                    WIDTH,
+                    HEIGHT,
+                    capture_ns=captured,
+                    transform_version=self.transform_version,
+                )
             await asyncio.sleep(0.035)
 
     def input(self, event: DeviceEvent) -> None:
@@ -505,6 +514,7 @@ async def rig(
                 for action in step.actions:
                     if isinstance(action.root, models.Click):
                         world.submitted_click = (action.root.x, action.root.y)
+                        world.submitted_click_frame = base_frame
             fault, world.next_submission_fault = world.next_submission_fault, None
             match fault:
                 case "rejected":
@@ -753,6 +763,317 @@ def test_supervised_profile_requires_model_and_planner(
 @pytest.fixture
 def root(tmp_path: Path) -> Path:
     return Path("\\\\?\\" + str(tmp_path.resolve())) if sys.platform == "win32" else tmp_path
+
+
+PHRASE = "开始"
+PHRASE_LINE = "请选择开始或返回"
+PHRASE_CHOICE_LINE = "覆盖存档后才开始或返回"
+
+
+def phrase_line(adapter: Adapter, text: str, *, dx: int = 0, dy: int = 0) -> OcrLine:
+    roi = adapter.roi("menu-start").to_pixels(WIDTH, HEIGHT)
+    box = PixelRect(roi.left + 8 + dx, roi.top + 3 + dy, roi.right - 24 + dx, roi.top + 14 + dy)
+    return OcrLine(text, box, 0.99, horizontal=True)
+
+
+def observe_phrase_crops(
+    monkeypatch: pytest.MonkeyPatch,
+    ocr: OcrService,
+    respond: Callable[[OcrResult], Awaitable[OcrResult]] | None = None,
+) -> list[OcrResult]:
+    reads: list[OcrResult] = []
+
+    async def recognize_rect(frame: FrameLike, rect: PixelRect) -> OcrResult:
+        # 把复读识别框放在估算框偏左的位置，区分两者的中心。
+        box = PixelRect(rect.left + 1, rect.top + 1, rect.left + 5, rect.top + 7)
+        result = OcrResult(
+            frame.frame_number,
+            frame.transform_version,
+            None,
+            rect,
+            (OcrLine(PHRASE, box, 0.98, horizontal=True),),
+        )
+        reads.append(result)
+        return result if respond is None else await respond(result)
+
+    monkeypatch.setattr(ocr, "recognize_rect", recognize_rect)
+    return reads
+
+
+class PhraseMenu:
+    def __init__(self, text: str, effect: ScreenType = ScreenType.DIALOGUE) -> None:
+        self.text = text
+        self.effect = effect
+
+    async def propose(self, inputs: PolicyInput) -> Plan:
+        if inputs.scene.screen_state.classification.screen_type is not ScreenType.MENU:
+            return Plan()
+        return Plan(
+            steps=(
+                StepProposal(
+                    Category.NAVIGATE,
+                    Click(TextTarget(self.text, "menu-start", point=(0, 0), phrase=PHRASE)),
+                    ExpectedEffect(EffectKind.SCREEN, screen_type=self.effect),
+                ),
+            )
+        )
+
+
+@pytest.mark.parametrize("mode", ["click", "choice", "choice-no-effect"])
+def test_phrase_click_uses_the_reread_box_and_choice_uses_a_new_frame(
+    core_exe: Path, root: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    async def main() -> None:
+        line = PHRASE_LINE if mode == "click" else PHRASE_CHOICE_LINE
+        async with rig(core_exe, root, policy=PhraseMenu(line)) as r:
+            controller = r.run.controller
+            assert controller is not None
+            reads = observe_phrase_crops(monkeypatch, controller.ocr)
+            r.world.extra_lines = (phrase_line(r.world.adapter, line),)
+            r.world.presenting = True
+            handle = r.world.game.handle
+            await r.start()
+            if mode != "click":
+                point = await until(lambda: r.console.current_decision)
+                assert point.deadline_ns is None
+                assert point.prompt == line
+                assert [option.text for option in point.options] == [PHRASE]
+                assert len(reads) == 1
+                assert r.world.submitted_click is None
+
+                r.world.extra_lines = (phrase_line(r.world.adapter, line, dx=12),)
+                handle(GamePress(Key.DOWN))
+                moved_at = time.perf_counter_ns()
+                await until(
+                    lambda: (
+                        frame
+                        if (frame := controller.scene.latest) is not None
+                        and frame.frame.capture_ns > moved_at
+                        else None
+                    )
+                )
+                if mode == "choice-no-effect":
+
+                    def ignore_input(_action: GameClick | GamePress) -> None:
+                        pass
+
+                    monkeypatch.setattr(r.world.game, "handle", ignore_input)
+                assert r.console.choose(0).id == point.id
+
+            status = StepStatus.UNKNOWN if mode == "choice-no-effect" else StepStatus.VERIFIED
+            result = await until(
+                lambda: next((s for s in controller.recent if s.status is status), None)
+            )
+            final_read = reads[-1]
+            (verified_line,) = final_read.lines
+            box = verified_line.box
+            point_xy = ((box.left + box.right) // 2, (box.top + box.bottom) // 2)
+            assert r.world.inputs == [(GameScene.MENU, GameClick(*point_xy))]
+            assert r.world.submitted_click_frame == final_read.frame_number
+            assert point_xy[0] != (final_read.rect.left + final_read.rect.right) // 2
+            if mode == "click":
+                assert len(reads) == 1
+                assert result.category is Category.NAVIGATE
+                return
+
+            assert len(reads) == 2
+            first, second = reads
+            assert second.frame_number > first.frame_number
+            assert second.transform_version == first.transform_version
+            assert second.rect.left == first.rect.left + 12
+            assert result.category is Category.SELECT
+            if mode == "choice":
+                await until(lambda: r.closed("operator", 0))
+            else:
+                await until(lambda: r.closed("unknown", None))
+                handle(GamePress(Key.DOWN))
+                await until(
+                    lambda: next(
+                        (
+                            s
+                            for s in controller.recent
+                            if s.detail == "choice-awaiting-authorization"
+                        ),
+                        None,
+                    )
+                )
+                assert r.console.current_decision is None
+                assert len(r.world.inputs) == 1
+                assert len(reads) == 2
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize(
+    ("failure", "detail", "extra_reads"),
+    [
+        ("changed-source", "target-not-found", 0),
+        ("duplicate-source", "ambiguous-target", 0),
+        ("source-confidence", "low-ocr-confidence", 0),
+        ("reread-confidence", "low-ocr-confidence", 1),
+        ("reread-mismatch", "phrase-ocr-mismatch", 1),
+        ("transform-changed", "decision-transform-changed", 0),
+        ("reread-timeout", "phrase-ocr-timeout", 1),
+    ],
+)
+def test_phrase_choice_refuses_changed_or_missing_evidence(
+    core_exe: Path,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    detail: str,
+    extra_reads: int,
+) -> None:
+    async def main() -> None:
+        async with rig(core_exe, root, policy=PhraseMenu(PHRASE_CHOICE_LINE)) as r:
+            controller = r.run.controller
+            assert controller is not None
+            original = phrase_line(r.world.adapter, PHRASE_CHOICE_LINE)
+            opened = False
+
+            async def respond(result: OcrResult) -> OcrResult:
+                if not opened:
+                    return result
+                match failure:
+                    case "reread-timeout":
+                        await asyncio.Event().wait()
+                    case "reread-confidence":
+                        return replace(result, lines=(replace(result.lines[0], confidence=0.2),))
+                    case "reread-mismatch":
+                        return replace(result, lines=(replace(result.lines[0], text="开始吧"),))
+                    case _:
+                        pass
+                return result
+
+            reads = observe_phrase_crops(monkeypatch, controller.ocr, respond)
+            r.world.extra_lines = (original,)
+            r.world.presenting = True
+            await r.start()
+            point = await until(lambda: r.console.current_decision)
+            opened = True
+            match failure:
+                case "changed-source":
+                    r.world.extra_lines = (replace(original, text="覆盖进度后才开始或返回"),)
+                case "duplicate-source":
+                    r.world.extra_lines = (
+                        original,
+                        phrase_line(r.world.adapter, original.text, dy=13),
+                    )
+                case "source-confidence":
+                    r.world.extra_lines = (replace(original, confidence=0.2),)
+                case "transform-changed":
+                    r.world.transform_version += 1
+                case _:
+                    pass
+            changed_at = time.perf_counter_ns()
+            await until(
+                lambda: (
+                    frame
+                    if (frame := controller.scene.latest) is not None
+                    and frame.frame.capture_ns > changed_at
+                    and frame.frame.transform_version == r.world.transform_version
+                    else None
+                )
+            )
+            assert r.console.choose(0).id == point.id
+            await until(lambda: r.closed("withdrawn", None))
+            assert any(
+                s.status is StepStatus.REJECTED and s.detail == detail for s in controller.recent
+            )
+            assert len(reads) == 1 + extra_reads
+            assert r.world.submitted_click is None
+            assert not r.world.inputs
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("reason", ["scene-changed", "goal-changed"])
+def test_phrase_reread_cannot_submit_after_scene_or_goal_changes(
+    core_exe: Path, root: Path, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    async def main() -> None:
+        initial = Goal("原授权目标", generation=1)
+        planner = RecordingPlanner(PlannerContext(initial))
+        reading = asyncio.Event()
+        finish = asyncio.Event()
+
+        class Once(PhraseMenu):
+            async def propose(self, inputs: PolicyInput) -> Plan:
+                return Plan() if reading.is_set() else await super().propose(inputs)
+
+        async def respond(result: OcrResult) -> OcrResult:
+            reading.set()
+            await finish.wait()
+            return result
+
+        async with rig(core_exe, root, policy=Once(PHRASE_LINE), planner=planner) as r:
+            controller = r.run.controller
+            assert controller is not None
+            observe_phrase_crops(monkeypatch, controller.ocr, respond)
+            r.world.extra_lines = (phrase_line(r.world.adapter, PHRASE_LINE),)
+            r.world.presenting = True
+            await r.start()
+            await asyncio.wait_for(reading.wait(), WAIT)
+            if reason == "scene-changed":
+                r.world.click("menu.shop")
+                await until(
+                    lambda: (
+                        frame
+                        if (frame := controller.scene.latest) is not None
+                        and frame.state.screen == "shop"
+                        else None
+                    )
+                )
+            else:
+                planner.context = PlannerContext(Goal("新授权目标", generation=2))
+            finish.set()
+            result = await until(
+                lambda: next(
+                    (
+                        s
+                        for s in controller.recent
+                        if s.status is StepStatus.REJECTED and s.detail == reason
+                    ),
+                    None,
+                )
+            )
+            assert result.category is Category.NAVIGATE
+            assert r.world.submitted_click is None
+            assert not r.world.inputs
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize(
+    ("text", "reason", "rereads"),
+    [("删除存档后才开始", "target-text-forbidden", 1), ("开始或重新开始", "ambiguous-target", 0)],
+)
+def test_phrase_rejects_forbidden_source_text_and_repeated_phrase(
+    core_exe: Path,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    reason: str,
+    rereads: int,
+) -> None:
+    async def main() -> None:
+        async with rig(core_exe, root, policy=PhraseMenu(text)) as r:
+            controller = r.run.controller
+            assert controller is not None
+            reads = observe_phrase_crops(monkeypatch, controller.ocr)
+            r.world.extra_lines = (phrase_line(r.world.adapter, text),)
+            r.world.presenting = True
+            await r.start()
+            result = await until(
+                lambda: next((s for s in controller.recent if s.detail == reason), None)
+            )
+            assert result.status is StepStatus.REJECTED
+            assert len(reads) == rereads
+            assert r.console.current_decision is None
+            assert r.world.submitted_click is None
+            assert not r.world.inputs
+
+    asyncio.run(main())
 
 
 def test_host_advances_then_resolves_operator_and_timed_choices(core_exe: Path, root: Path) -> None:
