@@ -104,6 +104,7 @@ class Kernel:
         clock: Clock | None = None,
         options: KernelOptions | None = None,
         on_transition: Callable[[Transition], None] | None = None,
+        control_open: Callable[[], bool] | None = None,
         audio: AudioReader | None = None,
         frames: FrameSource | None = None,
     ) -> None:
@@ -111,13 +112,17 @@ class Kernel:
         通常是 `CoreLink.audio_reader`；不给时插件读音频抛 `LookupError`。
 
         `frames` 是交给申请了 `frames.read` 的插件的帧源（`PluginContext.frames`），实时运行时
-        通常是定序帧源 `SequencedFrameSource(link.frames)`；不给时插件取帧源抛 `LookupError`。"""
+        通常是定序帧源 `SequencedFrameSource(link.frames)`；不给时插件取帧源抛 `LookupError`。
+
+        `control_open` 可让宿主在异步卸载之前停止接受提交。卸载仍负责作废代次并确认释放。
+        """
         self._catalog = catalog
         self._core = core
         self._frames = frames
         self._clock = clock or MonotonicClock()
         self._options = options or KernelOptions()
         self._on_transition = on_transition
+        self._control_open = control_open
         self._audio = audio
         self._registry = ServiceRegistry()
         self._entries: dict[str, _Entry] = {}
@@ -365,6 +370,7 @@ class Kernel:
                     entry.state is State.ACTIVE
                     and entry.instance is not None
                     and entry.instance.id == instance_id
+                    and (self._control_open is None or self._control_open())
                 ),
                 self._core.submit,
             )

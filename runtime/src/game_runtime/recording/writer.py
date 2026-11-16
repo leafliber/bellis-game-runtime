@@ -202,6 +202,12 @@ class RecordingWriter:
             self._queue_frame(frame)
             await self._drain(self._max_pending)
 
+    async def flush_frames(self) -> None:
+        """写完已提交的帧，供录制消费者在一批帧结束时及时发现编码或索引错误。"""
+        async with self._frame_lock:
+            self._check_writable()
+            await self._drain(0)
+
     def _queue_frame(self, frame: RingFrame) -> None:
         pixels = packed_pixels(frame)
         previous = self._previous

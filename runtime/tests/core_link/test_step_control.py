@@ -6,7 +6,7 @@ import math
 import sys
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -387,6 +387,7 @@ class Rig:
     device: FakeDevice
     world: World
     events: list[ConsoleEvent]
+    audio: FakeAudioOutput | None = None
 
     async def start(self) -> None:
         while self.console.pending_confirmation is not None:
@@ -441,6 +442,9 @@ async def rig(
     fast_paths: bool = True,
     voice: VoiceHub | None = None,
     text_cps: float = 500,
+    record: bool = False,
+    hold_key: bool = False,
+    after_core_start: Callable[[CoreLink], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[Rig]:
     source = GAMES_DIR / "synthetic-game" / "adapter.toml"
     directory = root / "games" / "synthetic-game"
@@ -455,6 +459,8 @@ async def rig(
         content = before + "[pacing]" + rest.split("[pacing]", 1)[1]
     if freeze_test:
         content = content.replace("press_duration = 0.05", "press_duration = 0.30")
+    if hold_key:
+        content = content.replace("hold_keys = []", "hold_keys = [30]\nmax_hold = 6.0")
     (directory / "adapter.toml").write_text(content, encoding="utf-8")
     adapter = load_adapter(directory)
     world = World(adapter, text_cps)
@@ -500,6 +506,11 @@ async def rig(
         loop.call_soon_threadsafe(world.input, event)
 
     class ObservedCoreLink(CoreLink):
+        async def start(self) -> None:
+            await super().start()
+            if after_core_start is not None:
+                await after_core_start(self)
+
         async def submit(
             self,
             grant: ControlGrant,
@@ -535,6 +546,11 @@ async def rig(
         with (
             FakeDisplay.create(WIDTH, HEIGHT) as display,
             FakeDevice(on_event=input_event) as device,
+            (
+                FakeAudioOutput.create(48_000, 2, block_capacity=16, block_count=8)
+                if record
+                else nullcontext()
+            ) as audio,
             pytest.MonkeyPatch.context() as patch,
         ):
             patch.setattr("game_runtime.step_control.host.CoreLink", ObservedCoreLink)
@@ -551,6 +567,9 @@ async def rig(
                         capture=CaptureConfig(
                             target=display.target, max_width=WIDTH, max_height=HEIGHT
                         ),
+                        audio=None
+                        if audio is None
+                        else AudioConfig(target=audio.target, block_capacity=16, block_count=8),
                     ),
                     games_dir=directory.parent,
                     data_dir=data,
@@ -566,6 +585,8 @@ async def rig(
                         fast_paths=fast_paths,
                     ),
                     profile=profile,
+                    record=record,
+                    name="supervised" if record else None,
                     admission=AdmissionPolicy(max_rate=20, idle_interval=0.08),
                     extra_plugins=narrative_plugins
                     + voice_plugins
@@ -603,7 +624,7 @@ async def rig(
                             )
                         )
                     try:
-                        yield Rig(running, console, device, world, events)
+                        yield Rig(running, console, device, world, events, audio)
                     finally:
                         if remove is not None:
                             remove()
