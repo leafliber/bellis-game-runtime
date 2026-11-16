@@ -22,6 +22,7 @@ from game_runtime.step_control.supervision import (
     SemanticPlay,
     SessionProgress,
 )
+from game_runtime.telemetry import TELEMETRY
 from game_runtime.voice_activity import VOICE_ACTIVITY
 
 _INTERRUPTS: Final = frozenset(
@@ -106,6 +107,7 @@ def step_plugin_for(
                 *policy_dependencies,
                 f"{NARRATIVE.ref}?",
                 f"{VOICE_ACTIVITY.ref}?",
+                f"{TELEMETRY.ref}?",
             ),
             permissions=(CONTROL_SUBMIT,),
             config=StepConfig,
@@ -148,6 +150,7 @@ def step_plugin_for(
                 signals.planner_binding,
                 reading,
                 semantic=semantic,
+                telemetry=lambda: ctx.optional(TELEMETRY),
             )
             self.controller = controller
             signals.controller = controller

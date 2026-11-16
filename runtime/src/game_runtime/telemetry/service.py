@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from re import fullmatch
 from secrets import randbits
-from time import monotonic_ns, time_ns
+from time import perf_counter_ns, time_ns
 
 from game_runtime.telemetry.exporter import EventRecord, LocalExporter, SpanRecord, TelemetryConfig
 
@@ -71,7 +71,7 @@ def _valid_id(value: object) -> bool:
     )
 
 
-def _parse_parent(value: str | None) -> tuple[str, str] | None:
+def parse_traceparent(value: object) -> tuple[str, str] | None:
     if isinstance(value, str) and (
         match := fullmatch(r"00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}", value)
     ):
@@ -96,9 +96,9 @@ class TelemetrySpan:
     def traceparent(self) -> str:
         return self._traceparent
 
-    def event(self, stage: str) -> None:
-        """记录实际步骤到达的固定阶段；每个阶段至多一次。"""
-        self._owner._event(self, stage)  # pyright: ignore[reportPrivateUsage]
+    def event(self, stage: str, *, at_monotonic_ns: int | None = None) -> None:
+        """记录固定阶段。延后交付时使用阶段发生时采样的 `perf_counter_ns()`。"""
+        self._owner._event(self, stage, at_monotonic_ns)  # pyright: ignore[reportPrivateUsage]
 
     def end(self, outcome: str) -> None:
         self._owner._end(self, outcome)  # pyright: ignore[reportPrivateUsage]
@@ -107,7 +107,7 @@ class TelemetrySpan:
 class RuntimeTelemetry:
     def __init__(self, config: TelemetryConfig) -> None:
         self._epoch_ns = time_ns()
-        self._origin_ns = monotonic_ns()
+        self._origin_ns = perf_counter_ns()
         self._max_active = config.max_active_spans
         self._exporter = LocalExporter(config)
         self._active: dict[TelemetrySpan, _OpenSpan] = {}
@@ -130,6 +130,25 @@ class RuntimeTelemetry:
         if context.decision_id is not None and (value := _allowed(timing, _TIMINGS)) is not None:
             return self._start(context, _Kind.DECISION, value)
         return None
+
+    def records(self, handle: TelemetrySpan, ids: tuple[str, str]) -> bool:
+        """核对活动句柄对应的实际导出标识。"""
+        span = self._active.get(handle)
+        return not self._closed and span is not None and ids == (span.trace_id, span.span_id)
+
+    def reparent_step(self, handle: TelemetrySpan, parent: str | None) -> bool:
+        """定位复核选定另一来源时，保留同一次尝试的起点和 span ID。"""
+        span = self._active.get(handle)
+        if self._closed or span is None or span.kind is not _Kind.STEP or span.events:
+            return False
+        parsed = parse_traceparent(parent)
+        try:
+            trace_id, parent_id = parsed if parsed is not None else (_new_id(32), None)
+        except OSError:
+            return False
+        span.trace_id, span.parent_id = trace_id, parent_id
+        handle._traceparent = f"00-{trace_id}-{span.span_id}-01"  # pyright: ignore[reportPrivateUsage]
+        return True
 
     def invalidate(
         self,
@@ -162,7 +181,7 @@ class RuntimeTelemetry:
         await self._exporter.aclose()
 
     def _now_ns(self) -> int:
-        return self._epoch_ns + monotonic_ns() - self._origin_ns
+        return self._epoch_ns + perf_counter_ns() - self._origin_ns
 
     def _start(self, context: SpanContext, kind: _Kind, value: str) -> TelemetrySpan | None:
         if (
@@ -176,7 +195,7 @@ class RuntimeTelemetry:
             or not _valid_id(context.decision_id)
         ):
             return None
-        parent = _parse_parent(context.traceparent)
+        parent = parse_traceparent(context.traceparent)
         try:
             trace_id, parent_id = parent if parent is not None else (_new_id(32), None)
             span_id = _new_id(16)
@@ -196,16 +215,23 @@ class RuntimeTelemetry:
         )
         return handle
 
-    def _event(self, handle: TelemetrySpan, stage: str) -> None:
+    def _event(self, handle: TelemetrySpan, stage: str, at_monotonic_ns: int | None) -> None:
         span = self._active.get(handle)
         if span is None or span.kind is not _Kind.STEP:
             return
         if (name := _allowed(stage, _STEP_EVENTS)) is None:
             return
         index = _STEP_EVENTS.index(name)
-        if index > span.last_event:
+        if index <= span.last_event:
+            return
+        now = self._now_ns()
+        timestamp = (
+            now if at_monotonic_ns is None else self._epoch_ns + at_monotonic_ns - self._origin_ns
+        )
+        previous = int(span.events[-1]["timeUnixNano"]) if span.events else span.started_ns
+        if previous <= timestamp <= now:
             span.last_event = index
-            span.events.append({"name": f"game.step.{name}", "timeUnixNano": str(self._now_ns())})
+            span.events.append({"name": f"game.step.{name}", "timeUnixNano": str(timestamp)})
 
     def _end(self, handle: TelemetrySpan, outcome: str) -> None:
         span = self._active.pop(handle, None)

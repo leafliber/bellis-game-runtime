@@ -14,6 +14,7 @@ from game_runtime.kernel import Manifest, NoConfig, Plugin, PluginContext, Tier
 from game_runtime.narrative import NARRATIVE
 from game_runtime.scene import SCENE
 from game_runtime.step_control.contracts import PLANNER
+from game_runtime.telemetry import TELEMETRY
 from game_runtime.voice_activity import VOICE_ACTIVITY
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,7 @@ def game_bridge_for(
                 f"{PLANNER.ref}?",
                 f"{VOICE_ACTIVITY.ref}?",
                 f"{NARRATIVE.ref}?",
+                f"{TELEMETRY.ref}?",
             ),
             config=NoConfig,
         )
@@ -97,12 +99,14 @@ def game_bridge_for(
                 max_frame_age_ns,
             )
             session.project = project
+            session.telemetry = lambda: ctx.optional(TELEMETRY)
             task = asyncio.create_task(_run(session, select), name=ctx.instance_id)
 
             async def close() -> None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 session.project = None
+                session.telemetry = None
 
             ctx.register(close)
 

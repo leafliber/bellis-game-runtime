@@ -37,6 +37,7 @@ from game_runtime.telemetry import (
     exporter,
     service,
 )
+from game_runtime.telemetry.consumer import recorded_traceparent
 from game_runtime.telemetry.exporter import SpanRecord
 from game_runtime.telemetry.exporter import _RotatingFiles as RotatingFiles  # pyright: ignore[reportPrivateUsage]
 
@@ -86,13 +87,89 @@ def test_directory_must_be_explicit_and_local(directory: str | None) -> None:
         TelemetryConfig.model_validate({} if directory is None else {"directory": directory})
 
 
+def test_step_reparent_keeps_original_start_and_deferred_stage_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    epoch = 1_710_000_000_000_000_000
+    now = 100
+    monkeypatch.setattr(service, "time_ns", lambda: epoch)
+    monkeypatch.setattr(service, "perf_counter_ns", lambda: now)
+    new_trace, new_parent = "56" * 16, "78" * 8
+    parent = f"00-{new_trace}-{new_parent}-01"
+
+    async def run() -> str:
+        nonlocal now
+        telemetry = RuntimeTelemetry(TelemetryConfig(directory=tmp_path))
+        try:
+            step = _require(telemetry.step(SpanContext(1, PARENT, goal_id="g"), "select"))
+            span_id = step.traceparent.split("-")[2]
+            now += 40
+            assert telemetry.reparent_step(step, parent)
+            assert step.traceparent == f"00-{new_trace}-{span_id}-01"
+            step.event("located")
+            assert not telemetry.reparent_step(step, PARENT)
+            now += 100
+            step.event("submitted", at_monotonic_ns=150)
+            step.event("executed", at_monotonic_ns=160)
+            step.event("effect_checked", at_monotonic_ns=159)
+            step.event("effect_checked")
+            step.end("verified")
+            assert not telemetry.records(step, (new_trace, span_id))
+            return span_id
+        finally:
+            await telemetry.aclose()
+
+    span_id = asyncio.run(run())
+    (step,) = _records(tmp_path)
+    assert step["spanId"] == span_id
+    assert step["traceId"] == new_trace
+    assert step.get("parentSpanId") == new_parent
+    assert step["startTimeUnixNano"] == str(epoch)
+    assert [int(event["timeUnixNano"]) - epoch for event in step.get("events", [])] == [
+        40,
+        50,
+        60,
+        140,
+    ]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "broken",
+        f"00-{'0' * 32}-{HOST_PARENT}-01",
+        f"00-{HOST_TRACE}-{'0' * 16}-01",
+        f"00-{HOST_TRACE}-{'a' * 16}-01",
+    ],
+)
+def test_wire_context_checks_advertised_identity_and_current_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, malformed: str
+) -> None:
+    async def run() -> None:
+        telemetry = RuntimeTelemetry(TelemetryConfig(directory=tmp_path))
+        try:
+            step = _require(telemetry.step(SpanContext(1, PARENT, goal_id="g"), "advance"))
+
+            def lookup() -> RuntimeTelemetry:
+                return telemetry
+
+            assert recorded_traceparent(step, telemetry, PARENT, lookup) == step.traceparent
+            assert recorded_traceparent(step, telemetry, PARENT, lambda: None) is None
+            monkeypatch.setattr(step, "_traceparent", malformed)
+            assert recorded_traceparent(step, telemetry, PARENT, lookup) is None
+        finally:
+            await telemetry.aclose()
+
+    asyncio.run(run())
+
+
 def test_connected_spans_use_a_monotonic_timeline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     epoch = 1_710_000_000_000_000_000
     wall, monotonic = epoch, 100
     monkeypatch.setattr(service, "time_ns", lambda: wall)
-    monkeypatch.setattr(service, "monotonic_ns", lambda: monotonic)
+    monkeypatch.setattr(service, "perf_counter_ns", lambda: monotonic)
 
     async def run() -> str:
         nonlocal wall, monotonic

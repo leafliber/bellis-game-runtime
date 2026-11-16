@@ -1,7 +1,7 @@
 """受监督运行的主进程组装。许可源分别直连实时核。"""
 
 from collections.abc import AsyncGenerator, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -16,7 +16,7 @@ from game_runtime.adapter import (
     GameAdapterPlugin,
     load_adapter,
 )
-from game_runtime.core_link import BellisCoreOptions, CoreLink, CoreLinkOptions
+from game_runtime.core_link import BellisCoreOptions, CoreLink, CoreLinkOptions, StopStage
 from game_runtime.frames import AdmissionPolicy, SequencedFrameSource
 from game_runtime.kernel import (
     AUDIO_READ,
@@ -39,6 +39,8 @@ from game_runtime.step_control.contracts import Policy
 from game_runtime.step_control.controller import StepConfig, StepController
 from game_runtime.step_control.plugin import SessionSignals, step_plugin_for
 from game_runtime.step_control.supervision import PlaySession
+from game_runtime.telemetry import RuntimeTelemetry, TelemetryPlugin
+from game_runtime.telemetry.plugin import telemetry_plugin_for
 from game_runtime.voice_activity import VoiceActivityPlugin
 
 if TYPE_CHECKING:
@@ -203,6 +205,18 @@ async def supervise(
             for entry in entries
         ):
             audio = audio_config(adapter)
+
+    telemetry_id = TelemetryPlugin.manifest.id
+    telemetry_entries = [entry for entry in entries if entry.plugin == telemetry_id]
+    if telemetry_entries:
+        # 逆序停用时让控制产出者和语义桥先结束各自的在途步骤。
+        entries = telemetry_entries + [entry for entry in entries if entry.plugin != telemetry_id]
+    telemetry: RuntimeTelemetry | None = None
+
+    def remember_telemetry(service: RuntimeTelemetry) -> None:
+        nonlocal telemetry
+        telemetry = service
+
     signals = SessionSignals()
     clock = MonotonicClock()
     if link_options.bellis is not None or (
@@ -293,6 +307,7 @@ async def supervise(
                     GameAdapterPlugin,
                     ocr_plugin,
                     ScenePlugin,
+                    *((telemetry_plugin_for(remember_telemetry),) if telemetry_entries else ()),
                     *configured_plugins,
                     *extra_plugins,
                     *bridge_plugins,
@@ -324,7 +339,12 @@ async def supervise(
                     if frames is not None:
                         await frames.close()
                 finally:
-                    await core.stop()
+                    stopped = await core.stop()
+                    if telemetry is not None and (
+                        stopped.returncode is not None or stopped.stage is StopStage.ALREADY_EXITED
+                    ):
+                        with suppress(Exception):
+                            await telemetry.aclose()
     finally:
         if client is not None:
             await client.close()
