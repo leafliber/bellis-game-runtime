@@ -1,0 +1,10 @@
+{
+  "release_id": 2,
+  "through_seq": 7,
+  "held": [
+    {
+      "type": "key",
+      "scan_code": 17
+    }
+  ]
+}

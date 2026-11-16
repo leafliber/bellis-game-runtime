@@ -882,3 +882,34 @@ pub struct FakeReleaseAll {
     /// 释放的原因。
     pub reason: ReleaseReason,
 }
+
+/// 显式假设备模式的释放核验请求；与输入事件共用有序连接。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeVerifyReleaseParams")]
+pub struct FakeVerifyReleaseParams {
+    /// 本核实例的释放编号。
+    #[schemars(range(min = 1))]
+    pub release_id: u64,
+    /// 本次 `release_all` 事件的序号。
+    #[schemars(range(min = 1))]
+    pub through_seq: u64,
+    /// 入队时固定的绝对截止。
+    #[schemars(range(min = 1))]
+    pub deadline_ns: u64,
+}
+
+/// 假设备独立维护的按住状态；空列表须有完整连续事件账目支持。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "FakeVerifyReleaseResult")]
+pub struct FakeVerifyReleaseResult {
+    /// 精确回显原释放编号。
+    #[schemars(range(min = 1))]
+    pub release_id: u64,
+    /// 精确回显原事件水位。
+    #[schemars(range(min = 1))]
+    pub through_seq: u64,
+    /// 实际收到并应用的事件之后仍按住的项。
+    pub held: Vec<HeldInput>,
+}

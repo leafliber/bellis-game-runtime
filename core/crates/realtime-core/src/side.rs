@@ -30,6 +30,10 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 /// 把通知交给核连接的出口（放进发送队列）；旁路连接的线程不直接写核连接。
 pub(crate) type Post = Arc<dyn Fn(Notices) + Send + Sync>;
 
+/// 测试设备的核验请求与事件共用一个发送队列；返回 true 表示该项已处理。
+pub(crate) type RequestSender =
+    Box<dyn Fn(&RpcPeer, &'static str, &Map<String, Value>) -> bool + Send>;
+
 /// 以 `role` 连上对端并握手。
 ///
 /// # Errors
@@ -67,6 +71,17 @@ impl SideConnection {
         handlers: Handlers,
         queue: Arc<SendQueue>,
     ) -> io::Result<Self> {
+        Self::spawn_with_requests(name, connection, handlers, queue, None)
+    }
+
+    /// 仅显式假设备模式使用请求处理接缝，普通旁路连接仍只发送通知。
+    pub(crate) fn spawn_with_requests(
+        name: &'static str,
+        connection: Connection,
+        handlers: Handlers,
+        queue: Arc<SendQueue>,
+        request: Option<RequestSender>,
+    ) -> io::Result<Self> {
         let peer = Arc::new(RpcPeer::spawn(
             connection,
             handlers,
@@ -85,6 +100,12 @@ impl SideConnection {
             .spawn(move || {
                 let mut failed = false;
                 queue.run(|method, params| {
+                    if request
+                        .as_ref()
+                        .is_some_and(|send| send(&peer, method, params))
+                    {
+                        return;
+                    }
                     if let Err(error) = peer.notify(method, Some(params))
                         && !failed
                     {
