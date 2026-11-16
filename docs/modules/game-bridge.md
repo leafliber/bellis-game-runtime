@@ -47,9 +47,9 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 
 - 以 Bellis `packages/protocol`（TypeBox，Bellis D-21）为唯一的源（GD-03）。本仓库在 `vendor/bellis-protocol/` 锁定某个 Bellis 提交的生成物（JSON Schema 与 Pydantic 模型），附来源提交与摘要；`uv run check` 核对锁定副本未被改动。
 - 改动先在 Bellis 合入，本仓库再更新锁定的生成物；两边的检查各自校验。
-- 锁定清单为 `vendor/bellis-protocol/manifest.json`：记录上游仓库、完整提交号、每个副本的源路径与 SHA-256。Schema、Pydantic 模型与控制连接 fixture 均取自同一个已合入提交的 Git blob，保留原始字节；本仓库的格式化工具不改动副本。更新时一起替换这三份文件与清单。`uv run check` 离线核对文件集合、来源路径与摘要；它不联网验证提交是否已合入，更新者须在复制前确认。
+- 锁定清单为 `vendor/bellis-protocol/manifest.json`：记录上游仓库、完整提交号、每个副本的源路径与 SHA-256。v1 与语义 v2 各有 Schema、Pydantic 模型及互通夹具，六份产物均取自同一个已合入提交的 Git blob，保留原始字节；本仓库的格式化工具不改动副本。更新时一起核对全部产物与清单。`uv run check` 离线核对文件集合、来源路径与摘要；它不联网验证提交是否已合入，更新者须在复制前确认。
 - 两仓联调可在隔离验证分支锁定 Bellis 已冻结但尚未合入提交的候选生成物。仍取同一完整提交的原始 Git blob，按相同路径与摘要规则核对，在联调 PR 或报告注明候选提交和未合入状态。正式锁定仍按前两条执行。
-- Python 接收端先用锁定模型提供的 `parse_game_bridge_json` 解码原始 JSON，再校验信封、载荷、角色与方向；不能先用普通 JSON 解码丢失 `-0`、小数或指数形式的整数字段信息。模型和 fixture 只是契约，不能代替实时核对有效许可、帧与输入策略的核验。
+- Python 接收端按所选的语义版本，用锁定模型提供的 `parse_game_bridge_json` 解码原始 JSON，再校验信封、载荷、角色与方向；未支持的版本拒绝，不能先用普通 JSON 解码丢失 `-0`、小数或指数形式的整数字段信息。v2 产物不提供控制连接方法。模型和 fixture 只是契约，不能代替实时核对有效许可、帧与输入策略的核验，也不表示任务和结案已接通。
 - 握手比较主版本，不兼容时 Bellis 的游戏桥插件停在 WAITING 并说明原因。
 - 控制连接的 Rust 类型在 `core/crates/game-bridge-protocol`。typify 0.8.0 生成的 `GameLeaseRenewParams` 未保留 `token` 和 `expiresAtMs` 的上界，现用手写类型。完整检查的 pytest 项逐条核对锁定夹具，从 Schema 派生字段边界样本，并把 Rust 和冻结 Pydantic 模型各自编码的消息送给对端校验。
 - Rust 解码入口按控制角色拆成 Bellis 请求、实时核通知和实时核应答，逐字段从原始 JSON 读取。应答由调用方提供同一连接的在途请求，编号匹配后按请求方法验证。版本不同的 `game.describe` 应答只读取公共主版本，`error.data` 保留任意 JSON。
