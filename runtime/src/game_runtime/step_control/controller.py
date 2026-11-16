@@ -15,10 +15,11 @@ from core_protocol import models
 from game_runtime.adapter import Adapter, ScreenType
 from game_runtime.adapter.schema import DecisionTimer, DialogueBox
 from game_runtime.channel import ChannelError
+from game_runtime.core_link.link import ActionDeadlineError
 from game_runtime.kernel import ControlGrant, ControlRevokedError
 from game_runtime.narrative import NarrativeRecord
 from game_runtime.ocr import OcrResult, OcrService
-from game_runtime.operator import Clock, OperatorClient, SessionState, messages
+from game_runtime.operator import Clock, SessionState, messages
 from game_runtime.scene import (
     SceneService,
     SceneUpdate,
@@ -66,7 +67,16 @@ from game_runtime.step_control.risk import (
     text_key,
     verify_ocr,
 )
-from game_runtime.step_control.supervision import OperatorGoalRelay, PlannerBinding, SessionProgress
+from game_runtime.step_control.supervision import (
+    OperatorGoalRelay,
+    PlannerBinding,
+    PlaySession,
+    ResolutionSource,
+    SemanticPauseError,
+    SemanticPlay,
+    SessionProgress,
+    SubmittedChoice,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +109,7 @@ class StepController:
         scene: SceneService,
         ocr: OcrService,
         grant: ControlGrant,
-        operator: OperatorClient,
+        operator: PlaySession,
         policy: Policy,
         clock: Clock,
         config: StepConfig,
@@ -109,12 +119,15 @@ class StepController:
         operator_goal: OperatorGoalRelay,
         planner_binding: PlannerBinding,
         reading: ReadingPacing,
+        *,
+        semantic: SemanticPlay | None = None,
     ) -> None:
         self.adapter = adapter
         self.scene = scene
         self.ocr = ocr
         self.grant = grant
         self.operator = operator
+        self._semantic = semantic
         self.policy = policy
         self.clock = clock
         self.config = config
@@ -152,6 +165,14 @@ class StepController:
     def recent(self) -> tuple[StepResult, ...]:
         return tuple(self._recent)
 
+    @property
+    def queue_depth(self) -> int:
+        return len(self._plan)
+
+    @property
+    def stuck(self) -> bool:
+        return self._progress.stuck
+
     async def propose(self, inputs: PolicyInput) -> Plan:
         async with asyncio.timeout(self.config.policy_timeout):
             return await self.policy.propose(inputs)
@@ -181,7 +202,12 @@ class StepController:
         session_id = self.operator.session_id
         previous_revision = self._operator_goal.revision
         if session_id is not None:
-            self._operator_goal.update(session_id, session.goal_revision, session.goal)
+            self._operator_goal.update(
+                session_id,
+                session.goal_revision,
+                session.goal,
+                plan=None if self._semantic is None else self._semantic.planning_goal,
+            )
         if old is None or self._operator_goal.revision != previous_revision:
             if not self._planner_binding.used:
                 self.set_goal(self._operator_goal.goal)
@@ -199,10 +225,41 @@ class StepController:
         self._rejects = 0
         self.interrupt(keep_decision=keep_decision)
 
-    def on_resolved(self, resolved: messages.DecisionResolved) -> None:
-        if self._pending is not None and not self._choice_submitting:
-            self._pending.accept(resolved, self.clock.now_ns(), _ns(self.config.decision_margin))
+    def on_resolved(
+        self,
+        resolved: messages.DecisionResolved,
+        *,
+        source: ResolutionSource | None = None,
+        traceparent: str | None = None,
+    ) -> bool:
+        pending = self._pending
+        if pending is None or self._choice_submitting:
+            return False
+        if source is not None and not self.decision_available(resolved.id):
+            return False
+        accepted = pending.accept(
+            resolved,
+            self.clock.now_ns(),
+            _ns(self.config.decision_margin),
+            source=source,
+            traceparent=traceparent,
+        )
+        if accepted:
             self.wake()
+        return accepted
+
+    def decision_available(self, decision_id: str) -> bool:
+        pending, latest = self._pending, self.scene.latest
+        return (
+            pending is not None
+            and pending.id == decision_id
+            and pending.selected is None
+            and not self._choice_submitting
+            and self._allowed()
+            and latest is not None
+            and latest.state.screen == pending.evidence.screen
+            and self._fresh(latest)
+        )
 
     def on_release(self, reason: models.ReleaseReason) -> None:
         self.interrupt(keep_decision=reason is models.ReleaseReason.LEASE_REVOKED)
@@ -243,7 +300,7 @@ class StepController:
                 task = asyncio.current_task()
                 if task is not None and task.cancelling():
                     raise
-            except ReadingWaitError as wait:
+            except (ReadingWaitError, SemanticPauseError) as wait:
                 self._plan.clear()
                 self._last_proposed = None
                 self._record(StepStatus.WAITING, str(wait), self.scene.latest)
@@ -291,6 +348,8 @@ class StepController:
             extra={"step_result": item},
         )
         if status is StepStatus.REJECTED:
+            if self._semantic is not None:
+                self._semantic.rejected(detail)
             self._goal_feedback("rejected", detail)
 
     def _planner_event(self, event: DecisionEvent | GoalEvent | ObservationReceipt) -> None:
@@ -389,7 +448,7 @@ class StepController:
         if context.paused and not self._planner_paused:
             self.interrupt(keep_decision=True)
         pending = self._pending
-        keep_decision = (
+        keep_decision = self._waiting_for(pending) or (
             self._planner_planning
             and not context.paused
             and pending is not None
@@ -413,15 +472,30 @@ class StepController:
         self._planner_planning = False
         self._pause_reason = reason
 
-    def _allowed(self) -> bool:
+    def _allowed(self, *, verifying: bool = False) -> bool:
         session = self.operator.session
         return (
             not self._closed
             and self.grant.is_open
-            and self.operator.may_autoplay
+            and (
+                self._semantic.may_verify
+                if verifying and self._semantic is not None
+                else self.operator.may_autoplay
+            )
             and session is not None
             and (session.ends_at_ns is None or self.clock.now_ns() < session.ends_at_ns)
         )
+
+    def _waiting_for(self, decision: PendingDecision | None) -> bool:
+        return (
+            self._semantic is not None
+            and decision is not None
+            and self._semantic.waiting_for(decision.id)
+        )
+
+    def _pacing_wait(self) -> None:
+        if self._semantic is not None and self._semantic.progress_held():
+            raise SemanticPauseError("pacing-held")
 
     def _fresh(self, update: SceneUpdate) -> bool:
         age = max(0, self.clock.now_ns() - update.frame.capture_ns)
@@ -539,7 +613,8 @@ class StepController:
         if self._progress.choice_held(self._operator_goal):
             self._record(StepStatus.WAITING, "choice-awaiting-authorization")
             return
-        if self._planner_paused and not self._planner_planning:
+        waiting_vote = self._waiting_for(pending)
+        if self._planner_paused and not self._planner_planning and not waiting_vote:
             self._record(StepStatus.WAITING, self._pause_reason or "planner-paused")
             return
         if not self._allowed():
@@ -560,10 +635,17 @@ class StepController:
                 self._record(StepStatus.STUCK, "cutscene-timeout", update)
             self._plan.clear()
             return
-        if self._progress.stuck or self._language_failed or self._progress.goal_done:
+        if self._language_failed or (
+            not waiting_vote and (self._progress.stuck or self._progress.goal_done)
+        ):
             return
         goal = self._progress.goal
-        if goal is not None and goal.deadline_ns is not None and now >= goal.deadline_ns:
+        if (
+            not waiting_vote
+            and goal is not None
+            and goal.deadline_ns is not None
+            and now >= goal.deadline_ns
+        ):
             self._plan.clear()
             self._progress.stuck = True
             self._record(StepStatus.STUCK, "goal-timeout", update)
@@ -632,6 +714,7 @@ class StepController:
         if update.screen_state.restrictions & STOPPED:
             self._plan.clear()
             if self._restart_permitted(update):
+                self._pacing_wait()
                 if update.observation_scope is not self._last_proposed:
                     self._last_proposed = update.observation_scope
                     await self._restart(update, revision)
@@ -645,6 +728,7 @@ class StepController:
             self._last_proposed = update.observation_scope
             await self._open_from_scene(update, revision)
             return
+        self._pacing_wait()
         box = self._dialogue_box(update)
         if box is not None and not at_limit:
             record = self._reading.require_ready(update, box, self.clock.now_ns())
@@ -833,7 +917,7 @@ class StepController:
             retry_frame, proposal, retry, revision, fast_dialogue=fast_dialogue
         )
 
-    def _require_authority(self, revision: int) -> None:
+    def _require_authority(self, revision: int, *, decision: PendingDecision | None = None) -> None:
         if revision != self._revision or not self._allowed():
             raise ActionRefusedError("operator-permission")
         if self._progress.choice_held(self._operator_goal):
@@ -845,21 +929,36 @@ class StepController:
             why = "planner-unavailable" if planner is None else "planner-replaced"
             self._hold_for_planner(why)
             raise ActionRefusedError(why)
-        if planner is not None:
+        waiting_vote = self._waiting_for(decision)
+        if planner is not None and not waiting_vote:
             context = planner.current()
-            if context.paused:
+            timed_planning = (
+                self._semantic is not None
+                and decision is not None
+                and decision.deadline_ns is not None
+                and context.planning
+            )
+            if context.paused and not timed_planning:
                 raise ActionRefusedError("planner-paused")
             if context.goal != self._progress.goal:
                 raise ActionRefusedError("goal-changed")
         if (
-            self._progress.goal is not None
+            not waiting_vote
+            and self._progress.goal is not None
             and self._progress.goal.deadline_ns is not None
             and self.clock.now_ns() >= self._progress.goal.deadline_ns
         ):
             raise ActionRefusedError("goal-timeout")
 
-    def _current(self, update: SceneUpdate, found: Located, revision: int) -> SceneUpdate:
-        self._require_authority(revision)
+    def _current(
+        self,
+        update: SceneUpdate,
+        found: Located,
+        revision: int,
+        *,
+        decision: PendingDecision | None = None,
+    ) -> SceneUpdate:
+        self._require_authority(revision, decision=decision)
         if (
             self._progress.goal is not None
             and self._progress.goal.max_steps is not None
@@ -1086,7 +1185,14 @@ class StepController:
             if pending.deadline_ns is not None and now >= pending.deadline_ns:
                 self._close_decision("withdrawn")
                 return
-            if self._planner_paused:
+            if self._planner_paused and not (
+                self._waiting_for(pending)
+                or (
+                    self._semantic is not None
+                    and self._planner_planning
+                    and pending.deadline_ns is not None
+                )
+            ):
                 return
             choice = pending.choose(now, margin)
             if choice is None:
@@ -1126,7 +1232,16 @@ class StepController:
                 proposal = pending.evidence.proposed
                 found = await self._locate(update, proposal)
                 here = update
-            status = await self._issue(here, proposal, found, revision, decision=pending)
+            source = pending.selected_source if by == "operator" else "default"
+            choice_at_submission = SubmittedChoice(
+                pending.id,
+                index,
+                source,
+                pending.selected_traceparent if by == "operator" else None,
+            )
+            status = await self._issue(
+                here, proposal, found, revision, decision=pending, choice=choice_at_submission
+            )
             if status is StepStatus.VERIFIED:
                 self._close_decision(by, index)
             elif status is StepStatus.REJECTED:
@@ -1158,6 +1273,8 @@ class StepController:
             return
         if by == "unknown":
             self._progress.unknown_choice_revision = self._operator_goal.revision
+            if self._semantic is not None:
+                self._progress.closed_choices.add(pending.evidence.identity)
         elif consume:
             self._progress.closed_choices.add(pending.evidence.identity)
         with suppress(ChannelError):
@@ -1181,6 +1298,7 @@ class StepController:
                     index,
                     confirmed,
                     pending.executed_at_ns,
+                    pending.selected_source if by == "operator" else None,
                 )
             )
 
@@ -1192,6 +1310,7 @@ class StepController:
         revision: int,
         *,
         decision: PendingDecision | None = None,
+        choice: SubmittedChoice | None = None,
         restart: bool = False,
         fast_dialogue: NarrativeRecord | None = None,
     ) -> StepStatus:
@@ -1208,14 +1327,14 @@ class StepController:
             and await self._matches(proposal.expected, update)
         ):
             raise ActionRefusedError("effect-already-present")
-        here = self._current(update, found, revision)
+        here = self._current(update, found, revision, decision=decision)
         box = self._dialogue_box(here)
         reading: NarrativeRecord | None = None
         if box is not None:
             read = next((item for item in found.reads if item.roi == box.text), None)
             if read is None:
                 read = await self._dialogue_read(here, box)
-                here = self._current(here, found, revision)
+                here = self._current(here, found, revision, decision=decision)
             reading = self._dialogue_ready(here, box, read)
         if fast_dialogue is not None and (
             reading is None or line_revision(reading) != line_revision(fast_dialogue)
@@ -1234,21 +1353,31 @@ class StepController:
             raise ActionRefusedError("decision-required")
         if self._waiting_time():
             raise ActionRefusedError("action-interval")
+        if decision is None:
+            self._pacing_wait()
         started = self.clock.now_ns()
         session = self.operator.session
         end = started + _ns(self.config.action_valid_for)
         for bound in (
             None if session is None else session.ends_at_ns,
             None if decision is None else decision.deadline_ns,
-            None if self._progress.goal is None else self._progress.goal.deadline_ns,
+            None
+            if self._progress.goal is None or self._waiting_for(decision)
+            else self._progress.goal.deadline_ns,
         ):
             if bound is not None:
                 end = min(end, bound)
         if end - started <= _ns(self.adapter.whitelist.press_duration):
             raise ActionRefusedError("action-window-expired")
         self._next_id += 1
-        action = core_action(proposal, found, self._next_id)
+        action_id = self._next_id
+        action = core_action(proposal, found, action_id)
         category = Category.SELECT if decision is not None else proposal.category
+        outcome = None
+        if self._semantic is not None:
+            outcome = self._semantic.action_started(
+                f"{self._decision_prefix}-{action_id}", category, action.root.type, end, choice
+            )
         self._last_action_ns = started
         self._progress.steps += 1
         previous_dialogue_line = self._progress.fast_dialogue_line
@@ -1269,11 +1398,20 @@ class StepController:
                 if isinstance(sent.result, models.Rejected):
                     status, detail = StepStatus.REJECTED, sent.result.reason.value
                 else:
-                    with suppress(ChannelError):
-                        self.operator.report_action(
-                            messages.Action(category=category.value, summary=action.root.type)
+                    if self._semantic is None:
+                        with suppress(ChannelError):
+                            self.operator.report_action(
+                                messages.Action(category=category.value, summary=action.root.type)
+                            )
+                    receipt = (await sent.outcomes()).get(action_id)
+                    if receipt is not None and (
+                        receipt.id != action_id
+                        or (
+                            isinstance(receipt, models.Executed)
+                            and not started <= receipt.at_ns < end
                         )
-                    receipt = (await sent.outcomes()).get(self._next_id)
+                    ):
+                        receipt = None
                     if isinstance(receipt, models.Dropped):
                         detail = receipt.reason.value
                         if receipt.reason is not models.DropReason.DUPLICATE:
@@ -1294,18 +1432,26 @@ class StepController:
                     detail = status.value
         except ControlRevokedError:
             status, detail = StepStatus.REJECTED, "producer-revoked"
+        except ActionDeadlineError:
+            status, detail = StepStatus.REJECTED, "action-window-expired"
         except (TimeoutError, ChannelError):
             pass
         except ActionRefusedError:
             detail = "verification-invalidated"
         except asyncio.CancelledError:
-            self._record(StepStatus.UNKNOWN, "interrupted-after-submit", here, category, started)
+            status, detail = StepStatus.UNKNOWN, "interrupted-after-submit"
+            self._record(status, detail, here, category, started)
             if decision is not None:
                 self._close_decision("unknown")
             raise
         except Exception:
             detail = "execution-verification-failed"
             logger.exception("无法确认已提交动作的效果")
+        finally:
+            if outcome is not None:
+                outcome(
+                    status, detail, receipt.at_ns if isinstance(receipt, models.Executed) else None
+                )
         if status is StepStatus.REJECTED:
             if fast_dialogue is not None:
                 # 首次明确未执行可重试。若这是无效果后的重发，原提交仍保留。
@@ -1330,7 +1476,11 @@ class StepController:
         if deadline is not None and executed_ns >= deadline:
             return StepStatus.UNKNOWN
         early_destination: str | None = None
-        while self._allowed() and revision == self._revision and self.clock.now_ns() < until:
+        while (
+            self._allowed(verifying=True)
+            and revision == self._revision
+            and self.clock.now_ns() < until
+        ):
             after = self.scene.latest
             if (
                 after is not None
@@ -1370,7 +1520,7 @@ class StepController:
                             verified = unchanged
                         else:
                             verified = not unchanged and await self._matches(expected, after)
-                if verified:
+                if verified and self._allowed(verifying=True) and revision == self._revision:
                     self._verified_scope = after.observation_scope
                     return StepStatus.VERIFIED
             self._wake.clear()
@@ -1379,7 +1529,9 @@ class StepController:
                     await self._wake.wait()
         latest = self.scene.latest
         if (
-            decision is None
+            self._allowed(verifying=True)
+            and revision == self._revision
+            and decision is None
             and unchanged
             and latest is not None
             and self._fresh(latest)

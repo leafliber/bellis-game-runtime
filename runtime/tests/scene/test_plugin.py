@@ -347,8 +347,10 @@ def test_fixed_texts_use_ocr_while_it_is_there(data_dir: Path) -> None:
         scene = await scene_service()
         feed = Feed(frames)
 
+        assert scene.last_analyzed_capture_ns is None
         menu = await processed(scene, feed.push())
         assert (menu.state.verdict, menu.state.screen) == (Verdict.SCREEN, "title-menu")
+        assert scene.last_analyzed_capture_ns == menu.frame.capture_ns
         assert Shared.reader.calls == 1
 
         # OCR 停用后 scene 仍在运行；“开始”按钮的像素变了，固定文字项不可判。
@@ -360,6 +362,7 @@ def test_fixed_texts_use_ocr_while_it_is_there(data_dir: Path) -> None:
         unchanged = await processed(scene, feed.push())
         assert unchanged.frame.pixels == menu.frame.pixels
         assert unchanged.state.verdict is Verdict.UNDETERMINED  # 停用后不沿用缓存签名
+        assert scene.last_analyzed_capture_ns is None
         assert unchanged.screen_state.restrictions == {ScreenType.UNKNOWN, ScreenType.SETTINGS}
         assert not scene.observe(menu, ScreenObservation(screen_type=ScreenType.SHOP, confidence=1))
 
@@ -381,6 +384,7 @@ def test_fixed_texts_use_ocr_while_it_is_there(data_dir: Path) -> None:
         feed.game.handle(Press(Key.DOWN))
         again = await processed(scene, feed.push())
         assert again.state.screen == "title-menu"
+        assert scene.last_analyzed_capture_ns == again.frame.capture_ns
         await k.shutdown()
 
     asyncio.run(scenario())
@@ -429,6 +433,7 @@ def test_observations_only_add_restrictions_for_the_same_picture(data_dir: Path)
         )
         await k.disable("scene")
         assert scene.latest is None
+        assert scene.last_analyzed_capture_ns is None
         assert not scene.observe(
             moved, ScreenObservation(screen_type=ScreenType.SHOP, confidence=1)
         )

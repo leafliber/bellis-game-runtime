@@ -1,10 +1,67 @@
 """认证操作员目标的转发和会话内 planner 实例核对。"""
 
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from typing import Literal, Protocol
 from weakref import ReferenceType, ref
 
-from game_runtime.step_control.contracts import Goal, PlannerPort
+from game_runtime.operator import messages
+from game_runtime.step_control.contracts import Category, Goal, PlannerPort, StepStatus
 from game_runtime.step_control.decisions import DecisionKey
+
+
+class PlaySession(Protocol):
+    @property
+    def session(self) -> messages.Session | None: ...
+
+    @property
+    def session_id(self) -> str | None: ...
+
+    @property
+    def may_autoplay(self) -> bool: ...
+
+    def open_decision(self, decision: messages.DecisionOpened) -> None: ...
+    def update_decision(self, update: messages.DecisionUpdated) -> None: ...
+    def close_decision(self, closed: messages.DecisionClosed) -> None: ...
+    def report_action(self, action: messages.Action) -> None: ...
+
+
+type ResolutionSource = Literal["director", "vote"]
+
+
+@dataclass(frozen=True, slots=True)
+class SubmittedChoice:
+    decision_id: str
+    index: int
+    source: Literal["director", "vote", "default"] | None
+    traceparent: str | None
+
+
+type ActionOutcome = Callable[[StepStatus, str, int | None], None]
+
+
+class SemanticPauseError(RuntimeError):
+    """接纳的节奏或等待投票状态暂缓普通动作。"""
+
+
+class SemanticPlay(PlaySession, Protocol):
+    @property
+    def planning_goal(self) -> Goal | None: ...
+
+    @property
+    def may_verify(self) -> bool: ...
+
+    def progress_held(self) -> bool: ...
+    def waiting_for(self, decision_id: str) -> bool: ...
+    def rejected(self, detail: str) -> None: ...
+    def action_started(
+        self,
+        action_id: str,
+        category: Category,
+        summary: str,
+        deadline_ns: int,
+        choice: SubmittedChoice | None,
+    ) -> ActionOutcome: ...
 
 
 @dataclass(slots=True)
@@ -43,12 +100,17 @@ class OperatorGoalRelay:
         self._sent = 0
         self._recipient: ReferenceType[PlannerPort] | None = None
 
-    def update(self, session_id: str, revision: int, text: str | None) -> None:
+    def update(
+        self, session_id: str, revision: int, text: str | None, *, plan: Goal | None = None
+    ) -> None:
         source = (session_id, revision, text)
         if self._source != source:
             self._source = source
             self.revision += 1
-            self.goal = None if text is None else Goal(text, generation=self.revision)
+            if plan is not None:
+                self.goal = replace(plan, generation=self.revision)
+            else:
+                self.goal = None if text is None else Goal(text, generation=self.revision)
 
     def forward(self, planner: PlannerPort) -> None:
         if (

@@ -62,6 +62,13 @@ class SceneUpdate:
     )
     """连续未变的画面共用；由 scene@1 发布时设置。"""
 
+    @property
+    def analyzed_capture_ns(self) -> int | None:
+        """签名可判时返回此帧的采集时刻。"""
+        if self.state.verdict in (Verdict.UNDETERMINED, Verdict.DISABLED):
+            return None
+        return self.frame.capture_ns
+
 
 class SceneAnalyzer:
     """逐帧判别。不是线程安全的：同一时刻只在一个工作线程里调用 `analyze`。"""

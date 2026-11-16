@@ -20,6 +20,7 @@ class Candidate:
     reason: str
     quotes: tuple[tuple[int, str], ...] = ()
     failed_outcome: str | None = None
+    failed_source: str | None = None
 
 
 type DecisionKey = tuple[str, str, tuple[str, ...], str]
@@ -56,7 +57,7 @@ class DecisionHistory:
     def __init__(self) -> None:
         self.current: Decision | None = None
         self.last_attempt: Attempt | None = None
-        self._failures: dict[DecisionKey, dict[str, str]] = {}
+        self._failures: dict[DecisionKey, dict[str, tuple[str, str]]] = {}
         self._last_failure: DecisionKey | None = None
         self._consecutive = 0
 
@@ -98,7 +99,9 @@ class DecisionHistory:
             if any(item not in evidence for item in row.quotes):
                 raise ValueError("引用须来自本次调用的剧情记录")
             quotes = tuple((item, evidence[item].text[:48]) for item in dict.fromkeys(row.quotes))
-            result.append(Candidate(row.index, row.reason, quotes, tried.get(options[row.index])))
+            failure = tried.get(options[row.index])
+            outcome, source = (None, None) if failure is None else failure
+            result.append(Candidate(row.index, row.reason, quotes, outcome, source))
         return tuple(sorted(result, key=lambda candidate: candidate.failed_outcome is not None))
 
     def tried(self, decision: Decision) -> dict[int, str]:
@@ -106,7 +109,7 @@ class DecisionHistory:
             return {}
         failures = self._failures.get(decision.key, {})
         return {
-            option.index: failures[key]
+            option.index: failures[key][0]
             for option in decision.event.view.options
             if (key := compare_key(option.text)) in failures
         }
@@ -132,7 +135,7 @@ class DecisionHistory:
                 event.instance_id,
                 compare_key(selected.text),
                 selected.text,
-                event.by,
+                event.authorized_source or event.by,
                 decision.scope,
                 decision.checkpoint,
             )
@@ -155,4 +158,4 @@ class DecisionHistory:
 
     def annotate(self, attempt: Attempt, result: str) -> None:
         if attempt.key is not None:
-            self._failures.setdefault(attempt.key, {})[attempt.option_key] = result
+            self._failures.setdefault(attempt.key, {})[attempt.option_key] = result, attempt.source

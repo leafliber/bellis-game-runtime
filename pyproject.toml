@@ -46,6 +46,7 @@ ignore = [
 
 [tool.pyright]
 include = ["protocol", "runtime", "tools"]
+extraPaths = ["vendor/bellis-protocol/models"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 

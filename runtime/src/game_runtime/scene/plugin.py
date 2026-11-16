@@ -46,7 +46,12 @@ class SceneService(Protocol):
 
     @property
     def latest(self) -> SceneUpdate | None:
-        """最近一次的结果；还没有时为 None。"""
+        """当前画面已发布的判别结果。"""
+        ...
+
+    @property
+    def last_analyzed_capture_ns(self) -> int | None:
+        """最近可判帧的采集时刻，画面像素变化待判时保留，判别或帧源失效时清空。"""
         ...
 
     def subscribe(self, listener: SceneListener) -> Callable[[], None]:
@@ -86,12 +91,17 @@ class SceneHub:
         self._problems = problems
         self._uncalibrated = uncalibrated
         self._latest: SceneUpdate | None = None
+        self._last_analyzed_capture_ns: int | None = None
         self._listeners: dict[object, SceneListener] = {}
         self._closed = False
 
     @property
     def latest(self) -> SceneUpdate | None:
         return self._latest
+
+    @property
+    def last_analyzed_capture_ns(self) -> int | None:
+        return self._last_analyzed_capture_ns
 
     @property
     def problems(self) -> tuple[str, ...]:
@@ -142,10 +152,16 @@ class SceneHub:
 
     def invalidate(self) -> None:
         self._latest = None
+        self._last_analyzed_capture_ns = None
 
     def begin_frame(self, frame: RingFrame) -> None:
-        if self._latest is not None and not _same_picture(self._latest.frame, frame):
+        latest = self._latest
+        if latest is None:
+            return
+        if not _continues_capture(latest.frame, frame):
             self.invalidate()
+        elif latest.frame.pixels != frame.pixels:
+            self._latest = None
 
     def close(self) -> None:
         self._closed = True
@@ -156,7 +172,11 @@ class SceneHub:
         if self._closed:
             return
         old = self._latest
-        if old is not None and _same_picture(old.frame, update.frame):
+        if (
+            old is not None
+            and _continues_capture(old.frame, update.frame)
+            and old.frame.pixels == update.frame.pixels
+        ):
             screen = replace(update.screen_state, observations=old.screen_state.observations)
             # 确定性判别改变后重新观察，但同一画面已追加的限制仍然有效。
             scope = (
@@ -164,6 +184,7 @@ class SceneHub:
             )
             update = replace(update, screen_state=screen, observation_scope=scope)
         self._latest = update
+        self._last_analyzed_capture_ns = update.analyzed_capture_ns
         for listener in list(self._listeners.values()):
             try:
                 listener(update)
@@ -171,14 +192,13 @@ class SceneHub:
                 logger.exception("scene@1 的监听者处理帧 %d 时出错", update.state.frame_number)
 
 
-def _same_picture(before: RingFrame, current: RingFrame) -> bool:
+def _continues_capture(before: RingFrame, current: RingFrame) -> bool:
     return (
         before.frame_number < current.frame_number
         and before.transform_version == current.transform_version
         and before.width == current.width
         and before.height == current.height
         and before.row_stride == current.row_stride
-        and before.pixels == current.pixels
     )
 
 

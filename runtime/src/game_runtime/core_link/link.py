@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 import logging
 import math
+import re
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -110,6 +111,10 @@ class CoreStartError(RuntimeError):
     """实时核没能就绪：启动失败、握手失败、就绪前退出或超时。"""
 
 
+class ActionDeadlineError(RuntimeError):
+    """动作的绝对截止时刻已到，动作块未发送。"""
+
+
 DEFAULT_RESTART_BACKOFF: tuple[float, ...] = (1.0, 2.0, 4.0)
 """GR-35 自动重启的退避（秒），至多这么多次。"""
 DEFAULT_RESTART_RESET: float = 60.0
@@ -130,6 +135,23 @@ class RestartPolicy:
             raise ValueError("退避须非空且非负")
         if self.reset_after <= 0:
             raise ValueError("清零时长须为正")
+
+
+@dataclass(frozen=True, slots=True)
+class BellisCoreOptions:
+    """只交给实时核运行身份。实时核在自己的进程里读取 Bellis 会话。"""
+
+    session_id: str
+    runtime_id: str
+    test_session_file: Path | None = None
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[a-z0-9]{1,16}", self.session_id) is None:
+            raise ValueError("Bellis 会话号无效")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", self.runtime_id) is None:
+            raise ValueError("Runtime 运行编号无效")
+        if self.test_session_file is not None and not self.test_session_file.is_absolute():
+            raise ValueError("Bellis 测试会话文件须为绝对路径")
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +189,7 @@ class CoreLinkOptions:
     时实时核连到控制台，许可只来自它。实时核须有输入后端，否则以参数不合法退出。"""
     real_input: bool = False
     """真实输入后端（SendInput）。为真时另加 `--input-backend sendinput` 与 `--emergency-hotkey`，
-    须同时给出 `operator`、不给 `test_device`，否则构造时报错（门禁同实时核）。只在 Windows 上。"""
+    须同时给出操作员或 Bellis 许可源，且不给 `test_device`。只在 Windows 上。"""
     emergency_hotkey: str | None = None
     """急停组合键（如 `ctrl+shift+f12`、`ctrl+alt+end`）；只在 `real_input` 为真时交给实时核。
     缺省由实时核取 Ctrl+Shift+F12。"""
@@ -177,6 +199,7 @@ class CoreLinkOptions:
     restart: RestartPolicy | None = field(default_factory=RestartPolicy)
     """GR-35 自动重启，缺省退避 1、2、4 秒；`None` 时不自动重启（宿主自己 `start`，只用于自己驱动
     重启的测试）。"""
+    bellis: BellisCoreOptions | None = None
 
     def __post_init__(self) -> None:
         timeouts = (
@@ -194,9 +217,16 @@ class CoreLinkOptions:
             raise ValueError("心跳超时须大于心跳周期")
         if self.health_timeout <= self.health_interval:
             raise ValueError("健康超时须大于健康周期")
+        if self.bellis is not None:
+            if self.operator is not None:
+                raise ValueError("操作员许可与 Bellis 许可只能选一个")
+            if not self.real_input and self.test_device is None:
+                raise ValueError("Bellis 控制连接需要明确的输入后端")
+            if self.bellis.test_session_file is not None and self.test_device is None:
+                raise ValueError("Bellis 测试会话文件只与假输入设备一起使用")
         if self.real_input:
-            if self.operator is None:
-                raise ValueError("真实输入后端须与操作员许可连接一起给出")
+            if self.operator is None and self.bellis is None:
+                raise ValueError("真实输入后端须与操作员许可连接或 Bellis 控制连接一起给出")
             if self.test_device is not None:
                 raise ValueError("真实输入后端不能同时给测试设备的凭据")
         elif self.emergency_hotkey is not None:
@@ -219,6 +249,8 @@ class CoreLinkOptions:
                 argv += ["--emergency-hotkey", self.emergency_hotkey]
         elif self.test_device is not None:
             argv += ["--input-backend", "fake"]
+        if self.bellis is not None:
+            argv += ["--bellis-control", self.bellis.runtime_id]
         return argv
 
     def child_env(self) -> dict[str, str]:
@@ -231,6 +263,10 @@ class CoreLinkOptions:
         if self.operator is not None:
             env[ENV_OPERATOR_PATH] = self.operator.path
             env[ENV_OPERATOR_KEY] = self.operator.encoded_key
+        if self.bellis is not None:
+            env["BELLIS_SESSION_ID"] = self.bellis.session_id
+            if self.bellis.test_session_file is not None:
+                env["GAME_RUNTIME_TEST_BELLIS_SESSION_FILE"] = str(self.bellis.test_session_file)
         return env
 
 
@@ -342,6 +378,7 @@ class CoreLink:
         on_residual: Callable[[InputResidualParams], None] | None = None,
         on_restart: Callable[[int], None] | None = None,
         on_verification: Callable[[InputVerificationParams], None] | None = None,
+        action_deadline: Callable[[], int | None] | None = None,
     ) -> None:
         self._options = options
         self._on_released = on_released
@@ -349,6 +386,7 @@ class CoreLink:
         self._on_residual = on_residual
         self._on_restart = on_restart
         self._on_verification = on_verification
+        self._action_deadline = action_deadline
         self._grant_source: Callable[[], ControlGrant | None] | None = None
         self._instance: _Instance | None = None
         self._instances = 0
@@ -698,12 +736,18 @@ class CoreLink:
             self._send_heartbeat(peer, grant)
         self._block_seq += 1
         start_ns = time.perf_counter_ns() + _nanos(start_delay)
+        deadline_ns = start_ns + _nanos(valid_for)
+        if self._action_deadline is not None:
+            inclusive_bound = self._action_deadline()
+            if inclusive_bound is None or inclusive_bound <= start_ns:
+                raise ActionDeadlineError("动作的绝对截止时刻已到")
+            deadline_ns = min(deadline_ns, inclusive_bound)
         block = models.ActionBlock(
             producer=Producer(id=grant.producer, generation=grant.generation),
             seq=self._block_seq,
             base_frame=base_frame,
             start_ns=start_ns,
-            deadline_ns=start_ns + _nanos(valid_for),
+            deadline_ns=deadline_ns,
             steps=list(steps),
         )
         submission = _Submission(block, asyncio.get_running_loop().create_future())

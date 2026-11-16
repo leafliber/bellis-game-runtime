@@ -27,6 +27,12 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 - 控制连接不在时，Bellis 游戏桥插件不申请也不续约 `game.input`。
 - 主进程与实时核都从 SecretStore 读取 Bellis 本次会话的连接信息（Bellis R-23）。
 
+### Bellis 启动入口
+
+`uv run supervise <适配包 id> --profile <文件> --bellis --real-input` 选择 Bellis 许可源。操作员核对适配包前置条件后，以可重复的 `--confirm-precondition <id>` 确认本次运行的对应条目。启动器读取本次宿主会话，并为主进程与实时核生成同一个 `runtimeId`。
+
+普通插件 `game-bridge` 注册语义 RPC 和上报任务。兼容的 `game.describe` 完成之后接受命令。断链时撤掉语义授权并让控制产出者走失效释放，同一宿主会话重连后等待新授权。凭据消失或换代时结束本次运行。
+
 ### 实时核控制连接
 
 - 启动实时核时，主进程以 `--bellis-control <runtimeId>` 选择 Bellis，并设置 `BELLIS_SESSION_ID` 为自己读到的 Bellis 会话号。同一次 Runtime 内的实时核重启继续使用相同的 `runtimeId`，供 Bellis 匹配语义与控制连接。实时核独立读取 Windows 凭据 `session.bellis`，其值是 UTF-16LE 编码的 `SessionInfo`，字段为 `v`、`sessionId`、`channelPath`、`channelKey`、`launcherPid`、`startedAt`。这里的地址与密钥只在凭据管理器交付。操作员许可源和 Bellis 只选一个。[Bellis 会话契约](https://github.com/leafliber/bellis/blob/main/packages/protocol/src/process.ts)
@@ -53,20 +59,28 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 
 | 方向 | 消息 | Game Runtime 的处理 |
 | --- | --- | --- |
-| 下行 | `goal.submit` | planner 据此与剧情状态拆出当前目标（[规划](narrative-planner.md#规划)） |
+| 下行 | `goal.submit` | 按本次会话接纳有绝对截止的目标，语言目标和约束交给 [planner](narrative-planner.md#规划) |
 | 下行 | `decision.resolve` | 在新帧上重新定位并核对实例后执行（[决策点](step-control.md#决策点)） |
 | 下行 | `lease.renew`、`input.stop` | 只走控制连接，由实时核处理 |
 | 下行 | `pacing.hold`、`pacing.release` | 见下文 |
 | 上行 | `situation.observed` | 局面摘要（[规划](narrative-planner.md#规划)），画面类型取自[通用分类](perception.md#画面状态)，带看点标记与配音忙闲 |
 | 上行 | `decision_point.opened` | 选项、是否计时与截止时间，附候选 |
-| 上行 | `action.committed` | 实际发生的动作 |
+| 上行 | `action.committed` | 与动作编号匹配的实时核已执行回执加上新帧效果核验 |
 | 上行 | `input.released` | 只走控制连接 |
-| 上行 | `health.reported` | 首动作时间、帧龄、队列深度、风险分、被拒的动作、模式切换、前置条件确认状态 |
+| 上行 | `health.reported` | 运行模式、目标与决策点、前置条件、首个已核验动作时间、帧龄、队列深度、风险状态与最近拒绝 |
+
+## 目标与执行事实
+
+- 接纳时绑定 `goalId`、认证连接代次、绝对截止和 `traceparent`。同一 `goalId` 只接纳一次。目标题述和约束只作为规划数据。
+- 动作块受当前目标与决策的绝对截止约束。语义目标到期时即失去授权，动作块最多有效到到期前一纳秒。提交时捕获目标编号、动作编号、选项和决定来源。仅在匹配的 `Executed` 回执与新帧效果都核验后，才按捕获的身份上报 `action.committed`。
+- 未知结果暂停输入并保留失败记录。语义重连、实时核重启和租约续约均不能恢复推进。收到新的授权目标后仍保留失败记录，已提交的决策不自动重发。
 
 ## 决策点
 
 - 无计时的选项：Bellis 决定直接自选或开观众投票；Game Runtime 停在该决策点，直到收到 `decision.resolve`。
 - 有计时的选项：Bellis 在截止前自选；到余量线仍未回复，Game Runtime 执行排第一的候选，并上报实际结果（Bellis D-07）。
+- `waiting_vote` 暂存当前自主目标，并绑定当前无计时实例。投票目标只授权该选择。确认选项效果后，先按投票目标上报事实，再恢复仍在原截止内、属于原连接代次的自主目标和规划。过期、暂停、新目标替换、断连或结果不明时保持对应的当前状态。需新授权时由 Bellis 再发 `goal.submit`。
+- 候选更新沿用已打开的实例编号、题目、选项和追踪上下文。倒计时只可收紧，已接纳决定或已关闭的实例不再更新。
 - 坏结局、卡住与重读的上报见[坏结局与重来](narrative-planner.md#坏结局与重来)。
 
 ## 看点与暂缓推进
@@ -76,7 +90,7 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 **看点标记**随 `situation.observed` 上报：
 
 - 类型：章节与审判的开始与结束、新证据、新证词、矛盾或疑点、反转、坏结局、卡住。
-- 每条含类型、一句摘要、重要程度（高、中）与发生时刻；同一件事只标一次；摘要不带原文段落。
+- 每条含类型、一句摘要、重要程度（高、中）与发生时刻。同一件事只报一次，等到局面帧的采集时刻达到看点发生时刻再上报。摘要只含短句。
 - 由快路径、planner 的批量更新（至多滞后一个间隔）或坏结局处理给出（[看点标记](narrative-planner.md#看点标记)）。
 - 标记只是数据，是否解说与频率由 Bellis 决定。
 
@@ -84,14 +98,20 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 
 - Bellis 发 `pacing.hold`（编号、原因、到期时间，到期时间必填）与 `pacing.release`；多个 hold 以最晚到期为准。
 - hold 有效时逐步控制器不执行推进类与导航类动作；选择类动作、计时决策与余量线照常。
-- 本地另有最长暂缓时间（缺省 30 秒，可配置），到上限即恢复并上报，Bellis 故障时不会把游戏卡住。
+- 第一个有效 hold 开始的暂缓窗口最多 30 秒。窗口内的多个 hold 使用较晚的到期时刻并受同一上限约束，收到 release 可提前到期。恢复后仍要核对原授权。
 - hold 走语义连接，只能让动作暂停，不产生输入，不影响输入许可。
 
-**配音忙闲**（忙、闲或未知，[感知](perception.md#配音检测)）随 `situation.observed` 上报，供 Bellis 选择等游戏配音结束再开口。
+**配音忙闲**（忙、闲或未知，[感知](perception.md#配音检测)）随 `situation.observed` 上报。只使用覆盖当前观测帧且仍新鲜的配音判定。
 
 ## 开播前置条件
 
 游戏适配包声明须由操作员确认的前置条件（[动作风险](step-control.md#动作风险)的第四道防线）。Game Runtime 在握手与健康上报中给出条目与是否已确认；Bellis 开播预检要求全部已确认才允许进入 M1–M3（提案 P-08）。
+
+主进程的 `health.reported.ready` 要求逐步控制服务持有内核授予的有效控制产出资格、实时核健康且正在采集、会话前置条件已确认、风险状态可用且未超限。实时核最新采集帧和主进程最近一次有效判别帧各自从采集时刻算起，帧龄都须在 `max_frame_age` 内。服务可在首个输入租约前就绪，启动后须先完成一次有效判别。
+
+画面像素变化后，判别新帧期间仅保留上次有效判别的采集时刻供健康检查。该帧超过帧龄上限时，健康检查返回 false。帧源错误、积压超限、坐标变换或帧格式变化、判别出错、不可判或停用都使该时刻失效。接纳可执行的目标和提交新动作仍需要当前有效且新鲜的已判别帧，并须通过各自的授权检查。
+
+缺少独立的风险状态来源时，`ready` 为 false 并报告 `risk-unsupported`。风险字段仍按 v1 的必填模型编码，风险判定接入取决于技术基线的审批。普通卡住按局面和失败摘要上报。
 
 ## 监督模式
 

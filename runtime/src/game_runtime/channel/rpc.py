@@ -187,11 +187,17 @@ class RpcPeer:
     """
 
     def __init__(
-        self, connection: Connection, *, timeout: float, max_inflight: int = DEFAULT_MAX_INFLIGHT
+        self,
+        connection: Connection,
+        *,
+        timeout: float,
+        max_inflight: int = DEFAULT_MAX_INFLIGHT,
+        json_decoder: Callable[[bytes], object] | None = None,
     ) -> None:
         self.connection = connection
         self._timeout = timeout
         self._max_inflight = max_inflight
+        self._json_decoder = json_decoder
         self._loop = asyncio.get_running_loop()
         self._pending: dict[RpcId, asyncio.Future[object]] = {}
         self._handlers: dict[str, RpcHandler] = {}
@@ -253,7 +259,12 @@ class RpcPeer:
         error: ChannelError | None = None
         try:
             while True:
-                message = await self.connection.receive()
+                decoder = self._json_decoder
+                message = (
+                    await self.connection.receive()
+                    if decoder is None
+                    else await self.connection.receive(json_decoder=decoder)
+                )
                 if isinstance(message, BinaryMessage):
                     continue
                 self._receive(message.value)

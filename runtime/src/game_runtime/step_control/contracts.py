@@ -127,6 +127,7 @@ class Goal:
     generation: int = 0
     max_steps: int | None = None
     completion_by_agent: bool = False
+    constraints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.generation < 0 or (
@@ -224,6 +225,7 @@ class DecisionEvent:
     index: int | None = None
     by: Literal["operator", "default"] | None = None
     executed_at_ns: int | None = None
+    authorized_source: Literal["director", "vote"] | None = None
 
 
 @dataclass(frozen=True, slots=True)

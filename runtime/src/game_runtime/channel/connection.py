@@ -7,7 +7,7 @@
 
 import asyncio
 import secrets
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
 
@@ -159,7 +159,9 @@ class Connection:
         except OSError as error:
             raise ChannelError("closed", f"连接已断开：{error}") from error
 
-    async def receive(self, timeout: float | None = None) -> Message:
+    async def receive(
+        self, timeout: float | None = None, *, json_decoder: Callable[[bytes], object] = loads
+    ) -> Message:
         """下一条消息。
 
         超过 `timeout` 秒没有收到完整的帧时为 `timeout`，连接仍可用；对端关闭时为 `closed`；
@@ -181,7 +183,7 @@ class Connection:
                 raise self._fail(ChannelError("protocol-error", "认证后收到握手帧"))
             case FrameKind.JSON:
                 try:
-                    return JsonMessage(loads(frame.payload))
+                    return JsonMessage(json_decoder(frame.payload))
                 except ChannelError as error:
                     raise self._fail(error) from None
 
