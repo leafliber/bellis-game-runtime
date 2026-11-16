@@ -1,6 +1,7 @@
 """语义桥经真实本机通道、实时核、合成画面和假设备。"""
 
 import asyncio
+import json
 import math
 import os
 import secrets
@@ -60,6 +61,9 @@ from game_runtime.step_control import (
 )
 from game_runtime.step_control.decisions import PendingDecision
 from game_runtime.step_control.plugin import SessionSignals
+from game_runtime.step_control.risk import ActionRefusedError
+from game_runtime.telemetry import RuntimeTelemetry, SpanContext, TelemetrySpan
+from game_runtime.telemetry.exporter import SpanRecord
 from game_runtime.voice_activity import VoiceState, VoiceStatus
 from synthetic_game.anchors import anchor_templates
 from synthetic_game.layout import Layout, Rect
@@ -362,7 +366,9 @@ class Rig:
 
 
 @asynccontextmanager
-async def rig(exe: Path, folder: Path, *, policy: Policy | None = None) -> AsyncGenerator[Rig]:
+async def rig(
+    exe: Path, folder: Path, *, policy: Policy | None = None, telemetry: Path | None = None
+) -> AsyncGenerator[Rig]:
     if sys.platform == "win32":
         folder = Path("\\\\?\\" + str(folder.resolve()))
     source = GAMES_DIR / "synthetic-game" / "adapter.toml"
@@ -381,6 +387,15 @@ async def rig(exe: Path, folder: Path, *, policy: Policy | None = None) -> Async
     peers: asyncio.Queue[Connection] = asyncio.Queue()
     session_id = f"test{secrets.token_hex(4)}"
     planner = RecordingPlanner(PlannerContext(None))
+    extra_entries = [
+        ResolvedEntry("plan", "fixture-planner", {}, False, frozenset()),
+    ]
+    if telemetry is not None:
+        extra_entries.append(
+            ResolvedEntry(
+                "telemetry", "telemetry", {"directory": str(telemetry)}, False, frozenset()
+            )
+        )
     loop = asyncio.get_running_loop()
 
     def input_event(event: DeviceEvent) -> None:
@@ -424,15 +439,7 @@ async def rig(exe: Path, folder: Path, *, policy: Policy | None = None) -> Async
                 admission=AdmissionPolicy(max_rate=20, idle_interval=0.06),
                 ocr_plugin=ocr_for(frames),
                 extra_plugins=(planner_for(lambda: planner),),
-                extra_entries=(
-                    ResolvedEntry(
-                        id="plan",
-                        plugin="fixture-planner",
-                        config={},
-                        disabled=False,
-                        grant=frozenset(),
-                    ),
-                ),
+                extra_entries=extra_entries,
                 bellis=BellisConfig(
                     store, frozenset({"safe"}), info_file, lambda: risk[-1] if risk else None
                 ),
@@ -486,6 +493,191 @@ async def refused(peer: RpcPeer, method: str, fields: dict[str, object]) -> None
     assert rejected.value.code == RpcErrorCode.INVALID_PARAMS
 
 
+class _AtTime(MonotonicClock):
+    def __init__(self, instant: int) -> None:
+        self.instant = instant
+
+    def now_ns(self) -> int:
+        return self.instant
+
+
+@pytest.mark.parametrize("fault", ["goal-expired", "resolve-expired", "detach"])
+def test_commands_recheck_after_synchronous_tracer(
+    semantic_core: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    async def run() -> None:
+        async with rig(semantic_core, tmp_path, telemetry=tmp_path / "otel") as r:
+            r.risk.append(RiskReading(0.23, False))
+            main, core, events = await r.connect(first=True)
+            assert core is not None
+            lease = asyncio.create_task(renew(core, 1))
+            original = RuntimeTelemetry.command_received
+            try:
+                await ready(r, events)
+                controller = r.run.controller
+                assert controller is not None
+                method = "goal.submit"
+                payload: dict[str, object] = goal("late", 4_000)
+                instant = ns(cast(int, payload["expiresAtMs"]))
+                if fault == "resolve-expired":
+                    r.frames.scene, r.frames.timer_end = "timed", time.perf_counter() + 3.6
+                    assert (
+                        await main.request(
+                            "pacing.hold",
+                            {
+                                "holdId": "waiting",
+                                "reason": "合成解说",
+                                "expiresAtMs": now_ms() + 8_000,
+                                "traceparent": _TRACE,
+                            },
+                        )
+                        == {}
+                    )
+                    assert await main.request("goal.submit", goal("timed", 8_000)) == {}
+                    point = await until(lambda: events.points[0] if events.points else None)
+                    assert point.timing is not None
+                    instant = ns(point.timing.resolveByMs + 15)
+                    method = "decision.resolve"
+                    payload = {
+                        "decisionPointId": point.decisionPointId,
+                        "optionId": "option-0",
+                        "source": "director",
+                        "traceparent": _DECISION_TRACE,
+                    }
+                    await asyncio.sleep(max(0, point.timing.resolveByMs - now_ms() - 180) / 1000)
+                    assert controller.decision_available(point.decisionPointId)
+
+                def trace(
+                    service: RuntimeTelemetry, context: SpanContext, command: str
+                ) -> TelemetrySpan | None:
+                    span = original(service, context, command)
+                    if command == method:
+                        if fault == "detach":
+                            r.session.detach()
+                        elif method == "decision.resolve":
+                            controller.clock = _AtTime(instant)
+                        else:
+                            r.session.clock = _AtTime(instant)
+                    return span
+
+                monkeypatch.setattr(RuntimeTelemetry, "command_received", trace)
+                await refused(main, method, payload)
+                if method == "goal.submit":
+                    assert r.session.planning_goal is None
+                    assert r.frames.down == []
+                else:
+                    assert r.session.planning_goal is not None
+                    assert all(
+                        fact.selection is not None and fact.selection.source == "default"
+                        for fact in events.actions
+                    )
+            finally:
+                lease.cancel()
+                await asyncio.gather(lease, return_exceptions=True)
+                await main.close()
+                await core.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "fault", ["deadline", "press-budget", "detach", "tracer-error", "locator-error"]
+)
+def test_step_tracer_and_location_keep_real_submission_guards(
+    semantic_core: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    directory = tmp_path / "otel"
+    locate_elapsed: list[int] = []
+
+    async def run() -> None:
+        async with rig(semantic_core, tmp_path, telemetry=directory) as r:
+            r.risk.append(RiskReading(0.23, False))
+            main, core, events = await r.connect(first=True)
+            assert core is not None
+            lease = asyncio.create_task(renew(core, 1))
+            try:
+                await ready(r, events)
+                controller = r.run.controller
+                assert controller is not None
+                payload = goal("instrumented", 360 if fault == "press-budget" else 4_000)
+                instant = ns(cast(int, payload["expiresAtMs"]))
+                touched = asyncio.Event()
+                original = TelemetrySpan.event
+
+                def event(
+                    span: TelemetrySpan, stage: str, *, at_monotonic_ns: int | None = None
+                ) -> None:
+                    original(span, stage, at_monotonic_ns=at_monotonic_ns)
+                    if stage == "located" and not touched.is_set():
+                        touched.set()
+                        if fault == "detach":
+                            r.session.detach()
+                        elif fault == "deadline":
+                            r.session.clock = _AtTime(instant)
+                            controller.clock = _AtTime(instant)
+                        elif fault == "press-budget":
+                            r.session.clock = _AtTime(instant - 50_000)
+                            controller.clock = r.session.clock
+                        elif fault == "tracer-error":
+                            raise ValueError("合成遥测异常")
+
+                async def fail_location(_frame: SceneUpdate, _proposal: StepProposal) -> None:
+                    started = time.perf_counter_ns()
+                    await asyncio.sleep(0.035)
+                    locate_elapsed.append(time.perf_counter_ns() - started)
+                    touched.set()
+                    raise ActionRefusedError("synthetic-location-refusal")
+
+                monkeypatch.setattr(TelemetrySpan, "event", event)
+                if fault == "locator-error":
+                    monkeypatch.setattr(controller, "_locate", fail_location)
+                assert await main.request("goal.submit", payload) == {}
+                await asyncio.wait_for(touched.wait(), WAIT)
+                if fault == "tracer-error":
+                    fact = await until(lambda: events.actions[0] if events.actions else None)
+                    assert fact.category == "navigate"
+                    assert fact.traceparent not in {None, _TRACE}
+                    assert r.frames.down == ["menu"]
+                else:
+                    await until(
+                        lambda: any(
+                            result.status is StepStatus.REJECTED for result in controller.recent
+                        )
+                    )
+                    if fault == "press-budget":
+                        assert any(
+                            result.detail == "action-window-expired" for result in controller.recent
+                        )
+                    assert r.frames.down == []
+                    assert not events.actions
+            finally:
+                lease.cancel()
+                await asyncio.gather(lease, return_exceptions=True)
+                await main.close()
+                await core.close()
+
+    asyncio.run(run())
+    steps: list[SpanRecord] = []
+    for path in directory.glob("*.jsonl"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            request = json.loads(line)
+            spans = cast(list[SpanRecord], request["resourceSpans"][0]["scopeSpans"][0]["spans"])
+            steps.extend(span for span in spans if span["name"] == "game.step")
+    assert steps
+    if fault == "locator-error":
+        assert locate_elapsed
+        assert any(
+            int(span["endTimeUnixNano"]) - int(span["startTimeUnixNano"]) >= min(locate_elapsed)
+            for span in steps
+        )
+        assert all("events" not in span for span in steps)
+    elif fault != "tracer-error":
+        assert all(
+            [event["name"] for event in span.get("events", [])] == ["game.step.located"]
+            for span in steps
+        )
+
+
 def delay_decision_effect_frames(
     r: Rig, monkeypatch: pytest.MonkeyPatch, *, resume_frames: asyncio.Event | None = None
 ) -> asyncio.Future[int]:
@@ -507,13 +699,15 @@ def delay_decision_effect_frames(
         executed_ns: int,
         decision: PendingDecision | None,
         revision: int,
+        *,
+        until: int,
     ) -> StepStatus:
         if decision is not None and not started.done():
             # begin_frame 使旧画面失效后，新的签名判别可能仍在处理。
             scene.invalidate()
             assert not r.session.ready()
             started.set_result(controller.clock.now_ns())
-        return await verify(before, expected, executed_ns, decision, revision)
+        return await verify(before, expected, executed_ns, decision, revision, until=until)
 
     if resume_frames is not None:
         monkeypatch.setattr(scene, "publish", publish_unless_waiting)

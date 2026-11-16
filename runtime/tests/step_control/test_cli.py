@@ -1,6 +1,7 @@
 """模型游玩只从操作员指定的 profile 组装。"""
 
 import asyncio
+import json
 import sys
 from collections.abc import Sequence
 from dataclasses import replace
@@ -90,3 +91,62 @@ def test_profile_cannot_change_the_selected_game(tmp_path: Path) -> None:
                 pytest.fail("不一致的适配包通过了启动校验")
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_supervise_cli_explicit_telemetry_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: bool
+) -> None:
+    profile = tmp_path / "profile.json"
+    entries: list[dict[str, object]] = []
+    if configured:
+        entries.append(
+            {
+                "id": "local-traces",
+                "plugin": "telemetry",
+                "disabled": True,
+                "config": {"directory": str(tmp_path / "old"), "max_queue": 12},
+            }
+        )
+    profile.write_text(
+        json.dumps({"name": "test", "packs": [{"name": "test", "entries": entries}]}),
+        encoding="utf-8",
+    )
+    directory = tmp_path / "traces"
+
+    async def launched(
+        game: str,
+        entries: Sequence[ResolvedEntry],
+        core: Path,
+        data_dir: Path,
+        store: SecretStore,
+        *,
+        real_input: bool,
+    ) -> int:
+        (entry,) = entries
+        assert entry.id == ("local-traces" if configured else "telemetry")
+        assert entry.plugin == "telemetry"
+        assert not entry.disabled
+        assert not entry.grant
+        assert entry.config["directory"] == str(directory)
+        assert entry.config.get("max_queue") == (12 if configured else None)
+        return 0
+
+    monkeypatch.setattr(cli, "CredentialManagerStore", MemorySecretStore)
+    monkeypatch.setattr(cli, "_run", launched)
+    assert (
+        cli.main(
+            [
+                "synthetic-game",
+                "--profile",
+                str(profile),
+                "--core",
+                str(tmp_path / "core"),
+                "--data-dir",
+                str(tmp_path),
+                "--telemetry-dir",
+                str(directory),
+            ]
+        )
+        == 0
+    )

@@ -3,7 +3,8 @@
 import logging
 import re
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -17,6 +18,13 @@ from game_runtime.operator import Clock, SessionState, messages
 from game_runtime.secret_store import SecretStore, SecretStoreError, SessionInfo
 from game_runtime.step_control.contracts import Category, Goal, StepStatus
 from game_runtime.step_control.supervision import ActionOutcome, SemanticPauseError, SubmittedChoice
+from game_runtime.telemetry import RuntimeTelemetry, SpanContext
+from game_runtime.telemetry.consumer import (
+    StepTrace,
+    recorded_traceparent,
+    try_telemetry,
+    valid_traceparent,
+)
 
 if TYPE_CHECKING:
     from game_runtime.game_bridge.projection import Projection
@@ -74,6 +82,7 @@ class _Goal:
 @dataclass(slots=True)
 class _Decision:
     opened: messages.DecisionOpened
+    connection: int
     traceparent: str | None
     latest: v1.GameDecisionPointOpened | None = None
     resolved: bool = False
@@ -129,6 +138,7 @@ class BellisSession:
             }
         )
         self.project: Projection | None = None
+        self.telemetry: Callable[[], RuntimeTelemetry | None] | None = None
         self.peer: RpcPeer | None = None
         self.described_ns: int | None = None
         self._connection = 0
@@ -339,9 +349,80 @@ class BellisSession:
         if not self.live:
             raise _refuse("语义握手尚未完成")
 
+    def _telemetry(self) -> RuntimeTelemetry | None:
+        return None if self.telemetry is None else try_telemetry(self.telemetry)
+
+    @contextmanager
+    def _received(self, context: SpanContext, method: str) -> Generator[str | None]:
+        traced = self.telemetry is not None
+        plan_generation = self._plan_generation
+        telemetry = self._telemetry()
+        span = (
+            None
+            if telemetry is None
+            else try_telemetry(lambda: telemetry.command_received(context, method))
+        )
+        traceparent = (
+            None
+            if span is None or telemetry is None
+            else recorded_traceparent(span, telemetry, context.traceparent, self._telemetry)
+        )
+        outcome = "unknown"
+        try:
+            if (
+                self._connection != context.connection_generation
+                or self._plan_generation != plan_generation
+                or (traced and not self.same_session())
+            ):
+                raise _refuse("Bellis 会话已失效")
+            self._require_live()
+            yield traceparent or valid_traceparent(context.traceparent)
+        except RpcError:
+            outcome = "rejected"
+            raise
+        else:
+            outcome = "accepted"
+        finally:
+            if span is not None:
+                try_telemetry(lambda: span.end(outcome))
+
+    def _invalidate_trace(
+        self, connection: int, *, goal_id: str | None = None, decision_id: str | None = None
+    ) -> None:
+        telemetry = self._telemetry()
+        if telemetry is not None:
+            try_telemetry(
+                lambda: telemetry.invalidate(connection, goal_id=goal_id, decision_id=decision_id)
+            )
+
+    def step_context(
+        self, decision_id: str | None, resolve_parent: str | None
+    ) -> SpanContext | None:
+        goal = self._authorization
+        if goal is None or goal.connection != self._connection:
+            return None
+        parent = valid_traceparent(goal.traceparent)
+        if decision_id is not None:
+            point = self._point
+            if (
+                point is None
+                or point.opened.id != decision_id
+                or point.connection != goal.connection
+            ):
+                return None
+            parent = (
+                valid_traceparent(resolve_parent) or valid_traceparent(point.traceparent) or parent
+            )
+        return SpanContext(goal.connection, parent, goal_id=goal.id, decision_id=decision_id)
+
     def _submit_goal(self, value: object) -> v1.GameAck:
         request = params(v1.GameGoalSubmitParams, value)
         self._require_live()
+        context = SpanContext(self._connection, request.traceparent, goal_id=request.goalId)
+        with self._received(context, "goal.submit") as parent:
+            return self._accept_goal(request, parent)
+
+    def _accept_goal(self, request: v1.GameGoalSubmitParams, parent: str | None) -> v1.GameAck:
         now = self.clock.now_ns()
         expires = ns(request.expiresAtMs)
         if expires <= now or request.goalId in self._goals_seen or not request.objective.strip():
@@ -372,13 +453,14 @@ class BellisSession:
         elif request.decisionPointId is not None:
             raise _refuse("只有等待投票的目标可绑定决策点")
 
+        previous = self._authorization
         self._authorization = _Goal(
             request.goalId,
             self._connection,
             request.mode,
             expires,
             now,
-            request.traceparent,
+            parent,
             request.decisionPointId,
         )
         self._goals_seen.add(request.goalId)
@@ -394,11 +476,22 @@ class BellisSession:
                     request.objective, deadline_ns=expires, constraints=tuple(request.constraints)
                 )
         self._announce()
+        if previous is not None:
+            self._invalidate_trace(previous.connection, goal_id=previous.id)
         return v1.GameAck()
 
     def _resolve(self, value: object) -> v1.GameAck:
         request = params(v1.GameDecisionResolveParams, value)
         self._require_live()
+        context = SpanContext(
+            self._connection, request.traceparent, decision_id=request.decisionPointId
+        )
+        with self._received(context, "decision.resolve") as parent:
+            return self._accept_choice(request, parent)
+
+    def _accept_choice(
+        self, request: v1.GameDecisionResolveParams, parent: str | None
+    ) -> v1.GameAck:
         point = self._point
         controller = self.signals.controller
         if (
@@ -422,7 +515,7 @@ class BellisSession:
         if index is None or not controller.on_resolved(
             messages.DecisionResolved(id=request.decisionPointId, index=index),
             source=request.source,
-            traceparent=request.traceparent,
+            traceparent=parent,
         ):
             raise _refuse("选项或决策余量线已经失效")
         point.resolved = True
@@ -495,6 +588,7 @@ class BellisSession:
         self._before_vote = None
         self._plan_goal = None
         self._announce()
+        self._invalidate_trace(self._connection)
 
     def _announce(self) -> None:
         self.signals.session(self.session)
@@ -520,8 +614,41 @@ class BellisSession:
         return True
 
     def open_decision(self, decision: messages.DecisionOpened) -> None:
-        self._point = _Decision(decision, self.traceparent)
-        self.publish_point()
+        previous = self._point
+        goal = self._authorization
+        connection, plan_generation = self._connection, self._plan_generation
+        first = (
+            previous is None
+            or previous.opened.id != decision.id
+            or previous.connection != connection
+        )
+        parent = valid_traceparent(
+            self.traceparent if first or previous is None else previous.traceparent
+        )
+        point = _Decision(decision, connection, parent)
+        self._point = point
+        if first and previous is not None:
+            self._invalidate_trace(previous.connection, decision_id=previous.opened.id)
+        if first and (telemetry := self._telemetry()) is not None:
+            context = SpanContext(
+                connection,
+                parent,
+                goal_id=goal.id if goal is not None and goal.connection == connection else None,
+                decision_id=decision.id,
+            )
+            timing = "untimed" if decision.deadline_ns is None else "timed"
+            span = try_telemetry(lambda: telemetry.decision_opened(context, timing))
+            if span is not None:
+                point.traceparent = (
+                    recorded_traceparent(span, telemetry, parent, self._telemetry) or parent
+                )
+                try_telemetry(lambda: span.end("opened"))
+        if (
+            self._point is point
+            and connection == self._connection
+            and plan_generation == self._plan_generation
+        ):
+            self.publish_point()
 
     def update_decision(self, update: messages.DecisionUpdated) -> None:
         point = self._point
@@ -582,7 +709,7 @@ class BellisSession:
             ],
             candidates=candidates,
             timing=timing,
-            traceparent=point.traceparent,
+            traceparent=point.traceparent if point.connection == self._connection else None,
         )
         latest = point.latest
         if latest is not None and message.model_copy(update={"atMs": latest.atMs}) == latest:
@@ -591,8 +718,10 @@ class BellisSession:
             point.latest = message
 
     def close_decision(self, closed: messages.DecisionClosed) -> None:
-        if self._point is not None and self._point.opened.id == closed.id:
+        point = self._point
+        if point is not None and point.opened.id == closed.id:
             self._point = None
+            self._invalidate_trace(point.connection, decision_id=closed.id)
         goal = self._authorization
         if goal is None or goal.mode != "waiting_vote" or goal.decision_id != closed.id:
             return
@@ -600,6 +729,7 @@ class BellisSession:
         if closed.by in ("operator", "default") and prior is not None and self._active(prior[0]):
             self._authorization, self._first_action_ms = prior
             self._announce()
+            self._invalidate_trace(goal.connection, goal_id=goal.id)
         elif closed.by != "unknown":
             self.suspend()
 
@@ -613,6 +743,8 @@ class BellisSession:
         summary: str,
         deadline_ns: int,
         choice: SubmittedChoice | None,
+        *,
+        step_trace: StepTrace | None = None,
     ) -> ActionOutcome:
         goal = self._authorization
         if goal is None or not self._active(goal) or not self.ready():
@@ -624,7 +756,8 @@ class BellisSession:
             raise SemanticPauseError("decision-without-authority")
         point = self._point
         selection = None
-        trace = goal.traceparent
+        parent = valid_traceparent(goal.traceparent)
+        trace_context = self.step_context(None, None)
         if choice is not None:
             if point is None or choice.decision_id != point.opened.id:
                 raise SemanticPauseError("decision-unavailable")
@@ -637,12 +770,22 @@ class BellisSession:
                 optionId=_option_id(choice.index),
                 source=choice.source,
             )
-            trace = choice.traceparent or trace
+            trace_context = self.step_context(choice.decision_id, choice.traceparent)
+            if trace_context is not None:
+                parent = trace_context.traceparent
             point.resolved = True
         self._inflight += 1
         # _active 已核对 now < expires_ns。语义授权的排他截止转换为核动作块的包容截止；
         # 更早的决策期限或动作块上限仍是原值。
         self._deadline_ns = min(deadline_ns, goal.expires_ns - 1)
+
+        def traceparent() -> str | None:
+            child = (
+                None
+                if step_trace is None
+                else step_trace.for_context(trace_context, self._telemetry)
+            )
+            return child or parent
 
         def finished(status: StepStatus, detail: str, executed_ns: int | None) -> None:
             self._inflight -= 1
@@ -652,6 +795,7 @@ class BellisSession:
                     self._first_action_ms = min(
                         2**32 - 1, ms(max(0, executed_ns - goal.accepted_ns))
                     )
+                trace = traceparent() if self._connection == goal.connection else None
                 if self._connection == goal.connection:
                     self.notify(
                         "action.committed",
@@ -669,7 +813,7 @@ class BellisSession:
                     )
             elif status in {StepStatus.UNKNOWN, StepStatus.NO_EFFECT, StepStatus.REJECTED}:
                 failure = FailedAction(
-                    action_id, goal.id, choice, status, detail, self.clock.now_ns(), trace
+                    action_id, goal.id, choice, status, detail, self.clock.now_ns(), traceparent()
                 )
                 self.failures.append(failure)
                 if status is StepStatus.UNKNOWN or (

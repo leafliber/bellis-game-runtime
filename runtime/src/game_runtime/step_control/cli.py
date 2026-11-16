@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -18,6 +19,22 @@ from game_runtime.operator import OperatorError
 from game_runtime.recording.cli import build_realtime_core, data_dir_option, setup_output
 from game_runtime.secret_store import CredentialManagerStore, SecretStore, SecretStoreError
 from game_runtime.step_control.host import supervise
+from game_runtime.telemetry import TelemetryConfig, TelemetryPlugin
+
+
+def _set_telemetry_directory(entries: list[ResolvedEntry], directory: Path) -> None:
+    plugin = TelemetryPlugin.manifest.id
+    configured = [index for index, entry in enumerate(entries) if entry.plugin == plugin]
+    candidates = [index for index in configured if not entries[index].disabled] or configured
+    if len(candidates) > 1:
+        raise ValueError("--telemetry-dir 须对应一个 telemetry 条目")
+    path = str(TelemetryConfig(directory=directory).directory)
+    if candidates:
+        (index,) = candidates
+        entry = entries[index]
+        entries[index] = replace(entry, config={**entry.config, "directory": path}, disabled=False)
+    else:
+        entries.append(ResolvedEntry(plugin, plugin, {"directory": path}, False, frozenset()))
 
 
 async def _run(
@@ -69,6 +86,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--core", type=Path, help="an already built realtime-core executable")
     parser.add_argument("--data-dir", type=Path, help="local data directory (absolute)")
+    parser.add_argument("--telemetry-dir", type=Path, help="local telemetry directory (absolute)")
     parser.add_argument("--real-input", action="store_true", help="enable supervised Windows input")
     parser.add_argument("--bellis", action="store_true", help="connect to the active Bellis host")
     parser.add_argument(
@@ -89,6 +107,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile = resolve_profile(
             read_profile(args.profile), [read_patch(path) for path in args.patch]
         )
+        if args.telemetry_dir is not None:
+            _set_telemetry_directory(profile, args.telemetry_dir)
         data_dir = data_dir_option(args.data_dir)
         store = CredentialManagerStore()
         core = args.core or build_realtime_core()

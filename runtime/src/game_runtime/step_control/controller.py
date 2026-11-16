@@ -3,9 +3,10 @@
 import asyncio
 import logging
 from collections import Counter, deque
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, suppress
 from dataclasses import replace
+from time import perf_counter_ns
 from typing import Annotated, Literal
 from uuid import uuid4
 
@@ -77,6 +78,8 @@ from game_runtime.step_control.supervision import (
     SessionProgress,
     SubmittedChoice,
 )
+from game_runtime.telemetry import RuntimeTelemetry, SpanContext
+from game_runtime.telemetry.consumer import StepTrace, try_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +124,7 @@ class StepController:
         reading: ReadingPacing,
         *,
         semantic: SemanticPlay | None = None,
+        telemetry: Callable[[], RuntimeTelemetry | None] | None = None,
     ) -> None:
         self.adapter = adapter
         self.scene = scene
@@ -128,6 +132,7 @@ class StepController:
         self.grant = grant
         self.operator = operator
         self._semantic = semantic
+        self._telemetry = telemetry
         self.policy = policy
         self.clock = clock
         self.config = config
@@ -534,39 +539,80 @@ class StepController:
             raise ReadingWaitError("dialogue-text-changed")
         return record
 
+    def _trace_context(
+        self, decision_id: str | None, resolve_parent: str | None
+    ) -> SpanContext | None:
+        if self._semantic is not None:
+            return self._semantic.step_context(decision_id, resolve_parent)
+        return SpanContext(
+            self.grant.generation,
+            goal_id=f"goal-{self._operator_goal.revision}",
+            decision_id=decision_id,
+        )
+
+    @contextmanager
+    def _trace_step(
+        self, category: Category, decision_id: str | None = None, resolve_parent: str | None = None
+    ) -> Generator[StepTrace | None]:
+        trace = None
+        if self._telemetry is not None:
+            context = self._trace_context(decision_id, resolve_parent)
+            telemetry = try_telemetry(self._telemetry)
+            if telemetry is not None and context is not None:
+                span = try_telemetry(lambda: telemetry.step(context, category))
+                if span is not None:
+                    trace = StepTrace(context, telemetry, span)
+        outcome = "cancelled"
+        try:
+            yield trace
+        except (ReadingWaitError, SemanticPauseError):
+            raise
+        except Exception:
+            outcome = "rejected"
+            raise
+        finally:
+            if trace is not None:
+                trace.end(outcome)
+
     async def _advance_dialogue(
         self, update: SceneUpdate, box: DialogueBox, initial: NarrativeRecord, revision: int
     ) -> None:
         if (initial.session, initial.occurrence) == self._progress.fast_dialogue_line:
             raise ReadingWaitError("dialogue-awaiting-next-line")
-        read = await self._dialogue_read(update, box)
-        here = self.scene.with_ocr(update, (read,))
-        if here is None:
-            raise ActionRefusedError("scene-changed")
-        record = self._dialogue_ready(here, box, read)
-        if line_revision(initial) != line_revision(record):
-            raise ReadingWaitError("dialogue-text-changed")
-        lines = here.screen_state.text_targets
-        counts = Counter(text_key(line.text) for line in lines)
-        line = next(
-            (line for line in lines if line.text.strip() and counts[text_key(line.text)] == 1), None
-        )
-        if line is None:
-            raise ReadingWaitError("dialogue-target-ambiguous")
-        proposal = StepProposal(
-            Category.ADVANCE,
-            Click(TextTarget(text=line.text, roi=box.text)),
-            ExpectedEffect(EffectKind.TEXT_DISAPPEARED, text=line.text, roi=box.text),
-        )
-        rect = line.box
-        found = Located(
-            ((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2), line, (read,)
-        )
-        speaker = "" if record.speaker is None else f"{record.speaker}："
-        observation = ScreenObservation(screen_type=ScreenType.DIALOGUE, confidence=1.0)
-        if not self._accept_observation(here, observation, f"{speaker}{record.text}"[:600]):
-            raise ActionRefusedError("scene-changed")
-        await self._issue_with_retry(here, proposal, found, revision, fast_dialogue=record)
+        with self._trace_step(Category.ADVANCE) as trace:
+            read = await self._dialogue_read(update, box)
+            here = self.scene.with_ocr(update, (read,))
+            if here is None:
+                raise ActionRefusedError("scene-changed")
+            record = self._dialogue_ready(here, box, read)
+            if line_revision(initial) != line_revision(record):
+                raise ReadingWaitError("dialogue-text-changed")
+            lines = here.screen_state.text_targets
+            counts = Counter(text_key(line.text) for line in lines)
+            line = next(
+                (line for line in lines if line.text.strip() and counts[text_key(line.text)] == 1),
+                None,
+            )
+            if line is None:
+                raise ReadingWaitError("dialogue-target-ambiguous")
+            proposal = StepProposal(
+                Category.ADVANCE,
+                Click(TextTarget(text=line.text, roi=box.text)),
+                ExpectedEffect(EffectKind.TEXT_DISAPPEARED, text=line.text, roi=box.text),
+            )
+            rect = line.box
+            found = Located(
+                ((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2), line, (read,)
+            )
+            speaker = "" if record.speaker is None else f"{record.speaker}："
+            observation = ScreenObservation(screen_type=ScreenType.DIALOGUE, confidence=1.0)
+            if not self._accept_observation(here, observation, f"{speaker}{record.text}"[:600]):
+                raise ActionRefusedError("scene-changed")
+            if trace is not None:
+                trace.event("located")
+            await self._issue_with_retry(
+                here, proposal, found, revision, fast_dialogue=record, trace=trace
+            )
 
     def _restart_permitted(self, update: SceneUpdate) -> bool:
         ending = self._progress.ending
@@ -597,8 +643,11 @@ class StepController:
             Click(TextTarget(text=target.text, roi=target.roi)),
             ExpectedEffect(EffectKind.SIGNATURE, signature=target.success_signature),
         )
-        found = await self._locate(update, proposal)
-        await self._issue(update, proposal, found, revision, restart=True)
+        with self._trace_step(proposal.category) as trace:
+            found = await self._locate(update, proposal)
+            if trace is not None:
+                trace.event("located")
+            await self._issue(update, proposal, found, revision, restart=True, trace=trace)
 
     async def _tick(self, revision: int) -> None:
         self._sync_planner()
@@ -882,29 +931,36 @@ class StepController:
 
     async def _ordinary(self, update: SceneUpdate, proposal: StepProposal, revision: int) -> None:
         try:
-            found = await self._locate(update, proposal)
-            here = self._current(update, found, revision)
-            if assess(self.adapter, here, proposal, found):
-                self._plan.clear()
-                if requires_choice(here) and found.phrase_identity is None:
-                    await self._open_from_scene(here, revision)
-                elif found.line is not None and found.reads and here.state.screen is not None:
-                    await self._open(
-                        here,
-                        DecisionEvidence(
-                            here.state.screen,
-                            found.line.text,
-                            (found.line,),
-                            None,
-                            proposal,
-                            phrase_identity=found.phrase_identity,
-                        ),
-                        revision,
-                    )
-                else:
-                    raise ActionRefusedError("decision-evidence-missing")
-                return
-            status = await self._issue_with_retry(here, proposal, found, revision)
+            with self._trace_step(proposal.category) as trace:
+                found = await self._locate(update, proposal)
+                if trace is not None:
+                    trace.event("located")
+                here = self._current(update, found, revision)
+                if assess(self.adapter, here, proposal, found):
+                    self._plan.clear()
+                    if requires_choice(here) and found.phrase_identity is None:
+                        if trace is not None:
+                            trace.end("cancelled")
+                        await self._open_from_scene(here, revision)
+                    elif found.line is not None and found.reads and here.state.screen is not None:
+                        if trace is not None:
+                            trace.end("cancelled")
+                        await self._open(
+                            here,
+                            DecisionEvidence(
+                                here.state.screen,
+                                found.line.text,
+                                (found.line,),
+                                None,
+                                proposal,
+                                phrase_identity=found.phrase_identity,
+                            ),
+                            revision,
+                        )
+                    else:
+                        raise ActionRefusedError("decision-evidence-missing")
+                    return
+                status = await self._issue_with_retry(here, proposal, found, revision, trace=trace)
             if status is not StepStatus.VERIFIED or proposal.expected.kind in {
                 EffectKind.CHANGED,
                 EffectKind.UNCHANGED,
@@ -925,20 +981,31 @@ class StepController:
         revision: int,
         *,
         fast_dialogue: NarrativeRecord | None = None,
+        trace: StepTrace | None = None,
     ) -> StepStatus:
-        status = await self._issue(here, proposal, found, revision, fast_dialogue=fast_dialogue)
+        status = await self._issue(
+            here, proposal, found, revision, fast_dialogue=fast_dialogue, trace=trace
+        )
         if status is not StepStatus.NO_EFFECT or found.line is None:
             return status
         fresh = await self._retry_frame(here, revision)
         if fresh is None:
             return status
-        retry = await self._locate(fresh, proposal)
-        retry_frame = self._current(fresh, retry, revision)
-        if assess(self.adapter, retry_frame, proposal, retry):
-            return status
-        return await self._issue(
-            retry_frame, proposal, retry, revision, fast_dialogue=fast_dialogue
-        )
+        with self._trace_step(proposal.category) as retry_trace:
+            retry = await self._locate(fresh, proposal)
+            if retry_trace is not None:
+                retry_trace.event("located")
+            retry_frame = self._current(fresh, retry, revision)
+            if assess(self.adapter, retry_frame, proposal, retry):
+                return status
+            return await self._issue(
+                retry_frame,
+                proposal,
+                retry,
+                revision,
+                fast_dialogue=fast_dialogue,
+                trace=retry_trace,
+            )
 
     def _require_authority(self, revision: int, *, decision: PendingDecision | None = None) -> None:
         if revision != self._revision or not self._allowed():
@@ -1247,45 +1314,59 @@ class StepController:
             if update.frame.frame_number <= pending.opened_frame or self._waiting_time():
                 return
             index, by = choice
-            if pending.evidence.proposed is None:
-                here, evidence, reads = await self._scene_evidence(update)
-                if evidence.identity != pending.evidence.identity:
-                    raise ActionRefusedError("decision-instance-changed")
-                old_deadline = pending.deadline_ns
-                pending.refresh_deadline(evidence.deadline_ns)
-                self._publish_decision_update(pending, here, old_deadline)
-                refreshed = pending.choose(self.clock.now_ns(), margin)
-                if refreshed is None:
-                    raise ActionRefusedError("decision-no-verified-candidate")
-                index, by = refreshed
-                line = evidence.lines[index]
-                box = line.box
-                found = Located(
-                    ((box.left + box.right) // 2, (box.top + box.bottom) // 2), line, reads
+            initial_parent = pending.selected_traceparent if by == "operator" else None
+            with self._trace_step(Category.SELECT, pending.id, initial_parent) as trace:
+                if pending.evidence.proposed is None:
+                    here, evidence, reads = await self._scene_evidence(update)
+                    if evidence.identity != pending.evidence.identity:
+                        raise ActionRefusedError("decision-instance-changed")
+                    old_deadline = pending.deadline_ns
+                    pending.refresh_deadline(evidence.deadline_ns)
+                    self._publish_decision_update(pending, here, old_deadline)
+                    refreshed = pending.choose(self.clock.now_ns(), margin)
+                    if refreshed is None:
+                        raise ActionRefusedError("decision-no-verified-candidate")
+                    index, by = refreshed
+                    line = evidence.lines[index]
+                    box = line.box
+                    found = Located(
+                        ((box.left + box.right) // 2, (box.top + box.bottom) // 2), line, reads
+                    )
+                    proposal = StepProposal(
+                        Category.SELECT,
+                        Click(
+                            TextTarget(
+                                text=line.text, roi=self.adapter.decisions[evidence.screen].options
+                            )
+                        ),
+                        ExpectedEffect(EffectKind.CHANGED),
+                    )
+                else:
+                    proposal = pending.evidence.proposed
+                    found = await self._locate(update, proposal, decision=pending)
+                    here = update
+                source = pending.selected_source if by == "operator" else "default"
+                choice_at_submission = SubmittedChoice(
+                    pending.id,
+                    index,
+                    source,
+                    pending.selected_traceparent if by == "operator" else None,
                 )
-                proposal = StepProposal(
-                    Category.SELECT,
-                    Click(
-                        TextTarget(
-                            text=line.text, roi=self.adapter.decisions[evidence.screen].options
-                        )
-                    ),
-                    ExpectedEffect(EffectKind.CHANGED),
+                if trace is not None and choice_at_submission.traceparent != initial_parent:
+                    trace.reparent(
+                        self._trace_context(pending.id, choice_at_submission.traceparent)
+                    )
+                if trace is not None:
+                    trace.event("located")
+                status = await self._issue(
+                    here,
+                    proposal,
+                    found,
+                    revision,
+                    decision=pending,
+                    choice=choice_at_submission,
+                    trace=trace,
                 )
-            else:
-                proposal = pending.evidence.proposed
-                found = await self._locate(update, proposal, decision=pending)
-                here = update
-            source = pending.selected_source if by == "operator" else "default"
-            choice_at_submission = SubmittedChoice(
-                pending.id,
-                index,
-                source,
-                pending.selected_traceparent if by == "operator" else None,
-            )
-            status = await self._issue(
-                here, proposal, found, revision, decision=pending, choice=choice_at_submission
-            )
             if status is StepStatus.VERIFIED:
                 self._close_decision(by, index)
             elif status is StepStatus.REJECTED:
@@ -1370,6 +1451,7 @@ class StepController:
         choice: SubmittedChoice | None = None,
         restart: bool = False,
         fast_dialogue: NarrativeRecord | None = None,
+        trace: StepTrace | None = None,
     ) -> StepStatus:
         auto_choice = decision is not None and decision.evidence.proposed is None
         if (
@@ -1423,7 +1505,12 @@ class StepController:
         outcome = None
         if self._semantic is not None:
             outcome = self._semantic.action_started(
-                f"{self._decision_prefix}-{action_id}", category, action.root.type, end, choice
+                f"{self._decision_prefix}-{action_id}",
+                category,
+                action.root.type,
+                end,
+                choice,
+                step_trace=trace,
             )
         self._last_action_ns = started
         self._progress.steps += 1
@@ -1435,22 +1522,32 @@ class StepController:
         self._choice_submitting = decision is not None
         status, detail = StepStatus.UNKNOWN, "submission-unknown"
         receipt: models.Executed | models.Dropped | models.Uncertain | None = None
+        effect_checked = None
+        loop = asyncio.get_running_loop()
+        receipt_until = loop.time() + self.config.receipt_timeout
         try:
-            async with asyncio.timeout(self.config.receipt_timeout):
+            async with asyncio.timeout_at(receipt_until):
                 sent = await self.grant.submit(
                     (models.ControlStep(offset_ns=0, held=[], actions=[action]),),
                     base_frame=here.frame.frame_number,
                     valid_for=(end - started) / 1e9,
                 )
+                if loop.time() >= receipt_until:
+                    raise TimeoutError
                 if isinstance(sent.result, models.Rejected):
                     status, detail = StepStatus.REJECTED, sent.result.reason.value
                 else:
+                    if trace is not None:
+                        trace.submitted_at = perf_counter_ns()
                     if self._semantic is None:
                         with suppress(ChannelError):
                             self.operator.report_action(
                                 messages.Action(category=category.value, summary=action.root.type)
                             )
-                    receipt = (await sent.outcomes()).get(action_id)
+                    outcomes = await sent.outcomes()
+                    if loop.time() >= receipt_until:
+                        raise TimeoutError
+                    receipt = outcomes.get(action_id)
                     if receipt is not None and (
                         receipt.id != action_id
                         or (
@@ -1470,9 +1567,16 @@ class StepController:
                     else:
                         detail = "receipt-uncertain"
             if isinstance(receipt, models.Executed):
+                until = self.clock.now_ns() + _ns(self.config.effect_timeout)
+                if trace is not None:
+                    executed_at = perf_counter_ns()
+                    # 回执等待已结束，固定核验截止以后才交付积攒的遥测事件。
+                    trace.flush_submitted()
+                    trace.event("executed", at_monotonic_ns=executed_at)
                 status = await self._verify(
-                    here, proposal.expected, receipt.at_ns, decision, revision
+                    here, proposal.expected, receipt.at_ns, decision, revision, until=until
                 )
+                effect_checked = perf_counter_ns()
                 if status is StepStatus.VERIFIED:
                     detail = "screen-verified"
                 elif status is not StepStatus.UNKNOWN:
@@ -1488,6 +1592,8 @@ class StepController:
         except asyncio.CancelledError:
             status, detail = StepStatus.UNKNOWN, "interrupted-after-submit"
             self._record(status, detail, here, category, started)
+            if trace is not None:
+                trace.end("unknown")
             if decision is not None:
                 self._close_decision("unknown")
             raise
@@ -1495,10 +1601,18 @@ class StepController:
             detail = "execution-verification-failed"
             logger.exception("无法确认已提交动作的效果")
         finally:
-            if outcome is not None:
-                outcome(
-                    status, detail, receipt.at_ns if isinstance(receipt, models.Executed) else None
-                )
+            try:
+                if outcome is not None:
+                    outcome(
+                        status,
+                        detail,
+                        receipt.at_ns if isinstance(receipt, models.Executed) else None,
+                    )
+            finally:
+                if trace is not None:
+                    if effect_checked is not None:
+                        trace.event("effect_checked", at_monotonic_ns=effect_checked)
+                    trace.end(status.value)
         if status is StepStatus.REJECTED:
             if fast_dialogue is not None:
                 # 首次明确未执行可重试。若这是无效果后的重发，原提交仍保留。
@@ -1515,8 +1629,9 @@ class StepController:
         executed_ns: int,
         decision: PendingDecision | None,
         revision: int,
+        *,
+        until: int,
     ) -> StepStatus:
-        until = self.clock.now_ns() + _ns(self.config.effect_timeout)
         last = before.frame.frame_number
         unchanged = False
         deadline = None if decision is None else decision.deadline_ns

@@ -8,6 +8,8 @@ from weakref import ReferenceType, ref
 from game_runtime.operator import messages
 from game_runtime.step_control.contracts import Category, Goal, PlannerPort, StepStatus
 from game_runtime.step_control.decisions import DecisionKey
+from game_runtime.telemetry import SpanContext
+from game_runtime.telemetry.consumer import StepTrace
 
 
 class PlaySession(Protocol):
@@ -54,6 +56,9 @@ class SemanticPlay(PlaySession, Protocol):
     def progress_held(self) -> bool: ...
     def waiting_for(self, decision_id: str) -> bool: ...
     def rejected(self, detail: str) -> None: ...
+    def step_context(
+        self, decision_id: str | None, resolve_parent: str | None
+    ) -> SpanContext | None: ...
     def action_started(
         self,
         action_id: str,
@@ -61,6 +66,8 @@ class SemanticPlay(PlaySession, Protocol):
         summary: str,
         deadline_ns: int,
         choice: SubmittedChoice | None,
+        *,
+        step_trace: StepTrace | None = None,
     ) -> ActionOutcome: ...
 
 
