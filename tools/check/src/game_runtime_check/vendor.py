@@ -1,4 +1,4 @@
-"""离线核对 Bellis 已合入提交的锁定副本；不生成或修改契约。"""
+"""离线核对 Bellis 源提交的锁定副本；不生成、修改契约或判断合入状态。"""
 
 import hashlib
 import json
@@ -15,6 +15,9 @@ SOURCES = {
     "schemas/game-bridge.schema.json": "packages/protocol/schemas/game-bridge.schema.json",
     "models/game_bridge.py": "packages/protocol/models/game_bridge.py",
     "fixtures/game-control.json": "packages/protocol/test/fixtures/game-control.json",
+    "schemas/game-bridge-v2.schema.json": "packages/protocol/schemas/game-bridge-v2.schema.json",
+    "models/game_bridge_v2.py": "packages/protocol/models/game_bridge_v2.py",
+    "fixtures/game-main-v2.json": "packages/protocol/test/fixtures/game-main-v2.json",
 }
 
 
@@ -81,7 +84,7 @@ def main() -> int:
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print("Bellis game bridge: all 3 pinned artifacts match their SHA-256 digests")
+    print(f"Bellis game bridge: all {len(SOURCES)} pinned artifacts match their SHA-256 digests")
     return 0
 
 
