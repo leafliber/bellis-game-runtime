@@ -113,11 +113,18 @@ TEST_LEASE_REVOKE: Final = Request(
 FAKE_INPUT_EVENT: Final = Notification(
     "fake_input.event", Direction.CORE_TO_TEST, models.FakeInputEventParams
 )
+FAKE_INPUT_VERIFY_RELEASE: Final = Request(
+    "fake_input.verify_release",
+    Direction.CORE_TO_TEST,
+    models.FakeVerifyReleaseParams,
+    models.FakeVerifyReleaseResult,
+)
 
 TEST_DEVICE_METHODS: Final[Mapping[str, Method]] = {
     TEST_LEASE_GRANT.name: TEST_LEASE_GRANT,
     TEST_LEASE_REVOKE.name: TEST_LEASE_REVOKE,
     FAKE_INPUT_EVENT.name: FAKE_INPUT_EVENT,
+    FAKE_INPUT_VERIFY_RELEASE.name: FAKE_INPUT_VERIFY_RELEASE,
 }
 """测试设备连接上的全部方法，按方法名索引。只用于测试。"""
 

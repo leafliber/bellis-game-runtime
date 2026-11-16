@@ -14,9 +14,10 @@ use serde::de::DeserializeOwned;
 use crate::messages::{
     ActionBlock, ActionReceiptParams, ActionSubmitResult, AudioRingAttachParams,
     AudioSetTargetParams, CaptureSetTargetParams, CoreHealthParams, CoreHelloParams,
-    CoreHelloResult, Empty, FakeInputEventParams, FrameRingAttachParams, InputPolicy,
-    InputReleasedParams, InputResidualParams, InputVerificationParams, LeaseGrantParams,
-    LeaseRevokeParams, ProducerHeartbeatParams, ProducerRevokeParams, ProducerRevokeResult,
+    CoreHelloResult, Empty, FakeInputEventParams, FakeVerifyReleaseParams, FakeVerifyReleaseResult,
+    FrameRingAttachParams, InputPolicy, InputReleasedParams, InputResidualParams,
+    InputVerificationParams, LeaseGrantParams, LeaseRevokeParams, ProducerHeartbeatParams,
+    ProducerRevokeParams, ProducerRevokeResult,
 };
 
 /// 消息的发送方。
@@ -187,6 +188,8 @@ methods! {
     TestLeaseRevoke = "test_lease.revoke", TestToCore, LeaseRevokeParams => Empty;
     /// 假输入后端交给假输入设备的一个事件。
     FakeInput = "fake_input.event", CoreToTest, FakeInputEventParams;
+    /// 显式测试模式读取独立假设备的释放水位和残留状态。
+    FakeVerifyRelease = "fake_input.verify_release", CoreToTest, FakeVerifyReleaseParams => FakeVerifyReleaseResult;
 }
 
 /// 核协议自定义的 JSON-RPC 错误码；其它错误用 JSON-RPC 2.0 的标准错误码。

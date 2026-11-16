@@ -14,34 +14,42 @@
 
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bellis_channel::{ChannelCredentials, ChannelError, Connection, Handlers};
 use core_protocol::messages::{
     Action, FakeAxisRelease, FakeAxisSet, FakeClick, FakeInputEvent, FakeInputEventParams,
     FakeKeyDown, FakeKeyPress, FakeKeyUp, FakeMouseDown, FakeMouseMove, FakeMouseUp,
-    FakeReleaseAll, FakeScroll, HeldInput, MouseButton, ReleaseReason,
+    FakeReleaseAll, FakeScroll, FakeVerifyReleaseParams, FakeVerifyReleaseResult, HeldInput,
+    MouseButton, ReleaseReason, VerificationResult,
 };
-use core_protocol::methods::{FakeInput, Method, TestLeaseGrant, TestLeaseRevoke};
-use serde_json::Value;
+use core_protocol::methods::{
+    FakeInput, FakeVerifyRelease, Method, TestLeaseGrant, TestLeaseRevoke,
+};
+use serde_json::{Map, Value};
 
-use crate::control::Control;
+use crate::control::{Control, Notice, Notices};
 use crate::ledger::{Inject, InputBackend, Momentary};
 use crate::queue::SendQueue;
-use crate::side::{Post, SideConnection, connect_side, with_lease_handlers};
+use crate::side::{Post, RequestSender, SideConnection, connect_side, with_lease_handlers};
+
+const VERIFICATION_WINDOW_NS: u64 = 200_000_000;
 
 /// 假输入后端：每个输入都作为一条 `fake_input.event` 放进发送队列。
 pub(crate) struct FakeBackend {
     queue: Arc<SendQueue>,
     seq: u64,
+    verify_release: bool,
 }
 
 impl FakeBackend {
     /// 新的假后端与它的发送队列；队列由测试设备连接的发送线程写出（[`TestDeviceConnection::start`]）。
-    pub(crate) fn new() -> (Self, Arc<SendQueue>) {
+    pub(crate) fn new(verify_release: bool) -> (Self, Arc<SendQueue>) {
         let queue = Arc::new(SendQueue::default());
         let backend = Self {
             queue: Arc::clone(&queue),
             seq: 0,
+            verify_release,
         };
         (backend, queue)
     }
@@ -147,8 +155,23 @@ impl InputBackend for FakeBackend {
         true
     }
 
-    fn released_all(&mut self, reason: ReleaseReason, _release_id: u64) {
+    fn released_all(&mut self, reason: ReleaseReason, release_id: u64) {
+        let deadline_ns = mono_clock::now_ns().saturating_add(VERIFICATION_WINDOW_NS);
         self.emit(FakeInputEvent::ReleaseAll(FakeReleaseAll { reason }));
+        if self.verify_release {
+            let request = FakeVerifyReleaseParams {
+                release_id,
+                through_seq: self.seq,
+                deadline_ns,
+            };
+            if let Ok(Value::Object(params)) = serde_json::to_value(request) {
+                self.queue.push(FakeVerifyRelease::NAME, params);
+            }
+        }
+    }
+
+    fn verifies_release(&self) -> bool {
+        self.verify_release
     }
 }
 
@@ -191,6 +214,7 @@ impl TestDeviceConnection {
         events: Arc<SendQueue>,
         control: &Arc<Control>,
         post: &Post,
+        verify_release: bool,
     ) -> io::Result<SideConnection> {
         let handlers = match role {
             DeviceRole::LeaseSource => with_lease_handlers(
@@ -202,10 +226,146 @@ impl TestDeviceConnection {
             ),
             DeviceRole::EventsOnly => Handlers::new(),
         };
-        let device = SideConnection::spawn("test-device", self.connection, handlers, events)?;
-        if role == DeviceRole::LeaseSource {
+        let request = verify_release.then(|| verification_sender(control, post));
+        let device = SideConnection::spawn_with_requests(
+            "test-device",
+            self.connection,
+            handlers,
+            events,
+            request,
+        )?;
+        if role == DeviceRole::LeaseSource || verify_release {
             device.watch_as_lease_source(control, post)?;
         }
         Ok(device)
+    }
+}
+
+fn checked_result(
+    request: &FakeVerifyReleaseParams,
+    reply: Value,
+    now_ns: u64,
+    open: bool,
+) -> VerificationResult {
+    let Ok(reply) = serde_json::from_value::<FakeVerifyReleaseResult>(reply) else {
+        return VerificationResult::Unavailable;
+    };
+    if !open
+        || now_ns >= request.deadline_ns
+        || reply.release_id != request.release_id
+        || reply.through_seq != request.through_seq
+    {
+        return VerificationResult::Unavailable;
+    }
+    if reply.held.is_empty() {
+        VerificationResult::Verified
+    } else {
+        VerificationResult::Residual
+    }
+}
+
+fn verification_sender(control: &Arc<Control>, post: &Post) -> RequestSender {
+    let (control, post) = (Arc::clone(control), Arc::clone(post));
+    Box::new(move |peer, method, params: &Map<String, Value>| {
+        if method != FakeVerifyRelease::NAME {
+            return false;
+        }
+        let Ok(request) =
+            serde_json::from_value::<FakeVerifyReleaseParams>(Value::Object(params.clone()))
+        else {
+            post(control.lease_source_lost());
+            return true;
+        };
+        let now_ns = mono_clock::now_ns();
+        let observed = if request.deadline_ns <= now_ns {
+            VerificationResult::Unavailable
+        } else {
+            peer.request_with_timeout(
+                method,
+                Some(params),
+                Duration::from_nanos(request.deadline_ns - now_ns),
+            )
+            .map_or(VerificationResult::Unavailable, |reply| {
+                checked_result(&request, reply, mono_clock::now_ns(), !peer.is_closed())
+            })
+        };
+        let proof = control.finish_verification(request.release_id, observed);
+        post(Notices(vec![Notice::Verification(proof)]));
+        control.verification_posted(proof);
+        true
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn proof_needs_matching_watermark_open_peer_and_live_deadline() {
+        let request = FakeVerifyReleaseParams {
+            release_id: 4,
+            through_seq: 9,
+            deadline_ns: 200,
+        };
+        let clear = json!({"release_id": 4, "through_seq": 9, "held": []});
+        assert_eq!(
+            checked_result(&request, clear.clone(), 199, true),
+            VerificationResult::Verified
+        );
+        assert_eq!(
+            checked_result(&request, clear.clone(), 200, true),
+            VerificationResult::Unavailable
+        );
+        assert_eq!(
+            checked_result(&request, clear, 199, false),
+            VerificationResult::Unavailable
+        );
+        for bad in [
+            json!({"release_id": 3, "through_seq": 9, "held": []}),
+            json!({"release_id": 4, "through_seq": 8, "held": []}),
+            json!({"release_id": 4, "through_seq": 9, "held": [], "extra": true}),
+            json!({"release_id": 4, "through_seq": 9, "held": [{"type": "unknown"}]}),
+            json!({"release_id": 4, "through_seq": 9}),
+        ] {
+            assert_eq!(
+                checked_result(&request, bad, 199, true),
+                VerificationResult::Unavailable
+            );
+        }
+        assert_eq!(
+            checked_result(
+                &request,
+                json!({"release_id": 4, "through_seq": 9, "held": [{"type": "key", "scan_code": 17}]}),
+                199,
+                true
+            ),
+            VerificationResult::Residual
+        );
+    }
+
+    #[test]
+    fn verification_request_follows_release_event_on_the_same_fifo() {
+        for enabled in [false, true] {
+            let (mut backend, queue) = FakeBackend::new(enabled);
+            backend.key_down(17);
+            backend.key_up(17);
+            backend.released_all(ReleaseReason::Stop, 7);
+            let mut seen = Vec::new();
+            queue.run(|name, params| {
+                seen.push((name, params.clone()));
+                if (enabled && name == FakeVerifyRelease::NAME) || (!enabled && seen.len() == 3) {
+                    queue.abandon();
+                }
+            });
+            assert_eq!(seen.len(), if enabled { 4 } else { 3 });
+            assert_eq!(seen[2].1["seq"], 3);
+            assert_eq!(seen[2].1["event"]["type"], "release_all");
+            if enabled {
+                assert_eq!(seen[3].1["release_id"], 7);
+                assert_eq!(seen[3].1["through_seq"], 3);
+            }
+            assert_eq!(backend.verifies_release(), enabled);
+        }
     }
 }

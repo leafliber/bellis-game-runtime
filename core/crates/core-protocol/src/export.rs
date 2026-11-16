@@ -18,19 +18,19 @@ use crate::messages::{
     CoreHelloParams, CoreHelloResult, DropReason, Dropped, Empty, Executed, FakeAudioTarget,
     FakeAxisRelease, FakeAxisSet, FakeClick, FakeInputEvent, FakeInputEventParams, FakeKeyDown,
     FakeKeyPress, FakeKeyUp, FakeMouseDown, FakeMouseMove, FakeMouseUp, FakeReleaseAll, FakeScroll,
-    FakeTarget, FrameRingAttachParams, HeldAxis, HeldInput, HeldKey, HeldMouseButton, InputPolicy,
-    InputReleasedParams, InputResidualParams, InputVerificationParams, KeyPress, LatestAudio,
-    LatestFrame, LeaseGrantParams, LeaseRevokeParams, LeaseStatus, MouseButton, MouseMove,
-    NormRect, Producer, ProducerHeartbeatParams, ProducerRevokeParams, ProducerRevokeResult,
-    RejectReason, Rejected, ReleaseReason, ReleaseVerification, ResidualCause, Scroll,
-    VerificationResult, WindowTarget,
+    FakeTarget, FakeVerifyReleaseParams, FakeVerifyReleaseResult, FrameRingAttachParams, HeldAxis,
+    HeldInput, HeldKey, HeldMouseButton, InputPolicy, InputReleasedParams, InputResidualParams,
+    InputVerificationParams, KeyPress, LatestAudio, LatestFrame, LeaseGrantParams,
+    LeaseRevokeParams, LeaseStatus, MouseButton, MouseMove, NormRect, Producer,
+    ProducerHeartbeatParams, ProducerRevokeParams, ProducerRevokeResult, RejectReason, Rejected,
+    ReleaseReason, ReleaseVerification, ResidualCause, Scroll, VerificationResult, WindowTarget,
 };
 use crate::methods::{
     ActionReceipt, ActionSubmit, AudioRingAttach, AudioSetTarget, CaptureSetTarget, CoreHealth,
-    CoreHello, CoreStop, FakeInput, FrameRingAttach, InputConfigure, InputReleased, InputResidual,
-    InputVerification, Method, MethodInfo, OperatorInputResidual, OperatorLeaseGrant,
-    OperatorLeaseRevoke, ProducerHeartbeat, ProducerRevoke, Request, TestLeaseGrant,
-    TestLeaseRevoke, catalog, error_code, operator_catalog, test_device_catalog,
+    CoreHello, CoreStop, FakeInput, FakeVerifyRelease, FrameRingAttach, InputConfigure,
+    InputReleased, InputResidual, InputVerification, Method, MethodInfo, OperatorInputResidual,
+    OperatorLeaseGrant, OperatorLeaseRevoke, ProducerHeartbeat, ProducerRevoke, Request,
+    TestLeaseGrant, TestLeaseRevoke, catalog, error_code, operator_catalog, test_device_catalog,
 };
 use crate::{audio_ring, frame_ring};
 
@@ -617,6 +617,30 @@ pub fn fixtures() -> Vec<Fixture> {
         Fixture::result::<TestLeaseGrant>(None, &Empty {}),
         Fixture::params::<TestLeaseRevoke>(None, &LeaseRevokeParams { token: 2 }),
         Fixture::result::<TestLeaseRevoke>(None, &Empty {}),
+        Fixture::params::<FakeVerifyRelease>(
+            None,
+            &FakeVerifyReleaseParams {
+                release_id: 2,
+                through_seq: 7,
+                deadline_ns: 5_500_000_000,
+            },
+        ),
+        Fixture::result::<FakeVerifyRelease>(
+            Some("clear"),
+            &FakeVerifyReleaseResult {
+                release_id: 2,
+                through_seq: 7,
+                held: vec![],
+            },
+        ),
+        Fixture::result::<FakeVerifyRelease>(
+            Some("residual"),
+            &FakeVerifyReleaseResult {
+                release_id: 2,
+                through_seq: 7,
+                held: vec![HeldInput::Key(HeldKey { scan_code: 0x11 })],
+            },
+        ),
     ];
     let events = [
         (

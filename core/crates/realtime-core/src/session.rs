@@ -365,14 +365,15 @@ fn start_input(
         InputSetup::Fake {
             test_device,
             permit,
+            verify_release,
         } => {
-            let (backend, events) = FakeBackend::new();
+            let (backend, events) = FakeBackend::new(verify_release);
             let backend: Box<dyn InputBackend> = Box::new(backend);
             let control = Arc::new(Control::new(
                 limits,
                 Arc::clone(frames),
                 Some(backend),
-                false,
+                verify_release,
             ));
             let mut sides = Sides::default();
             let device_role = match permit {
@@ -395,7 +396,7 @@ fn start_input(
                 connect_test_device(&test_device, role).map_err(StartError::TestDevice)?;
             sides.device = Some(
                 connection
-                    .start(device_role, events, &control, &post)
+                    .start(device_role, events, &control, &post, verify_release)
                     .map_err(StartError::Thread)?,
             );
             match device_role {

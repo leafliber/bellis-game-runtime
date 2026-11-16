@@ -28,6 +28,7 @@ from game_runtime.channel import (
 )
 from game_runtime.core_link import CORE_ROLE, ENV_TEST_DEVICE_KEY, ENV_TEST_DEVICE_PATH
 from game_runtime.core_link.fake_device import FakeDevice
+from game_runtime.core_link.fake_device import Held as DeviceHeld
 from game_runtime.frame_ring import FrameRing
 from game_runtime.frame_ring.fake import FakeDisplay
 from game_runtime.secret_store import SessionInfo
@@ -78,11 +79,18 @@ async def runtime(
     *,
     wrong_key: bool = False,
     wrong_session: bool = False,
+    verify_release: bool = False,
+    drop_lifts: frozenset[DeviceHeld] = frozenset(),
+    verification_delay: float = 0.0,
 ) -> AsyncGenerator[Rig]:
     session_id = f"b{secrets.token_hex(4)}"
     with (
         session_credentials(session_id) as credentials,
-        FakeDevice() as device,
+        FakeDevice(
+            verify_release=verify_release,
+            drop_lifts=drop_lifts,
+            verification_delay=verification_delay,
+        ) as device,
         contextlib.ExitStack() as resources,
     ):
         connections: asyncio.Queue[Connection] = asyncio.Queue()
@@ -118,6 +126,7 @@ async def runtime(
                     "3000",
                     "--max-frame-age-ms",
                     "3000",
+                    *(["--fake-verify-release"] if verify_release else []),
                 ],
                 extra_env={
                     ENV_TEST_DEVICE_PATH: device.credentials.path,

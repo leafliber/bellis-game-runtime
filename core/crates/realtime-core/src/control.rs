@@ -1038,7 +1038,6 @@ impl Control {
     }
 
     /// 核验期间可能发生了更新的释放。只有当前释放的成功结果能打开输入门禁。
-    #[cfg(any(windows, test))]
     pub(crate) fn finish_verification(
         &self,
         release_id: u64,
@@ -1069,7 +1068,6 @@ impl Control {
     }
 
     /// 回执入队后才放开对应的门禁；旧回执不能放开新的。
-    #[cfg(any(windows, test))]
     pub(crate) fn verification_posted(&self, observed: InputVerificationParams) {
         let mut state = self.lock();
         if state
