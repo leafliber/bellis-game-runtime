@@ -428,6 +428,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `test_lease.grant` | 测试一方 → 实时核 | 请求 | `LeaseGrantParams` → `Empty` | 授予或续约许可：`token`、`expires_ns`（与帧环同一时钟）。不被接受时回 -32004 |
 | `test_lease.revoke` | 测试一方 → 实时核 | 请求 | `LeaseRevokeParams` → `Empty` | 吊销 `token` 及更早的令牌；释放完成后才回应 |
 | `fake_input.event` | 实时核 → 测试一方 | 通知 | `FakeInputEventParams` | 假输入后端的一个事件：`seq`（实例内从 1 起逐个加一）、`at_ns`（交给假后端的时刻）、`event` |
+| `fake_input.verify_release` | 实时核 → 测试一方 | 请求 | `FakeVerifyReleaseParams` → `FakeVerifyReleaseResult` | 显式测试模式核对释放水位上的独立假设备账目；不授予许可 |
 
 `event` 是联合类型 `FakeInputEvent`：
 
@@ -440,6 +441,10 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `release_all` | `reason`（释放的原因，取值同 `input.released`） | 释放全部输入：此前按住的每一项都已逐一发出抬起，这一条随后发出；账目为空时也发 |
 
 事件经发送队列写给测试一方，与核连接上的回执、`input.released` 走两条连接，先后不定。实时核退出前至多等 500 ms 把队列里的事件写完。
+
+释放核验默认不启用。`--fake-verify-release` 只接受假后端、认证测试设备、Bellis 控制连接及隔离测试会话文件同时存在的组合；真实输入不能启用。测试设备也须显式开启核验。请求与事件共用 FIFO，在 `release_all` 后发送 `release_id`、该事件的 `through_seq` 和入队时固定的 `deadline_ns`，核验窗口为 200 ms。回执精确回显前两项，并返回从独立按下与抬起事件维护的完整 `held`。`release_all` 只是水位，不清空设备账目。序列空洞、旧连接、旧水位、超时或断链不能取得成功证明；设备重连不清除旧残留。
+
+实时核在原截止内将当前匹配的空账目交给既有释放核验闸门。非空账目是残留，其余不可用；旧释放的回复不能打开新释放的门禁。测试设备断链立即使本测试实例失权。结果仍通过现有 `input.verification` 和 Bellis 控制回读传播，属于模拟设备证据，不代表真机物理释放。普通假后端继续报告 `unverified`。
 
 ## 帧环与音频环
 
