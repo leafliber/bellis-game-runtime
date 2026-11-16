@@ -730,6 +730,7 @@ class BellisSession:
                     parent,
                     task_id=request_v2.taskId,
                     task_deadline=task.request.expires_at_ns,
+                    overall_completion=task.request.overall_completion,
                 )
 
     def _accept_goal(
@@ -739,6 +740,7 @@ class BellisSession:
         *,
         task_id: str | None = None,
         task_deadline: int | None = None,
+        overall_completion: ExpectedEffect | None = None,
     ) -> v1.GameAck:
         now = self.clock.now_ns()
         expires = ns(request.expiresAtMs)
@@ -794,7 +796,10 @@ class BellisSession:
                 self._unknown = None
                 self._manual = False
                 self._plan_goal = Goal(
-                    request.objective, deadline_ns=expires, constraints=tuple(request.constraints)
+                    request.objective,
+                    completion=overall_completion,
+                    deadline_ns=expires,
+                    constraints=tuple(request.constraints),
                 )
         self._announce()
         if previous is not None:
@@ -944,21 +949,95 @@ class BellisSession:
                 self.notify("health.reported", self.health())
         self.signals.became_ready()
 
-    async def record_subgoal(self, task_id: str, progress_id: str) -> bool:
-        ledger = self._require_tasks()
-        async with self.admission:
-            if not self._task_active(task_id):
-                raise _refuse("task-not-active")
-            return await self._read_ledger(partial(ledger.record_subgoal, task_id, progress_id))
+    async def record_subgoal(
+        self,
+        goal_revision: int,
+        progress_id: str,
+        *,
+        recheck: Callable[[], None],
+        on_recorded: Callable[[], None],
+    ) -> bool:
+        def write(ledger: TaskLedger, task_id: str, before_write: Callable[[], None]) -> bool:
+            return ledger.record_subgoal(task_id, progress_id, before_write=before_write)
 
-    async def complete_task(self, task_id: str) -> TaskAccount:
-        ledger = self._require_tasks()
+        return await self._record_completion(goal_revision, write, recheck, on_recorded)
+
+    async def complete_task(
+        self,
+        goal_revision: int,
+        *,
+        recheck: Callable[[], None],
+        on_recorded: Callable[[], None],
+    ) -> TaskAccount:
+        def write(
+            ledger: TaskLedger, task_id: str, before_write: Callable[[], None]
+        ) -> TaskAccount:
+            return ledger.close_task(task_id, TaskEnd.COMPLETED, before_write=before_write)
+
+        return await self._record_completion(
+            goal_revision, write, recheck, on_recorded, overall=True
+        )
+
+    async def _record_completion[T: (bool, TaskAccount)](
+        self,
+        goal_revision: int,
+        write: Callable[[TaskLedger, str, Callable[[], None]], T],
+        recheck: Callable[[], None],
+        on_recorded: Callable[[], None],
+        *,
+        overall: bool = False,
+    ) -> T:
+        goal = self._authorization
+        controller = self.signals.controller
+        if goal is None or goal.task_id is None or controller is None:
+            raise SemanticPauseError("completion-authority-revoked")
+        grant = controller.grant
+        origin = asyncio.current_task()
+
+        def current() -> bool:
+            return (
+                goal is self._authorization
+                and goal.mode == "autonomous"
+                and goal_revision == self._plan_generation
+                and self.signals.controller is controller
+                and controller.grant is grant
+                and grant.is_open
+                and (origin is None or origin.cancelling() == 0)
+                and self._active(goal)
+                and self.same_session()
+            )
+
+        def require_current() -> None:
+            if not current():
+                raise SemanticPauseError("completion-authority-revoked")
+
+        async def check_evidence() -> None:
+            require_current()
+            if not self.ready():
+                raise SemanticPauseError("completion-evidence-unavailable")
+            recheck()
+            require_current()
+
         async with self.admission:
-            if not self._task_active(task_id):
-                raise _refuse("task-not-active")
-            task = await self._read_ledger(partial(ledger.close_task, task_id, TaskEnd.COMPLETED))
-            await self._refresh_ledger(ledger)
-            return task
+            require_current()
+            ledger = self._require_tasks()
+            if overall and (self._plan_goal is None or self._plan_goal.completion is None):
+                raise SemanticPauseError("task-completion-condition-missing")
+            loop = asyncio.get_running_loop()
+
+            def before_write() -> None:
+                # SQLite 持有写事务时，把最后一次取证复核交还给事件循环。
+                asyncio.run_coroutine_threadsafe(check_evidence(), loop).result()
+
+            result = await self._read_ledger(partial(write, ledger, goal.task_id, before_write))
+            if result is not False:
+                try:
+                    # 暂停或撤权可以在写事务返回前发生。持久事实归原目标，事件还需当前授权。
+                    if current():
+                        on_recorded()
+                finally:
+                    await self._refresh_ledger(ledger)
+            return result
 
     def _accept_choice(
         self, request: v1.GameDecisionResolveParams, parent: str | None

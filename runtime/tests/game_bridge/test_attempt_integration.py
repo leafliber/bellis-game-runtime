@@ -11,6 +11,7 @@ from contextlib import ExitStack, asynccontextmanager, closing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from time import perf_counter_ns
 from typing import cast
 
@@ -51,6 +52,7 @@ from game_runtime.game_bridge.task_ledger import (
     FrameStamp,
     LedgerRefusedError,
     Resolution,
+    TaskAccount,
     TaskEnd,
     TaskLedger,
     TaskLimits,
@@ -68,6 +70,7 @@ from game_runtime.step_control.pacing import DEFAULT_PACING, ReadingPacing
 from game_runtime.step_control.plugin import SessionSignals
 from game_runtime.step_control.supervision import SemanticPauseError
 
+from ..core_link.conftest import core_exe as core_exe
 from ..core_link.test_semantic_bridge import FixturePolicy
 from ..core_link.test_semantic_bridge import rig as supervised_rig
 from ..core_link.test_semantic_bridge import semantic_core as semantic_core
@@ -75,6 +78,7 @@ from ..planner.test_planner import scene
 
 TARGET = "fixed-fixture"
 LIMITS = TaskLimits(calls=3, inputs=3, no_progress_ns=30_000_000_000)
+OVERALL = ExpectedEffect(EffectKind.SCREEN, screen_type=ScreenType.MENU)
 WAIT = 5
 
 
@@ -183,12 +187,20 @@ async def fake_core(
 
 
 def ledger_and_spec(
-    path: Path, *, receipt_timeout_ns: int = 2_000_000_000
+    path: Path,
+    *,
+    receipt_timeout_ns: int = 2_000_000_000,
+    overall: ExpectedEffect | None = None,
 ) -> tuple[TaskLedger, AttemptSpec, models.ControlStep]:
     TaskLedger.provision(path, TARGET)
     ledger = TaskLedger.start(path, TARGET)
     now = perf_counter_ns()
-    request = TaskRequest(task_id="task", objective="打开菜单", expires_at_ns=now + 30_000_000_000)
+    request = TaskRequest(
+        task_id="task",
+        objective="打开菜单",
+        expires_at_ns=now + 30_000_000_000,
+        overall_completion=overall,
+    )
     ledger.open_task(request, LIMITS, release_verified=True)
     spec = AttemptSpec(
         attempt_id="attempt",
@@ -334,7 +346,7 @@ def test_p04_goals_and_reconnect_share_budget_and_restart_ends_original_task(
 ) -> None:
     async def run() -> None:
         path = tmp_path / "ledger.sqlite3"
-        ledger, spec, _ = ledger_and_spec(path)
+        ledger, spec, _ = ledger_and_spec(path, overall=OVERALL)
         async with fake_core(ledger) as rig, task_session(path, ledger, rig) as session:
             async with semantic_connection(session) as main:
                 await main.request("goal.submit", task_goal(spec, "goal"))
@@ -342,7 +354,15 @@ def test_p04_goals_and_reconnect_share_budget_and_restart_ends_original_task(
                 assert first is not None
                 assert await first("first", CallKind.PLANNER)
                 assert not await first("first", CallKind.PLANNER)
-                await main.request("goal.submit", task_goal(spec, "p04"))
+                assert ledger.reserve_attempt(spec)
+                ledger.record_not_sent(spec.attempt_id, proof="fixture-no-kernel-write")
+                await main.request(
+                    "goal.submit", task_goal(spec, "p04") | {"objective": "恢复对主菜单的核验"}
+                )
+                goal = session.planning_goal
+                assert goal is not None
+                assert goal.text == "恢复对主菜单的核验"
+                assert goal.completion == OVERALL
                 assert not await first("old-goal", CallKind.POLICY)
                 second = session.model_budget(session.session.goal_revision)
                 assert second is not None
@@ -366,7 +386,229 @@ def test_p04_goals_and_reconnect_share_budget_and_restart_ends_original_task(
         old = restarted.get_task(spec.task_id)
         assert old is not None
         assert old.calls_spent == LIMITS.calls
+        assert old.inputs_spent == 1
         assert old.end is TaskEnd.RESTARTED
+
+    asyncio.run(run())
+
+
+def test_completion_rechecks_latest_scene_and_notifies_before_terminal_refresh(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        path = tmp_path / "ledger.sqlite3"
+        ledger, spec, _ = ledger_and_spec(path, overall=OVERALL)
+        async with (
+            fake_core(ledger) as rig,
+            task_session(path, ledger, rig) as session,
+            semantic_connection(session) as main,
+        ):
+            await main.request("goal.submit", task_goal(spec, "goal"))
+            revision = session.session.goal_revision
+            project = session.project
+            assert project is not None
+            initial = project.scene.latest
+            assert initial is not None
+            assert isinstance(project.scene, SceneHub)
+            loop = asyncio.get_running_loop()
+            recorded: list[str] = []
+
+            def require_initial() -> None:
+                assert asyncio.get_running_loop() is loop
+                if project.scene.latest is not initial:
+                    raise SemanticPauseError("completion-frame-changed")
+
+            project.scene.publish(replace(initial, frame=replace(initial.frame, frame_number=5)))
+            latest = project.scene.latest
+            assert latest is not None
+            with pytest.raises(SemanticPauseError, match="completion-frame-changed"):
+                await session.record_subgoal(
+                    revision,
+                    "subgoal",
+                    recheck=require_initial,
+                    on_recorded=lambda: recorded.append("unexpected"),
+                )
+            assert recorded == []
+
+            def require_latest() -> None:
+                assert asyncio.get_running_loop() is loop
+                assert project.scene.latest is latest
+
+            def completed() -> None:
+                task = ledger.get_task(spec.task_id)
+                assert task is not None
+                assert task.end is TaskEnd.COMPLETED
+                assert session.session.goal_revision == revision
+                assert session.planning_goal is not None
+                recorded.append("task")
+
+            assert await session.record_subgoal(
+                revision,
+                "subgoal",
+                recheck=require_latest,
+                on_recorded=lambda: recorded.append("subgoal"),
+            )
+            assert not await session.record_subgoal(
+                revision,
+                "subgoal",
+                recheck=require_latest,
+                on_recorded=lambda: recorded.append("duplicate"),
+            )
+            task = await session.complete_task(
+                revision,
+                recheck=require_latest,
+                on_recorded=completed,
+            )
+            assert task.end is TaskEnd.COMPLETED
+            assert recorded == ["subgoal", "task"]
+            assert session.planning_goal is None
+            assert not session.may_autoplay
+            assert rig.requests.empty()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["pause", "grant-revoked"])
+@pytest.mark.parametrize("committed", [False, True], ids=["before-write", "after-commit"])
+def test_completion_racing_with_revocation_never_publishes_stale_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    committed: bool,
+) -> None:
+    async def run() -> None:
+        path = tmp_path / "ledger.sqlite3"
+        ledger, spec, _ = ledger_and_spec(path, overall=OVERALL)
+        async with (
+            fake_core(ledger) as rig,
+            task_session(path, ledger, rig) as session,
+            semantic_connection(session) as main,
+        ):
+            await main.request("goal.submit", task_goal(spec, "goal"))
+            revision = session.session.goal_revision
+            entered, release = asyncio.Event(), Event()
+            loop = asyncio.get_running_loop()
+            close_task = ledger.close_task
+            events: list[int] = []
+
+            def block() -> None:
+                loop.call_soon_threadsafe(entered.set)
+                if not release.wait(WAIT):
+                    raise TimeoutError("测试未释放 SQLite 写线程")
+
+            def delayed_close(
+                task_id: str,
+                end: TaskEnd,
+                *,
+                before_write: Callable[[], None] | None = None,
+            ) -> TaskAccount:
+                assert before_write is not None
+                if committed:
+                    account = close_task(task_id, end, before_write=before_write)
+                    block()
+                    return account
+
+                def gated() -> None:
+                    block()
+                    before_write()
+
+                return close_task(task_id, end, before_write=gated)
+
+            monkeypatch.setattr(ledger, "close_task", delayed_close)
+            waiter = asyncio.create_task(
+                session.complete_task(
+                    revision,
+                    recheck=rig.grant.check,
+                    on_recorded=lambda: events.append(revision),
+                )
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), WAIT)
+                if change == "pause":
+                    await main.request("goal.submit", task_goal(spec, "pause", mode="paused"))
+                else:
+                    rig.stop.set()
+            finally:
+                release.set()
+            if committed:
+                assert (await waiter).end is TaskEnd.COMPLETED
+            else:
+                with pytest.raises(SemanticPauseError, match="completion-authority-revoked"):
+                    await waiter
+            old = ledger.get_task(spec.task_id)
+            assert old is not None
+            assert old.end is (TaskEnd.COMPLETED if committed else None)
+            assert events == []
+            assert rig.requests.empty()
+
+    asyncio.run(run())
+
+
+def test_old_subgoal_progress_cannot_publish_to_queued_p04_goal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        path = tmp_path / "ledger.sqlite3"
+        ledger, spec, _ = ledger_and_spec(path)
+        async with (
+            fake_core(ledger) as rig,
+            task_session(path, ledger, rig) as session,
+            semantic_connection(session) as main,
+        ):
+            await main.request("goal.submit", task_goal(spec, "goal"))
+            revision = session.session.goal_revision
+            loop = asyncio.get_running_loop()
+            entered, release = asyncio.Event(), Event()
+            record_subgoal = ledger.record_subgoal
+            events: list[int] = []
+
+            def delayed_record(
+                task_id: str,
+                progress_id: str,
+                *,
+                before_write: Callable[[], None] | None = None,
+            ) -> bool:
+                first = record_subgoal(task_id, progress_id, before_write=before_write)
+                loop.call_soon_threadsafe(entered.set)
+                if not release.wait(WAIT):
+                    raise TimeoutError("测试未释放 SQLite 写线程")
+                return first
+
+            monkeypatch.setattr(ledger, "record_subgoal", delayed_record)
+            waiter = asyncio.create_task(
+                session.record_subgoal(
+                    revision,
+                    "old-progress",
+                    recheck=rig.grant.check,
+                    on_recorded=lambda: events.append(revision),
+                )
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), WAIT)
+                await main.request("goal.submit", task_goal(spec, "pause", mode="paused"))
+                recovery = asyncio.create_task(main.request("goal.submit", task_goal(spec, "p04")))
+            finally:
+                release.set()
+            assert await waiter
+            await recovery
+            assert session.session.goal_revision != revision
+            assert not record_subgoal(spec.task_id, "old-progress")
+            with pytest.raises(SemanticPauseError, match="completion-authority-revoked"):
+                await session.record_subgoal(
+                    revision,
+                    "stale-progress",
+                    recheck=rig.grant.check,
+                    on_recorded=lambda: events.append(revision),
+                )
+            with pytest.raises(SemanticPauseError, match="task-completion-condition-missing"):
+                await session.complete_task(
+                    session.session.goal_revision,
+                    recheck=rig.grant.check,
+                    on_recorded=lambda: events.append(revision),
+                )
+            assert events == []
+            assert rig.requests.empty()
 
     asyncio.run(run())
 
@@ -374,7 +616,9 @@ def test_p04_goals_and_reconnect_share_budget_and_restart_ends_original_task(
 def test_original_readonly_effect_finishes_across_pause_without_new_action(tmp_path: Path) -> None:
     async def run() -> None:
         path = tmp_path / "ledger.sqlite3"
-        ledger, spec, step = ledger_and_spec(path, receipt_timeout_ns=5_000_000_000)
+        ledger, spec, step = ledger_and_spec(
+            path, receipt_timeout_ns=5_000_000_000, overall=OVERALL
+        )
         session: BellisSession
 
         def authorize(work: AttemptSpec) -> bool:
@@ -391,6 +635,7 @@ def test_original_readonly_effect_finishes_across_pause_without_new_action(tmp_p
             effects: asyncio.Queue[object] = asyncio.Queue()
             main.on_notification("action.committed", effects.put_nowait)
             await main.request("goal.submit", task_goal(spec, "goal"))
+            revision = session.session.goal_revision
             project = session.project
             assert project is not None
             update = project.scene.latest
@@ -452,6 +697,15 @@ def test_original_readonly_effect_finishes_across_pause_without_new_action(tmp_p
             result = await asyncio.wait_for(rig.records.get(), WAIT)
             assert result.phase is AttemptPhase.VERIFIED
             assert result.spec == original
+            with pytest.raises(SemanticPauseError, match="completion-authority-revoked"):
+                await session.complete_task(
+                    revision,
+                    recheck=recheck,
+                    on_recorded=lambda: pytest.fail("暂停不能结束任务"),
+                )
+            account = ledger.get_task(spec.task_id)
+            assert account is not None
+            assert account.end is None
             assert rig.requests.empty()
             assert effects.empty()
 
@@ -629,6 +883,12 @@ def test_timeout_remains_pending_on_late_receipt_and_restart(tmp_path: Path) -> 
             assert record.phase is AttemptPhase.PENDING
         restarted = TaskLedger.start(path, TARGET)
         assert restarted.status().outstanding == record
+        assert restarted.status().active_task is None
+        next_task = TaskRequest(
+            task_id="next", objective="检查下一局", expires_at_ns=perf_counter_ns() + 5_000_000_000
+        )
+        with pytest.raises(LedgerRefusedError, match="attempt-outstanding"):
+            restarted.open_task(next_task, LIMITS, release_verified=True)
         with pytest.raises(LedgerRefusedError, match="release-unverified"):
             restarted.resolve_pending(
                 "original", spec.attempt_id, Resolution.RECONCILED_UNKNOWN, release_verified=False
@@ -640,6 +900,7 @@ def test_timeout_remains_pending_on_late_receipt_and_restart(tmp_path: Path) -> 
             is AttemptPhase.OPERATOR_RESOLVED
         )
         assert restarted.status().outstanding is None
+        assert restarted.open_task(next_task, LIMITS, release_verified=True).request == next_task
 
     asyncio.run(run())
 

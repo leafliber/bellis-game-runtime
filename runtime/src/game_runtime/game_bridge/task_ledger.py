@@ -563,7 +563,9 @@ class TaskLedger:
             )
             return TaskAccount(request, limits, now_ns, now_ns, 0, 0, None)
 
-    def close_task(self, task_id: str, end: TaskEnd) -> TaskAccount:
+    def close_task(
+        self, task_id: str, end: TaskEnd, *, before_write: Callable[[], None] | None = None
+    ) -> TaskAccount:
         """完成须结清原尝试。撤权可立即终止执行，原尝试继续记账。"""
         if end not in (TaskEnd.COMPLETED, TaskEnd.REVOKED):
             raise ValueError("只能显式完成或撤权")
@@ -578,6 +580,10 @@ class TaskLedger:
                 raise LedgerConflictError("任务终态冲突")
             if end is TaskEnd.COMPLETED:
                 _ensure_idle(db)
+            if before_write is not None:
+                before_write()
+                if end is TaskEnd.COMPLETED:
+                    task = _active(db, task_id, self._clock_ns())
             db.execute("UPDATE tasks SET ended = ? WHERE task_id = ?", (end, task_id))
             return replace(task, end=end)
 
@@ -614,7 +620,9 @@ class TaskLedger:
             db.execute("INSERT INTO calls VALUES (?, ?, ?)", (task_id, call_id, kind))
             return True
 
-    def record_subgoal(self, task_id: str, progress_id: str) -> bool:
+    def record_subgoal(
+        self, task_id: str, progress_id: str, *, before_write: Callable[[], None] | None = None
+    ) -> bool:
         """记录已核验的子目标。重复事实不推进无进展时钟。"""
         if not progress_id:
             raise ValueError("子目标核验身份为空")
@@ -628,6 +636,10 @@ class TaskLedger:
             now_ns = self._clock_ns()
             _active(db, task_id, now_ns)
             _ensure_idle(db)
+            if before_write is not None:
+                before_write()
+                now_ns = self._clock_ns()
+                _active(db, task_id, now_ns)
             db.execute("INSERT INTO subgoals VALUES (?, ?)", (task_id, progress_id))
             _progress(db, task_id, now_ns)
             return True
