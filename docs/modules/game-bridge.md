@@ -32,6 +32,20 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 
 `uv run supervise <适配包 id> --profile <文件> --bellis --real-input` 选择 Bellis 许可源。操作员核对适配包前置条件后，以可重复的 `--confirm-precondition <id>` 确认本次运行的对应条目。启动器读取本次宿主会话，并为主进程与实时核生成同一个 `runtimeId`。
 
+`--task-config <文件>` 为 Bellis 启动入口加载维护者指定的本地 JSON。该文件独立于插件 profile 和补丁，所有字段必填。以下字符串是脱敏占位值，限额由维护者填写。
+
+| 字段 | 取值 |
+| --- | --- |
+| `control_target_id` | 固定被控对象标识，例如 `local-demo-slot` |
+| `adapter_id` | 与启动所选游戏一致的适配包标识，例如 `synthetic-game` |
+| `ledger_path` | 该对象跨会话使用的同一个绝对 SQLite 路径，例如 `C:/path/to/local-data/task.sqlite3` |
+| `limits.calls`、`limits.inputs` | `limits` 对象中的调用和输入上限，均为非负整数 |
+| `limits.no_progress_ms` | `limits` 对象中的无进展上限，单位为毫秒，须为正整数 |
+
+`uv run task-ledger provision <任务配置 JSON>` 显式建账，核对适配包并为该对象创建新账库。目标路径已经存在时拒绝建账。常规启动只读入已有账库，原身份、预算及未决状态依[授权任务](#授权任务)处理。任务配置文件、账库和凭据由各自的本地入口管理。
+
+配置加载和显式建账可用。v2 任务授权的真实输入启动仍为 unsupported，`--task-config` 随真实启动命令传入时会拒绝启核。隔离假设备验收继续经监督宿主的 Python 接口进行。正式启用条件见[授权任务与动作尝试](#授权任务与动作尝试)。
+
 普通插件 `game-bridge` 注册语义 RPC 和上报任务。兼容的 `game.describe` 完成之后接受命令。断链时撤掉语义授权并让控制产出者走失效释放，同一宿主会话重连后等待新授权。凭据消失或换代时结束本次运行。
 
 ### 实时核控制连接
