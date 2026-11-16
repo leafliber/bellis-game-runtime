@@ -9,12 +9,17 @@ Linux 容器里跑 POSIX 共享内存。真机经 WGC 的录制见 `test_record_
 
 import asyncio
 import contextlib
+import dataclasses
 import functools
 import json
+import shutil
 import sys
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
+from typing import IO, cast
 
 import numpy as np
 import pytest
@@ -24,6 +29,7 @@ from game_runtime.audio_ring.fake import FakeAudioOutput
 from game_runtime.core_link import AudioConfig, CaptureConfig, CoreLinkOptions, StopStage
 from game_runtime.frame_ring.fake import FakeDisplay
 from game_runtime.frames import AdmissionPolicy
+from game_runtime.kernel import Kernel
 from game_runtime.ocr import Image, RecognizedLine
 from game_runtime.ocr import plugin as ocr_plugin
 from game_runtime.ocr.fake import ScriptedRecognizer, scripted_line
@@ -33,12 +39,22 @@ from game_runtime.recording import (
     LiveOptions,
     LiveSession,
     Recording,
+    SessionResult,
+    WriterOptions,
     adapter_sha256,
     perception_catalog,
     replay,
 )
+from game_runtime.recording import session as session_module
 from game_runtime.recording.cli import record
-from game_runtime.recording.layout import LIVE_DIR, REPLAY_DIR, ToolInfo, read_meta
+from game_runtime.recording.layout import (
+    FRAMES_DIR,
+    LIVE_DIR,
+    META_FILE,
+    REPLAY_DIR,
+    ToolInfo,
+    read_meta,
+)
 from game_runtime.scene import store_template
 from game_runtime.voice_activity import SpeechModel, VoiceActivityPlugin
 from game_runtime.voice_activity.fake import EnergyModel
@@ -305,3 +321,300 @@ def test_interrupting_the_recording_finishes_it_cleanly(
     for index in range(len(recording.frames)):
         recording.frame(index)
     assert len(recording.audio) == recording.meta.audio.blocks > 0  # pyright: ignore[reportOptionalMemberAccess]
+
+
+def hold_flush(
+    session: LiveSession, file: str, monkeypatch: pytest.MonkeyPatch
+) -> tuple[asyncio.Event, threading.Event]:
+    """卡住真实文件的 flush，等测试方放行。"""
+    writer = session._writer  # pyright: ignore[reportPrivateUsage]
+    assert writer is not None
+    stream = cast("IO[str] | IO[bytes]", getattr(writer, file))
+    flush = stream.flush
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+
+    def block() -> None:
+        loop.call_soon_threadsafe(entered.set)
+        if not release.wait(8):
+            raise TimeoutError("录制的 flush 未获放行")
+        flush()
+
+    monkeypatch.setattr(stream, "flush", block)
+    return entered, release
+
+
+async def cancel_while_waiting[T](task: asyncio.Task[T]) -> None:
+    for _ in range(2):
+        task.cancel()
+        await asyncio.wait((task,), timeout=0.05)
+        assert not task.done()
+
+
+def hold_activation(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    activating = asyncio.Event()
+    settled = Kernel.settled
+
+    async def block_start(kernel: Kernel) -> None:
+        if not activating.is_set():
+            activating.set()
+            await asyncio.Event().wait()
+        await settled(kernel)
+
+    monkeypatch.setattr(Kernel, "settled", block_start)
+    return activating
+
+
+@pytest.mark.parametrize("media", ["audio", "frame"])
+def test_cancelling_stop_waits_for_in_flight_writes_and_finishes(
+    core_exe: Path,
+    synthetic: Adapter,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    media: str,
+) -> None:
+    async def main() -> None:
+        with (
+            FakeDisplay.create(WIDTH, HEIGHT, slot_count=2) as display,
+            FakeAudioOutput.create(RATE, CHANNELS, block_capacity=BLOCK, block_count=64) as output,
+        ):
+            live = options(core_exe, synthetic, data_dir, display, output)
+            session = LiveSession(
+                dataclasses.replace(live, perception=False, writer=WriterOptions(threads=1))
+            )
+            await session.start()
+            file = "_audio_samples" if media == "audio" else "_frames_index"
+            entered, release = hold_flush(session, file, monkeypatch)
+            stop: asyncio.Task[SessionResult] | None = None
+            showing: asyncio.Task[None] | None = None
+            close_started = asyncio.Event()
+            close = session.frames.close
+
+            async def report_close() -> None:
+                close_started.set()
+                await close()
+
+            monkeypatch.setattr(session.frames, "close", report_close)
+            audio = session.audio_task
+            assert audio is not None
+            path = session.path
+            try:
+                if media == "audio":
+                    output.play(tone(1, loud=True))
+                else:
+                    showing = asyncio.create_task(Player(display, output).show(4.0))
+                await asyncio.wait_for(entered.wait(), 4)
+                stop = asyncio.create_task(session.stop("seconds"))
+                if media == "audio":
+                    await until(lambda: audio.cancelling() or None, timeout=4)
+                    assert not audio.done()
+                else:
+                    await asyncio.wait_for(close_started.wait(), 4)
+                    assert not session.frames.closed
+                await cancel_while_waiting(stop)
+                assert session.link.running
+                assert session.link.frames is not None
+                assert session.link.audio is not None
+                assert read_meta(path).state == "recording"
+            finally:
+                release.set()
+                if showing is not None:
+                    showing.cancel()
+                    await asyncio.gather(showing, return_exceptions=True)
+                if stop is not None:
+                    (outcome,) = await asyncio.gather(stop, return_exceptions=True)
+                else:
+                    outcome = None
+                stopped = not session.link.running
+                if not stopped:
+                    await session.stop("test-cleanup")
+            assert isinstance(outcome, asyncio.CancelledError)
+            assert stopped
+            assert session.link.frames is None
+            assert session.link.audio is None
+            assert audio.done()
+            recording = Recording.open(path)
+            assert (recording.meta.state, recording.meta.stop_reason) == ("complete", "seconds")
+            assert len(recording.audio if media == "audio" else recording.frames) > 0
+
+    asyncio.run(main())
+
+
+def test_repeated_start_cancellation_finishes_abort_with_audio_in_flight(
+    core_exe: Path, synthetic: Adapter, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def main() -> None:
+        with (
+            FakeDisplay.create(WIDTH, HEIGHT, slot_count=2) as display,
+            FakeAudioOutput.create(RATE, CHANNELS, block_capacity=BLOCK, block_count=64) as output,
+        ):
+            session = LiveSession(
+                dataclasses.replace(
+                    options(core_exe, synthetic, data_dir, display, output), perception=False
+                )
+            )
+            activating = hold_activation(monkeypatch)
+            start = asyncio.create_task(session.start())
+            release: threading.Event | None = None
+            try:
+                await asyncio.wait_for(activating.wait(), 4)
+                entered, release = hold_flush(session, "_audio_samples", monkeypatch)
+                audio = session.audio_task
+                assert audio is not None
+                path = session.path
+                output.play(tone(1, loud=True))
+                await asyncio.wait_for(entered.wait(), 4)
+                start.cancel()
+                await until(lambda: audio.cancelling() or None, timeout=4)
+                await cancel_while_waiting(start)
+                assert not audio.done()
+                assert session.link.running
+                assert read_meta(path).state == "recording"
+            finally:
+                if release is not None:
+                    release.set()
+                if not start.cancelling():
+                    start.cancel()
+                (outcome,) = await asyncio.gather(start, return_exceptions=True)
+                stopped = not session.link.running
+                if not stopped:
+                    await session.stop("test-cleanup")
+            assert isinstance(outcome, asyncio.CancelledError)
+            assert stopped
+            assert session.link.frames is None
+            assert session.link.audio is None
+            assert audio.done()
+            assert not path.exists()
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("case", ["empty", "deletion-denied", "unindexed-frame"])
+def test_cancelled_start_preserves_the_cause_when_final_metadata_replace_fails(
+    core_exe: Path,
+    synthetic: Adapter,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+) -> None:
+    async def main() -> None:
+        with (
+            FakeDisplay.create(WIDTH, HEIGHT, slot_count=2) as display,
+            FakeAudioOutput.create(RATE, CHANNELS, block_capacity=BLOCK, block_count=64) as output,
+        ):
+            live = options(core_exe, synthetic, data_dir, display, output)
+            session = LiveSession(
+                dataclasses.replace(live, perception=False, writer=WriterOptions(threads=1))
+            )
+            activating = hold_activation(monkeypatch)
+            start = asyncio.create_task(session.start())
+            showing: asyncio.Task[None] | None = None
+            try:
+                await asyncio.wait_for(activating.wait(), 4)
+                writer = session._writer  # pyright: ignore[reportPrivateUsage]
+                assert writer is not None
+                path = writer.path
+                meta_error = PermissionError("禁止替换结束元数据")
+                remove_error = PermissionError("禁止删除录制目录")
+                replace = Path.replace
+                removals: list[Path] = []
+
+                def fail_replace(source: Path, target: str | Path) -> Path:
+                    if Path(target) == path / META_FILE:
+                        raise meta_error
+                    return replace(source, target)
+
+                def delete(target: Path) -> None:
+                    removals.append(target)
+                    if case == "deletion-denied":
+                        raise remove_error
+                    shutil.rmtree(target)
+
+                monkeypatch.setattr(Path, "replace", fail_replace)
+                monkeypatch.setattr(session_module, "shutil", SimpleNamespace(rmtree=delete))
+                if case == "unindexed-frame":
+                    # 启动还在等激活，让定序帧源接纳一帧，像素文件写好后索引才失败。
+                    def fail_index(_line: str) -> int:
+                        raise OSError("禁止写入帧索引")
+
+                    index = writer._frames_index  # pyright: ignore[reportPrivateUsage]
+                    monkeypatch.setattr(index, "write", fail_index)
+                    session.frames.start()
+                    showing = asyncio.create_task(Player(display, output).show(4.0))
+                    await until(lambda: session.frames.closed or None, timeout=4)
+                    assert session.frames.stats.admitted > 0
+                    assert writer.meta.frames.count == 0
+                    assert any((path / FRAMES_DIR).glob("*.png"))
+                start.cancel("中止插件激活")
+                with pytest.raises(asyncio.CancelledError, match="中止插件激活"):
+                    await start
+                assert not session.link.running
+                assert session.link.frames is None
+                assert session.link.audio is None
+                assert any(log.exc_info and log.exc_info[1] is meta_error for log in caplog.records)
+                if case == "deletion-denied":
+                    failure = next(
+                        log
+                        for log in caplog.records
+                        if log.exc_info and log.exc_info[1] is remove_error
+                    )
+                    assert str(path) in failure.getMessage()
+                    assert read_meta(path).state == "recording"
+                if case == "unindexed-frame":
+                    assert removals == []
+                    assert any((path / FRAMES_DIR).glob("*.png"))
+                else:
+                    assert removals == [path]
+                    assert path.exists() == (case == "deletion-denied")
+            finally:
+                if showing is not None:
+                    showing.cancel()
+                    await asyncio.gather(showing, return_exceptions=True)
+                if not start.done():
+                    start.cancel()
+                    await asyncio.gather(start, return_exceptions=True)
+                if session.link.running:
+                    await session.link.stop()
+
+    asyncio.run(main())
+
+
+def test_cancelling_core_start_releases_the_rings_before_recording_is_created(
+    core_exe: Path, synthetic: Adapter, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def main() -> None:
+        with (
+            FakeDisplay.create(WIDTH, HEIGHT, slot_count=2) as display,
+            FakeAudioOutput.create(RATE, CHANNELS, block_capacity=BLOCK, block_count=64) as output,
+        ):
+            session = LiveSession(options(core_exe, synthetic, data_dir, display, output))
+            ready = asyncio.Event()
+            start_core = session.link.start
+
+            async def pause_before_return() -> None:
+                await start_core()
+                ready.set()
+                await asyncio.Event().wait()
+
+            monkeypatch.setattr(session.link, "start", pause_before_return)
+            task = asyncio.create_task(session.start())
+            try:
+                await asyncio.wait_for(ready.wait(), 4)
+                assert session.link.running
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert not session.link.running
+                assert session.link.frames is None
+                assert session.link.audio is None
+                assert session.recording_path is None
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                if session.link.running:
+                    await session.link.stop()
+
+    asyncio.run(main())
