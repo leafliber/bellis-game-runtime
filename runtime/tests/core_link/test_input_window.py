@@ -151,12 +151,32 @@ if sys.platform == "win32":
             ("dwExtraInfo", ctypes.c_void_p),
         )
 
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = (
+            ("dx", wintypes.LONG),
+            ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_void_p),
+        )
+
+    class _HARDWAREINPUT(ctypes.Structure):
+        _fields_ = (
+            ("uMsg", wintypes.DWORD),
+            ("wParamL", wintypes.WORD),
+            ("wParamH", wintypes.WORD),
+        )
+
     class _INPUT(ctypes.Structure):
         class _U(ctypes.Union):
-            _fields_ = (("ki", _KEYBDINPUT),)
+            # SendInput 的 cbSize 是完整 INPUT，键盘事件也必须保留鼠标成员的大小。
+            _fields_ = (("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT))
 
         _anonymous_ = ("u",)
         _fields_ = (("type", wintypes.DWORD), ("u", _U))
+
+    _user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
 
     def third_party_keys(*scans: int) -> None:
         """本进程以 SendInput 依次按下这些键、再倒序抬起（扫描码，不是实时核的会话标记）。"""
@@ -171,7 +191,34 @@ if sys.platform == "win32":
                 time=0,
                 dwExtraInfo=None,
             )
-        _user32.SendInput(len(order), ctypes.byref(events), ctypes.sizeof(_INPUT))
+        ctypes.set_last_error(0)
+        inserted = int(_user32.SendInput(len(order), events, ctypes.sizeof(_INPUT)))
+        error = ctypes.get_last_error()
+        if inserted != len(order):
+            # 失败不能算作外来输入已送达。部分提交可能留下按住的键；只补抬起，不重发按下。
+            pending: dict[int, None] = {}
+            for scan, up in order[: max(0, min(inserted, len(order)))]:
+                if up:
+                    pending.pop(scan, None)
+                else:
+                    pending[scan] = None
+            releases = (_INPUT * len(pending))()
+            for index, scan in enumerate(reversed(pending)):
+                releases[index].type = INPUT_KEYBOARD
+                releases[index].ki = _KEYBDINPUT(
+                    wScan=scan, dwFlags=KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP
+                )
+            released = (
+                int(_user32.SendInput(len(releases), releases, ctypes.sizeof(_INPUT)))
+                if releases
+                else 0
+            )
+            raise OSError(
+                error,
+                f"SendInput accepted {inserted}/{len(order)} events; "
+                f"cleanup accepted {released}/{len(releases)} key-up events; "
+                "physical release still requires verification",
+            )
 
     def find_hwnd() -> int | None:
         hwnd = _user32.FindWindowW("TkTopLevel", WINDOW_TITLE)
