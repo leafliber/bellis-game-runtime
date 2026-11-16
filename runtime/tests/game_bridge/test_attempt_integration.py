@@ -3,6 +3,7 @@
 # pyright: reportPrivateUsage=false
 
 import asyncio
+import json
 import os
 import sqlite3
 import sys
@@ -41,6 +42,7 @@ from game_runtime.game_bridge.session import (
     BellisSession,
     TaskAuthorityConfig,
 )
+from game_runtime.game_bridge.task_config import read_task_config
 from game_runtime.game_bridge.task_ledger import (
     AttemptKind,
     AttemptPhase,
@@ -1020,12 +1022,23 @@ def test_supervise_projects_original_pending_identity_and_refuses_unverified_rel
         previous, spec, _ = ledger_and_spec(path)
         assert previous.reserve_attempt(spec)
         previous.mark_pending(spec.attempt_id, "previous-unknown")
-        authority = TaskAuthorityConfig(
-            control_target_id=TARGET,
-            adapter_id="synthetic-game",
-            ledger_path=path,
-            limits=LIMITS,
+        config = tmp_path / "task.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "control_target_id": TARGET,
+                    "adapter_id": "synthetic-game",
+                    "ledger_path": str(path),
+                    "limits": {
+                        "calls": LIMITS.calls,
+                        "inputs": LIMITS.inputs,
+                        "no_progress_ms": LIMITS.no_progress_ns // 1_000_000,
+                    },
+                }
+            ),
+            encoding="utf-8",
         )
+        authority = read_task_config(config)
         async with supervised_rig(semantic_core, tmp_path, task_authority=authority) as rig:
             with pytest.raises(LedgerUnavailableError, match="活动进程"):
                 TaskLedger.start(path, TARGET)

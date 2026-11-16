@@ -88,6 +88,12 @@ class BellisConfig:
     task_authority: TaskAuthorityConfig | None = None
     fake_verify_release: bool = False
 
+    def require_task_backend(self, *, real_input: bool, has_test_device: bool) -> None:
+        if self.task_authority is not None and (
+            real_input or not has_test_device or self.test_session_file is None
+        ):
+            raise ValueError("GR-38 v2 真实输入 unsupported，任务授权目前只供隔离假设备验收")
+
 
 def read_bellis_session(store: SecretStore) -> SessionInfo | None:
     text = store.get(SESSION_ENTRY)

@@ -9,10 +9,12 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from game_runtime._threads import in_thread
 from game_runtime.adapter import AdapterError
 from game_runtime.adapter.load import describe
 from game_runtime.core_link import CoreLinkOptions
 from game_runtime.game_bridge.session import BellisConfig
+from game_runtime.game_bridge.task_config import read_task_config
 from game_runtime.kernel import ResolvedEntry, State, read_patch, read_profile, resolve_profile
 from game_runtime.local_data import LocalDataError
 from game_runtime.operator import OperatorError
@@ -42,7 +44,7 @@ def _set_telemetry_directory(entries: list[ResolvedEntry], directory: Path) -> N
 async def _run(
     game: str,
     entries: Sequence[ResolvedEntry],
-    core: Path,
+    core: Path | None,
     data_dir: Path,
     store: SecretStore,
     *,
@@ -51,10 +53,13 @@ async def _run(
     record: bool = False,
     name: str | None = None,
 ) -> int:
+    if bellis is not None:
+        bellis.require_task_backend(real_input=real_input, has_test_device=False)
+    executable = core if core is not None else await in_thread(build_realtime_core)
     async with supervise(
         game,
         None,
-        CoreLinkOptions(core),
+        CoreLinkOptions(executable),
         data_dir=data_dir,
         store=store,
         real_input=real_input,
@@ -108,6 +113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--name", type=check_name, help="recording name (with --record)")
     parser.add_argument("--real-input", action="store_true", help="enable supervised Windows input")
     parser.add_argument("--bellis", action="store_true", help="connect to the active Bellis host")
+    parser.add_argument("--task-config", type=Path, help="local JSON task configuration for Bellis")
     parser.add_argument(
         "--confirm-precondition",
         action="append",
@@ -119,12 +125,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.bellis and not args.real_input:
         parser.error("--bellis requires an explicit --real-input backend")
+    if args.task_config is not None and not args.bellis:
+        parser.error("--task-config requires --bellis")
     if args.confirm_precondition and not args.bellis:
         parser.error("--confirm-precondition requires --bellis")
     if args.name is not None and not args.record:
         parser.error("--name requires --record")
     setup_output(args.verbose)
     try:
+        authority = read_task_config(args.task_config) if args.task_config is not None else None
+        if authority is not None and authority.adapter_id != args.game:
+            raise ValueError("任务配置的适配包与启动所选游戏不匹配")
         profile = resolve_profile(
             read_profile(args.profile), [read_patch(path) for path in args.patch]
         )
@@ -132,7 +143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _set_telemetry_directory(profile, args.telemetry_dir)
         data_dir = data_dir_option(args.data_dir)
         store = CredentialManagerStore()
-        core = args.core or build_realtime_core()
+        core = args.core
         if args.bellis:
             return asyncio.run(
                 _run(
@@ -143,7 +154,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     store,
                     real_input=args.real_input,
                     bellis=BellisConfig(
-                        CredentialManagerStore("bellis"), frozenset(args.confirm_precondition)
+                        CredentialManagerStore("bellis"),
+                        frozenset(args.confirm_precondition),
+                        task_authority=authority,
                     ),
                     record=args.record,
                     name=args.name,

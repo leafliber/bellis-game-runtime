@@ -273,6 +273,11 @@ async def supervise(
     name: str | None = None,
 ) -> AsyncGenerator[SupervisedRun]:
     """用模型 profile 或调用方的单独策略启动监督会话。"""
+    if bellis is not None:
+        bellis.require_task_backend(
+            real_input=real_input or link_options.real_input,
+            has_test_device=link_options.test_device is not None,
+        )
     if name is not None:
         if not record:
             raise ValueError("录制名称只用于启用录制的会话")
@@ -367,13 +372,6 @@ async def supervise(
         authority = bellis.task_authority
         ledger = None
         if authority is not None:
-            if (
-                real_input
-                or link_options.real_input
-                or link_options.test_device is None
-                or bellis.test_session_file is None
-            ):
-                raise ValueError("GR-38 任务授权目前只供隔离假设备验收")
             if authority.adapter_id != adapter.id:
                 raise ValueError("任务授权配置的适配包与选定游戏不匹配")
             if capture.target.type != "fake" and capture.target != adapter.window_rule():
