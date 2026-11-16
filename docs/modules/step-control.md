@@ -170,7 +170,7 @@
 
 ## 本地遥测
 
-普通插件 `telemetry` 提供可选服务 `telemetry@1`，按 Bellis R-21 写本机 OTLP JSONL。[语义连接](game-bridge.md)的消费方保存接收消息时的连接代次、目标或决策标识与 `traceparent`，随后用该上下文记录因这条消息而产生的 span。使用合法的 W3C `00` 父标识时沿用其 trace ID，缺少有效父标识时另开根 span。句柄的 `traceparent` 可随该步骤的 `action.committed` 传播。目标、决策或连接失效时用原代次和对应标识关闭活动 span，迟到的完成回调对已关闭的句柄无效。
+普通插件 `telemetry` 提供可选服务 `telemetry@1`，按 Bellis R-21 写本机 OTLP JSONL。[语义连接](game-bridge.md)的消费方保存接收消息时的连接代次、目标或决策标识与 `traceparent`，随后用该上下文记录因这条消息而产生的 span。使用合法的 W3C `00` 父标识时沿用其 trace ID，缺少有效父标识时另开根 span。动作发布时核对 `traceparent` 对应当前服务仍在记录的步骤，校验失败时沿用该动作的有效父上下文。目标、决策或连接失效时用原代次和对应标识关闭活动 span，迟到的完成回调对已关闭的句柄无效。
 
 | 入口 | span | 写出的属性 |
 | --- | --- | --- |
@@ -178,9 +178,11 @@
 | `step` | `game.step` | `bellis.game.category` 取 `advance`、`navigate` 或 `select`，结局取 `verified`、`no-effect` 或 `rejected` |
 | `decision_opened` | `game.decision` | 决策实例首次开放时记录，`bellis.game.timing` 取 `timed` 或 `untimed`，结局取 `opened` 或 `rejected` |
 
-`bellis.game.outcome` 也可取 `unknown`、`cancelled` 或 `invalidated`。步骤按实际到达的顺序记录 `game.step.located`、`game.step.submitted`、`game.step.executed` 和 `game.step.effect_checked`，各阶段至多一次。`executed` 以实时核的 `Executed` 回执为准。写出的属性和值限于表中枚举与固定的服务名，事件只有名字与时刻。连接代次与目标、决策标识只用于本进程的关联。耗时由单调时钟计算，导出时刻以 Unix 纳秒表示。
+`bellis.game.outcome` 也可取 `unknown`、`cancelled` 或 `invalidated`。每次实际尝试在定位前捕获上下文并开始计时，定位失败也结案。转入等待决策的提议以 `cancelled` 结束。步骤按实际到达的顺序记录 `game.step.located`、`game.step.submitted`、`game.step.executed` 和 `game.step.effect_checked`，各阶段至多一次。`submitted` 以实时核确认接收为准，`executed` 以匹配且合时的 `Executed` 回执为准，`effect_checked` 在效果核验返回时记录。同一决策的更新沿用首次开放的上下文，默认选择从该决策的开放 span 延续，收到决定的选择从对应的命令 span 延续。写出的属性和值限于表中枚举与固定的服务名，事件只有名字与时刻。连接代次与目标、决策标识只用于本进程的关联。耗时由单调时钟计算，导出时刻以 Unix 纳秒表示。
 
-启用时将本机绝对路径显式填入 `directory`。守护线程分批追加，每行一个 `ExportTraceServiceRequest`，文件名区分进程实例。批写间隔 `flush_interval_ms` 缺省 100 毫秒，队列 `max_queue` 缺省 1024 条，满时丢最旧的记录；活动 span 上限 `max_active_spans` 缺省 128 条，满时跳过新 span。达到 `max_file_bytes`（缺省 8 MiB）或 `max_file_age_ms`（缺省 1 小时）就轮转，每个进程实例保留最新的 `max_files` 个文件（缺省 24）。写入失败丢弃该批。停用回调关闭活动 span 并请求排空后即返回，守护线程只在 250 毫秒内领取待写批次，剩余记录丢弃。授权、输入和释放流程独立于遥测。
+新帧复核切到默认选择时，同一次步骤尝试改接决策开放 span，保留已测的定位起点。提交入口固定回执截止，接受匹配的 `Executed` 后固定核验截止。两阶段的遥测回调在回执等待结束后执行，事件保留实际阶段时刻。
+
+在 `supervise` 的 profile 中启用 `telemetry` 条目并将本机绝对路径填入 `config.directory`。`--telemetry-dir <绝对路径>` 可启用该条目并覆盖目录，profile 未列出该条目时可用该参数直接启用。守护线程分批追加，每行一个 `ExportTraceServiceRequest`，文件名区分进程实例。批写间隔 `flush_interval_ms` 缺省 100 毫秒，队列 `max_queue` 缺省 1024 条，满时丢最旧的记录；活动 span 上限 `max_active_spans` 缺省 128 条，满时跳过新 span。达到 `max_file_bytes`（缺省 8 MiB）或 `max_file_age_ms`（缺省 1 小时）就轮转，每个进程实例保留最新的 `max_files` 个文件（缺省 24）。写入失败丢弃该批。停用回调关闭活动 span 并请求排空后即返回，守护线程只在 250 毫秒内领取待写批次，剩余记录丢弃。宿主完成撤权和输入释放并停止实时核后，在同一时限内等待排空。遥测回调后继续执行原有授权、时限和帧复核。
 
 ## 技能
 
