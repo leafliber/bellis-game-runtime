@@ -168,6 +168,20 @@
 
 连续模式的输入节奏（帧率、时序）在 GS-08 之前只预留字段。
 
+## 本地遥测
+
+普通插件 `telemetry` 提供可选服务 `telemetry@1`，按 Bellis R-21 写本机 OTLP JSONL。[语义连接](game-bridge.md)的消费方保存接收消息时的连接代次、目标或决策标识与 `traceparent`，随后用该上下文记录因这条消息而产生的 span。使用合法的 W3C `00` 父标识时沿用其 trace ID，缺少有效父标识时另开根 span。句柄的 `traceparent` 可随该步骤的 `action.committed` 传播。目标、决策或连接失效时用原代次和对应标识关闭活动 span，迟到的完成回调对已关闭的句柄无效。
+
+| 入口 | span | 写出的属性 |
+| --- | --- | --- |
+| `command_received` | `game.command` | `bellis.game.command` 取 `goal.submit` 或 `decision.resolve`，结局取 `accepted` 或 `rejected` |
+| `step` | `game.step` | `bellis.game.category` 取 `advance`、`navigate` 或 `select`，结局取 `verified`、`no-effect` 或 `rejected` |
+| `decision_opened` | `game.decision` | 决策实例首次开放时记录，`bellis.game.timing` 取 `timed` 或 `untimed`，结局取 `opened` 或 `rejected` |
+
+`bellis.game.outcome` 也可取 `unknown`、`cancelled` 或 `invalidated`。步骤按实际到达的顺序记录 `game.step.located`、`game.step.submitted`、`game.step.executed` 和 `game.step.effect_checked`，各阶段至多一次。`executed` 以实时核的 `Executed` 回执为准。写出的属性和值限于表中枚举与固定的服务名，事件只有名字与时刻。连接代次与目标、决策标识只用于本进程的关联。耗时由单调时钟计算，导出时刻以 Unix 纳秒表示。
+
+启用时将本机绝对路径显式填入 `directory`。守护线程分批追加，每行一个 `ExportTraceServiceRequest`，文件名区分进程实例。批写间隔 `flush_interval_ms` 缺省 100 毫秒，队列 `max_queue` 缺省 1024 条，满时丢最旧的记录；活动 span 上限 `max_active_spans` 缺省 128 条，满时跳过新 span。达到 `max_file_bytes`（缺省 8 MiB）或 `max_file_age_ms`（缺省 1 小时）就轮转，每个进程实例保留最新的 `max_files` 个文件（缺省 24）。写入失败丢弃该批。停用回调关闭活动 span 并请求排空后即返回，守护线程只在 250 毫秒内领取待写批次，剩余记录丢弃。授权、输入和释放流程独立于遥测。
+
 ## 技能
 
 （GR-34）普通插件 `skills@1`，游戏无关的多步过程：关闭弹窗、在菜单中找到某段文字并进入、滚动列表直到出现某项、返回主界面。
