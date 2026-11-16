@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from game_runtime.adapter import PixelRect
 from game_runtime.ocr import EngineOptions, FrameLike, OcrLine, OcrResult
 
+type PhraseIdentity = tuple[str | None, str, str]
+
 
 class PhraseLocationError(ValueError):
     """词项定位缺少可供提交的证据。"""
@@ -25,7 +27,7 @@ class PhraseCandidate:
     min_confidence: float
 
     @property
-    def identity(self) -> tuple[str | None, str, str]:
+    def identity(self) -> PhraseIdentity:
         """跨帧比较用的 ROI、完整源行和词项。"""
         return self.source.roi, phrase_text_key(self.source_line.text), phrase_text_key(self.phrase)
 

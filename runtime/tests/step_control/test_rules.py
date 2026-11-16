@@ -117,6 +117,33 @@ def test_forbidden_text_and_business_choice_are_independent() -> None:
     assert not assess(adapter, choice, click, target("测试选项", box), authorized_decision=True)
 
 
+def test_phrase_choices_keep_distinct_source_locations_and_words() -> None:
+    adapter = load_adapter(GAMES_DIR / "synthetic-game")
+    text = "打开门或关上门"
+    line = OcrLine(text, PixelRect(1, 1, 10, 4), 1, horizontal=True)
+
+    def evidence(roi: str, phrase: str) -> DecisionEvidence:
+        action = Click(TextTarget(text, roi, phrase=phrase))
+        proposed = StepProposal(Category.SELECT, action, ExpectedEffect(EffectKind.CHANGED))
+        return DecisionEvidence("title-menu", text, (line,), None, proposed, (roi, text, phrase))
+
+    first = evidence("menu-start", "打开门")
+    second = evidence("menu-start", "关上门")
+    elsewhere = evidence("client", "打开门")
+    assert len({first.identity, second.identity, elsewhere.identity}) == 3
+    assert [option.text for option in second.view.options] == ["关上门"]
+    box = adapter.roi("choices").to_pixels(1280, 720)
+    assert first.proposed is not None
+    with pytest.raises(ActionRefusedError, match="timed-phrase-unsupported"):
+        assess(
+            adapter,
+            frame("timed-choice", ScreenType.TIMED_CHOICE),
+            first.proposed,
+            target(text, box),
+            authorized_decision=True,
+        )
+
+
 def test_restart_needs_an_exact_signed_target_and_respects_other_restrictions() -> None:
     adapter = load_adapter(GAMES_DIR / "synthetic-game")
     ending = frame("bad-ending", ScreenType.BAD_ENDING)

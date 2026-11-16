@@ -855,11 +855,29 @@ class StepController:
             self._progress.stuck = True
             self._record(StepStatus.STUCK, "repeated-rejections", update, category)
 
-    async def _locate(self, update: SceneUpdate, proposal: StepProposal) -> Located:
+    async def _locate(
+        self,
+        update: SceneUpdate,
+        proposal: StepProposal,
+        *,
+        decision: PendingDecision | None = None,
+    ) -> Located:
         if isinstance(proposal.action, Press):
             return Located()
+        target = proposal.action.target
+        timeout = None
+        if target.phrase is not None:
+            if decision is not None and update.frame.transform_version != decision.opened_transform:
+                raise ActionRefusedError("decision-transform-changed")
+            expires = update.frame.capture_ns + _ns(self.config.max_frame_age)
+            timeout = (self._execution_deadline(expires, decision) - self.clock.now_ns()) / 1e9
         return await locate(
-            self.scene, self.ocr, update, proposal.action.target, radius=self.config.snap_radius
+            self.scene,
+            self.ocr,
+            update,
+            target,
+            radius=self.config.snap_radius,
+            phrase_timeout=timeout,
         )
 
     async def _ordinary(self, update: SceneUpdate, proposal: StepProposal, revision: int) -> None:
@@ -868,13 +886,18 @@ class StepController:
             here = self._current(update, found, revision)
             if assess(self.adapter, here, proposal, found):
                 self._plan.clear()
-                if requires_choice(here):
+                if requires_choice(here) and found.phrase_identity is None:
                     await self._open_from_scene(here, revision)
                 elif found.line is not None and found.reads and here.state.screen is not None:
                     await self._open(
                         here,
                         DecisionEvidence(
-                            here.state.screen, found.line.text, (found.line,), None, proposal
+                            here.state.screen,
+                            found.line.text,
+                            (found.line,),
+                            None,
+                            proposal,
+                            phrase_identity=found.phrase_identity,
                         ),
                         revision,
                     )
@@ -959,6 +982,15 @@ class StepController:
         decision: PendingDecision | None = None,
     ) -> SceneUpdate:
         self._require_authority(revision, decision=decision)
+        if (
+            decision is not None
+            and decision.evidence.phrase_identity is not None
+            and (
+                self._pending is not decision
+                or found.phrase_identity != decision.evidence.phrase_identity
+            )
+        ):
+            raise ActionRefusedError("decision-instance-changed")
         if (
             self._progress.goal is not None
             and self._progress.goal.max_steps is not None
@@ -1097,7 +1129,14 @@ class StepController:
                     ranking = self._validated_rank(rank.ranked_options, evidence)
         # 排名可以晚于同一倒计时内的下一帧。执行之前仍按新帧重新定位。
         latest = self.scene.latest
-        if latest is None or not self._can_preview(latest, evidence, revision):
+        if (
+            latest is None
+            or not self._can_preview(latest, evidence, revision)
+            or (
+                evidence.phrase_identity is not None
+                and latest.observation_scope is not update.observation_scope
+            )
+        ):
             self._planner_event(
                 DecisionEvent(session, identity, "withdrawn", view, update.frame.frame_number)
             )
@@ -1117,7 +1156,12 @@ class StepController:
         )
         self.operator.open_decision(decision)
         self._pending = PendingDecision(
-            decision.id, evidence, ranking, evidence.deadline_ns, update.frame.frame_number
+            decision.id,
+            evidence,
+            ranking,
+            evidence.deadline_ns,
+            update.frame.frame_number,
+            opened_transform=update.frame.transform_version,
         )
         self._planner_event(
             DecisionEvent(session, identity, "opened", view, update.frame.frame_number)
@@ -1230,7 +1274,7 @@ class StepController:
                 )
             else:
                 proposal = pending.evidence.proposed
-                found = await self._locate(update, proposal)
+                found = await self._locate(update, proposal, decision=pending)
                 here = update
             source = pending.selected_source if by == "operator" else "default"
             choice_at_submission = SubmittedChoice(
@@ -1302,6 +1346,19 @@ class StepController:
                 )
             )
 
+    def _execution_deadline(self, end: int, decision: PendingDecision | None) -> int:
+        session = self.operator.session
+        for bound in (
+            None if session is None else session.ends_at_ns,
+            None if decision is None else decision.deadline_ns,
+            None
+            if self._progress.goal is None or self._waiting_for(decision)
+            else self._progress.goal.deadline_ns,
+        ):
+            if bound is not None:
+                end = min(end, bound)
+        return end
+
     async def _issue(
         self,
         update: SceneUpdate,
@@ -1356,17 +1413,7 @@ class StepController:
         if decision is None:
             self._pacing_wait()
         started = self.clock.now_ns()
-        session = self.operator.session
-        end = started + _ns(self.config.action_valid_for)
-        for bound in (
-            None if session is None else session.ends_at_ns,
-            None if decision is None else decision.deadline_ns,
-            None
-            if self._progress.goal is None or self._waiting_for(decision)
-            else self._progress.goal.deadline_ns,
-        ):
-            if bound is not None:
-                end = min(end, bound)
+        end = self._execution_deadline(started + _ns(self.config.action_valid_for), decision)
         if end - started <= _ns(self.adapter.whitelist.press_duration):
             raise ActionRefusedError("action-window-expired")
         self._next_id += 1

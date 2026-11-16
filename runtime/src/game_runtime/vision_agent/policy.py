@@ -25,8 +25,10 @@ from game_runtime.vision_agent.effects import EffectReply
 _INSTRUCTION = (
     "Describe the screen, interactable elements and visible change in one short observation. "
     "Propose up to the requested number of safe steps using the declared inputs. Use actual OCR "
-    "text and calibrated regions when known. Points are relative to the supplied image and follow "
-    "its coordinate convention. In a choice screen propose opening a decision, with no input. "
+    "text and calibrated regions when known. For a click on part of a line, set `text` to the "
+    "complete source line, `phrase` to the exact part, and `roi` to its calibrated region. "
+    "Points are relative to the supplied image and follow its coordinate convention. In a choice "
+    "screen propose opening a decision, with no input. "
     "For decision evidence, rank its listed option indices, with no input. For a goal explicitly "
     "marked for agent judgment, report completion only when it is visible in the current image. "
     "Put that proof in goal_evidence with no steps or decision. Use only this run."
@@ -42,10 +44,13 @@ class _Target(_Reply):
     text: Annotated[str, Field(min_length=1, max_length=160)] | None = None
     roi: str | None = None
     point: tuple[float, float] | None = None
+    phrase: Annotated[str, Field(min_length=1, max_length=160)] | None = None
 
     def convert(self, adapter: Adapter, transform: ImageTransform) -> TextTarget:
         if self.roi is not None:
             adapter.roi(self.roi)
+        if self.phrase is not None:
+            return TextTarget(text=self.text, roi=self.roi, phrase=self.phrase)
         point = None if self.point is None else transform.client_point(*self.point)
         return TextTarget(self.text, self.roi, point)
 

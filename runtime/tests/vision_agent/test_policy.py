@@ -21,7 +21,14 @@ from game_runtime.models import (
 )
 from game_runtime.ocr import OcrLine
 from game_runtime.scene import SceneState, SceneUpdate, Stability, Verdict
-from game_runtime.step_control.contracts import Click, EffectKind, ExpectedEffect, Goal, PolicyInput
+from game_runtime.step_control.contracts import (
+    Click,
+    EffectKind,
+    ExpectedEffect,
+    Goal,
+    PolicyInput,
+    TextTarget,
+)
 from game_runtime.vision_agent import VisionPolicy
 
 
@@ -116,6 +123,37 @@ def test_vision_policy_maps_evidence_into_contract_and_keeps_ocr_as_data() -> No
         {"text": line.text, "client_box": list(line.box), "confidence": line.confidence}
     ]
     assert inputs.ocr[0].text not in model.instruction
+
+
+@pytest.mark.parametrize(
+    ("kind", "line", "roi", "valid"),
+    [
+        ("click", "使用钥匙开启门锁", "menu-start", True),
+        ("click", None, "menu-start", False),
+        ("click", "使用钥匙开启门锁", None, False),
+        ("click", "使用钥匙开启门锁", "no-such-roi", False),
+        ("scroll", "使用钥匙开启门锁", "menu-start", False),
+    ],
+)
+def test_vision_reply_only_accepts_phrase_clicks_with_source_line_and_roi(
+    kind: str, line: str | None, roi: str | None, valid: bool
+) -> None:
+    adapter = load_adapter(GAMES_DIR / "synthetic-game")
+    action: dict[str, object] = {
+        "kind": kind,
+        "target": {"text": line, "roi": roi, "phrase": "钥匙", "point": [0.6, 0.6]},
+    }
+    if kind == "scroll":
+        action["notches"] = 1
+    step = {**_CLICK, "action": action}
+    model = SyntheticReply(response(ScreenType.MENU, [step]))
+    plan = asyncio.run(VisionPolicy(adapter, model).propose(snapshot()))
+    if valid:
+        (proposal,) = plan.steps
+        assert proposal.action == Click(TextTarget(line, roi, phrase="钥匙"))
+    else:
+        assert plan.steps == ()
+        assert plan.report == "visual-invalid-step"
 
 
 def test_choice_observation_only_opens_decision_even_with_click_in_reply() -> None:
