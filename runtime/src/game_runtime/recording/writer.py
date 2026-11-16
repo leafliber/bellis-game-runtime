@@ -1,7 +1,8 @@
 """录制的写入方：定序帧源的接收方，加上音频块与元数据。
 
 格式见 `docs/modules/offline-tools.md` 的“样本格式”。帧的编码在线程池里并行，索引按接纳的顺序写；
-在途的帧至多为线程数的两倍，再多就让定序帧源等着（接纳帧率随之降下来）。只在事件循环的线程里调用。
+在途的帧至多为线程数的两倍，再多就让定序帧源等着（接纳帧率随之降下来）。帧索引和收尾在工作线程
+写盘，实时录制也在工作线程调用同步的音频写入。
 """
 
 import asyncio
@@ -13,8 +14,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import IO, Final
 
+from game_runtime._threads import in_thread
 from game_runtime.audio_ring import AudioRead
 from game_runtime.frame_ring import RingFrame
 from game_runtime.recording.annotations import Annotations, save_annotations
@@ -119,7 +122,11 @@ class RecordingWriter:
         self._frames = FramesInfo()
         self._audio = meta.audio
         self._last_block: int | None = None
-        self._failure: BaseException | None = None
+        self._frame_lock = asyncio.Lock()
+        self._audio_lock = Lock()
+        self._frame_failure: BaseException | None = None
+        self._file_failure: Exception | None = None
+        self._closing = False
         self._finished = False
 
     @classmethod
@@ -177,16 +184,25 @@ class RecordingWriter:
 
     @property
     def failure(self) -> BaseException | None:
-        return self._failure
+        return self._frame_failure or self._file_failure
+
+    def _check_writable(self) -> None:
+        failure = self.failure
+        if failure is not None:
+            raise failure
+        if self._closing:
+            raise RuntimeError("录制已收尾")
 
     # 帧
 
     async def write_frame(self, frame: RingFrame) -> None:
         """定序帧源的接收方：按顺序计划这一帧的编码，交给线程池；在途的帧太多时等最旧的写完。"""
-        if self._failure is not None:
-            raise self._failure
-        if self._finished:
-            raise RuntimeError("录制已收尾")
+        async with self._frame_lock:
+            self._check_writable()
+            self._queue_frame(frame)
+            await self._drain(self._max_pending)
+
+    def _queue_frame(self, frame: RingFrame) -> None:
         pixels = packed_pixels(frame)
         previous = self._previous
         if previous is None or (previous[0].width, previous[0].height) != (
@@ -217,7 +233,6 @@ class RecordingWriter:
             future = loop.run_in_executor(self._executor, work)
         self._pending.append((_Planned(frame, encoding), future))
         self._previous = (frame, pixels)
-        await self._drain(self._max_pending)
 
     def _encode(
         self, frame: RingFrame, encoding: Encoding, pixels: bytes, previous: bytes | None
@@ -238,8 +253,10 @@ class RecordingWriter:
     async def _drain(self, limit: int) -> None:
         """按顺序把编码完的帧写进索引，直到在途的不超过 `limit` 且最旧的一帧还没编码完。
 
-        等的是线程池的结果，被取消时这一帧留在在途里，收尾时照样写进索引。
+        等编码时取消则保留这一帧。开始写索引后，等这次写完再取消，收尾时从下一帧继续。
         """
+        if self._frame_failure is not None:
+            raise self._frame_failure
         while self._pending and (len(self._pending) > limit or self._pending[0][1].done()):
             planned, future = self._pending[0]
             try:
@@ -247,45 +264,61 @@ class RecordingWriter:
             except asyncio.CancelledError:
                 raise
             except BaseException as error:
-                self._failure = error
+                self._frame_failure = error
                 raise
-            self._pending.popleft()
-            self._index(planned.frame, encoded)
+            try:
+                await in_thread(functools.partial(self._index, planned.frame, encoded))
+            except Exception as error:
+                self._frame_failure = error
+                raise
+            finally:
+                self._pending.popleft()
 
     def _index(self, frame: RingFrame, encoded: _Encoded) -> None:
-        crc = encoded.crc32 if encoded.crc32 is not None else self._last_crc
-        if crc is None:
-            raise RuntimeError("第一帧不能是 same")
-        entry = FrameEntry(
-            frame_number=frame.frame_number,
-            capture_ns=frame.capture_ns,
-            transform_version=frame.transform_version,
-            width=frame.width,
-            height=frame.height,
-            encoding=encoded.encoding,
-            file=encoded.file,
-            crc32=crc,
-        )
-        self._frames_index.write(entry.model_dump_json() + "\n")
-        self._frames_index.flush()
+        try:
+            crc = encoded.crc32 if encoded.crc32 is not None else self._last_crc
+            if crc is None:
+                raise RuntimeError("第一帧不能是 same")
+            entry = FrameEntry(
+                frame_number=frame.frame_number,
+                capture_ns=frame.capture_ns,
+                transform_version=frame.transform_version,
+                width=frame.width,
+                height=frame.height,
+                encoding=encoded.encoding,
+                file=encoded.file,
+                crc32=crc,
+            )
+            info = self._frames
+            frames = info.model_copy(
+                update={
+                    "count": info.count + 1,
+                    "keyframes": info.keyframes + (encoded.encoding == "png"),
+                    "bytes": info.bytes + encoded.size,
+                    "first_capture_ns": (
+                        frame.capture_ns if info.first_capture_ns is None else info.first_capture_ns
+                    ),
+                    "last_capture_ns": frame.capture_ns,
+                }
+            )
+            self._frames_index.write(entry.model_dump_json() + "\n")
+            self._frames_index.flush()
+        except Exception as error:
+            # 即使等这个写入的任务被取消，收尾仍需知道索引写入失败，不能再追加后续差分帧。
+            self._frame_failure = error
+            raise
         self._last_crc = crc
-        info = self._frames
-        self._frames = info.model_copy(
-            update={
-                "count": info.count + 1,
-                "keyframes": info.keyframes + (encoded.encoding == "png"),
-                "bytes": info.bytes + encoded.size,
-                "first_capture_ns": (
-                    frame.capture_ns if info.first_capture_ns is None else info.first_capture_ns
-                ),
-                "last_capture_ns": frame.capture_ns,
-            }
-        )
+        self._frames = frames
 
     # 声音
 
     def write_audio(self, read: AudioRead) -> None:
-        """按块号顺序追加块；块号有空缺时计数。格式须与开始录制时给的相同。"""
+        """同步追加音频块，按块号写并计空缺。实时录制须在工作线程调用。"""
+        with self._audio_lock:
+            self._check_writable()
+            self._append_audio(read)
+
+    def _append_audio(self, read: AudioRead) -> None:
         audio = self._audio
         index, samples = self._audio_index, self._audio_samples
         if audio is None or index is None or samples is None:
@@ -297,36 +330,43 @@ class RecordingWriter:
             )
         blocks, gaps, size = audio.blocks, audio.gaps, audio.bytes
         first, last = audio.first_capture_ns, audio.last_capture_ns
-        for block in read.blocks:
-            if self._last_block is not None and block.block_number <= self._last_block:
-                continue  # 已经写过
-            if self._last_block is not None and block.block_number != self._last_block + 1:
-                gaps += 1
-            entry = AudioEntry(
-                block_number=block.block_number,
-                capture_ns=block.capture_ns,
-                sample_count=block.sample_count,
-                discontinuity=block.discontinuity,
-                offset=size,
+        last_block = self._last_block
+        try:
+            for block in read.blocks:
+                if last_block is not None and block.block_number <= last_block:
+                    continue  # 已经写过
+                if last_block is not None and block.block_number != last_block + 1:
+                    gaps += 1
+                entry = AudioEntry(
+                    block_number=block.block_number,
+                    capture_ns=block.capture_ns,
+                    sample_count=block.sample_count,
+                    discontinuity=block.discontinuity,
+                    offset=size,
+                )
+                samples.write(block.samples)
+                index.write(entry.model_dump_json() + "\n")
+                blocks += 1
+                size += len(block.samples)
+                first = block.capture_ns if first is None else first
+                last = block.capture_ns
+                last_block = block.block_number
+            updated = audio.model_copy(
+                update={
+                    "blocks": blocks,
+                    "gaps": gaps,
+                    "bytes": size,
+                    "first_capture_ns": first,
+                    "last_capture_ns": last,
+                }
             )
-            samples.write(block.samples)
-            index.write(entry.model_dump_json() + "\n")
-            blocks += 1
-            size += len(block.samples)
-            first = block.capture_ns if first is None else first
-            last = block.capture_ns
-            self._last_block = block.block_number
-        samples.flush()
-        index.flush()
-        self._audio = audio.model_copy(
-            update={
-                "blocks": blocks,
-                "gaps": gaps,
-                "bytes": size,
-                "first_capture_ns": first,
-                "last_capture_ns": last,
-            }
-        )
+            samples.flush()
+            index.flush()
+        except Exception as error:
+            self._file_failure = error
+            raise
+        self._audio = updated
+        self._last_block = last_block
 
     @property
     def last_block(self) -> int:
@@ -340,37 +380,54 @@ class RecordingWriter:
     ) -> RecordingMeta:
         """写完在途的帧，关闭文件，把元数据改写为 `complete`（写入出过错为 `failed`）。
 
-        可以重复调用，之后的调用只返回元数据。
+        开始收尾后拒绝新的写入。可以重复调用，完成后的调用只返回元数据。
         """
-        if self._finished:
-            return self._meta
-        try:
-            await self._drain(0)
-        except asyncio.CancelledError:
-            raise
-        except BaseException as error:
-            logger.error("录制 %s 写帧失败：%s", self.path, error)
-            # 出错的那一帧之后的不进索引：等它们做完，免得线程池还在往目录里写。
-            for _, future in self._pending:
-                await asyncio.wait((future,))
-                if not future.cancelled():
-                    future.exception()  # 取走，免得事件循环报告没人取的异常
-            self._pending.clear()
+        self._closing = True
+        async with self._frame_lock:
+            if self._finished:
+                return self._meta
+            try:
+                await self._drain(0)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                logger.error("录制 %s 写帧失败：%s", self.path, error)
+                # 出错的那一帧之后的不进索引：等编码做完，免得线程池还在往目录里写。
+                for _, future in self._pending:
+                    await asyncio.wait((future,))
+                    if not future.cancelled():
+                        future.exception()
+                self._pending.clear()
+            return await in_thread(
+                functools.partial(self._finish_files, stop_reason, reader_overflows, state)
+            )
+
+    def _finish_files(
+        self, stop_reason: str, reader_overflows: int, state: State | None
+    ) -> RecordingMeta:
         self._executor.shutdown(wait=True)
-        self._frames_index.close()
-        if self._audio_index is not None:
-            self._audio_index.close()
-        if self._audio_samples is not None:
-            self._audio_samples.close()
-        final: State = state or ("failed" if self._failure is not None else "complete")
-        self._meta = self.meta.model_copy(
-            update={
-                "state": final,
-                "ended_at": datetime.now(UTC).replace(microsecond=0),
-                "stop_reason": stop_reason,
-                "reader_overflows": reader_overflows,
-            }
-        )
-        write_meta(self.path, self._meta)
-        self._finished = True
-        return self._meta
+        with self._audio_lock:
+            for file in (self._frames_index, self._audio_index, self._audio_samples):
+                if file is not None:
+                    try:
+                        file.close()
+                    except OSError as error:
+                        self._file_failure = self._file_failure or error
+                        logger.error("录制 %s 关闭文件失败：%s", self.path, error)
+            final: State = "failed" if self.failure is not None else state or "complete"
+            meta = self.meta.model_copy(
+                update={
+                    "state": final,
+                    "ended_at": datetime.now(UTC).replace(microsecond=0),
+                    "stop_reason": stop_reason,
+                    "reader_overflows": reader_overflows,
+                }
+            )
+            try:
+                write_meta(self.path, meta)
+            except OSError as error:
+                self._file_failure = self._file_failure or error
+                raise
+            self._meta = meta
+            self._finished = True
+            return meta

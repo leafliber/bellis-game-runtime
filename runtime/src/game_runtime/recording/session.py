@@ -6,8 +6,8 @@
 """
 
 import asyncio
-import contextlib
 import dataclasses
+import functools
 import logging
 import shutil
 from collections.abc import Callable, Sequence
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Final
 
 from core_protocol.models import CaptureState
+from game_runtime._threads import in_thread
 from game_runtime.adapter import Adapter
 from game_runtime.audio_ring import AudioRingTornError
 from game_runtime.core_link import (
@@ -49,6 +50,30 @@ from game_runtime.recording.results import ResultsHub
 from game_runtime.recording.writer import RecordingWriter, WriterOptions
 
 logger = logging.getLogger(__name__)
+
+
+async def _wait_cleanup[T](task: asyncio.Task[T]) -> T:
+    """调用方被取消时，仍等会话释放资源，再交出取消。"""
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.wait((task,))
+            except asyncio.CancelledError:
+                continue
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("实时运行收尾失败", exc_info=error)
+        raise
+
+
+async def _wait_start_cleanup[T](task: asyncio.Task[T]) -> None:
+    """记录启动清理的错误，由调用方继续抛出启动异常。"""
+    try:
+        await _wait_cleanup(task)
+    except Exception:
+        logger.exception("实时运行启动清理出错")
+
 
 DRAIN_TIMEOUT: Final = 30.0
 """停止时等读者处理完已接纳的帧、剧情记录处理完积压的更新的时限（秒）。"""
@@ -159,6 +184,7 @@ class LiveSession:
         self._kernel: Kernel | None = None
         self._writer: RecordingWriter | None = None
         self._audio_task: asyncio.Task[None] | None = None
+        self._stop_task: asyncio.Task[SessionResult] | None = None
         self._readers = 0
         self._hub = ResultsHub()
 
@@ -195,11 +221,18 @@ class LiveSession:
     async def start(self) -> None:
         """拉起实时核并挂接两个环、建录制目录、激活插件，然后开始接纳与录声音。
 
-        实时核起不来抛 `CoreStartError`。录制时插件没有全部激活抛 RuntimeError，删掉已建的录制目录；
-        不录制时照样开始，没激活的由 `snapshot` 给出。
+        实时核起不来抛 `CoreStartError`。录制时插件没有全部激活抛 RuntimeError，尝试清理已建的
+        零帧录制目录；不录制时照样开始，没激活的由 `snapshot` 给出。
         """
         options = self.options
-        await self.link.start()
+        try:
+            await self.link.start()
+        except asyncio.CancelledError:
+            # 连接和环可能已经建立，插件与录制还没启动。
+            await _wait_start_cleanup(
+                asyncio.create_task(self.link.stop(), name="停止未就绪实时核")
+            )
+            raise
         try:
             ring = self.link.frames
             if ring is None:
@@ -242,7 +275,7 @@ class LiveSession:
                 raise RuntimeError(f"插件没有全部激活：{reasons}")
             frames.start()
         except BaseException:
-            await self._abort()
+            await _wait_start_cleanup(asyncio.create_task(self._abort(), name="中止录制启动"))
             raise
 
     def _recording_entries(self) -> list[ResolvedEntry]:
@@ -304,22 +337,43 @@ class LiveSession:
                 except AudioRingTornError:
                     read = None
                 if read is not None and read.blocks:
-                    writer.write_audio(read)
+                    await in_thread(functools.partial(writer.write_audio, read))
             await asyncio.sleep(AUDIO_POLL_INTERVAL)
 
+    async def _stop_audio(self) -> BaseException | None:
+        task = self._audio_task
+        if task is None:
+            return None
+        task.cancel()
+        # 写盘已开始时 in_thread 会等工作线程做完，再结束音频任务。
+        await asyncio.wait((task,))
+        return None if task.cancelled() else task.exception()
+
     async def _abort(self) -> None:
-        """启动失败时收拾：停内核、停录声音、停实时核；已建的录制目录还没有任何帧，删掉它。"""
+        """启动失败时停帧源、内核、录音与实时核，再尝试清理零帧录制。"""
+        frames = self._frames
+        if frames is not None:
+            await frames.close()
         if self._kernel is not None:
             await self._kernel.shutdown()
-        if self._audio_task is not None:
-            self._audio_task.cancel()
-            await asyncio.wait((self._audio_task,))
+        await self._stop_audio()
         await self.link.stop()
         writer = self._writer
-        if writer is not None:
+        if writer is None:
+            return
+        keep_recording = (
+            writer.meta.frames.count > 0
+            or writer.pending > 0
+            or (frames is not None and frames.stats.admitted > 0)
+        )
+        try:
             await writer.finish(stop_reason="error", state="failed")
-            if writer.meta.frames.count == 0:
-                await asyncio.to_thread(shutil.rmtree, writer.path, True)
+        finally:
+            if not keep_recording:
+                try:
+                    await in_thread(functools.partial(shutil.rmtree, writer.path))
+                except OSError:
+                    logger.exception("启动中止后未能清理零帧录制目录 %s", writer.path)
 
     def status(self) -> SessionStatus:
         health = self.link.last_health
@@ -349,6 +403,12 @@ class LiveSession:
         """按顺序收尾：关闭定序帧源 → 等读者处理完已接纳的帧、剧情记录处理完积压的更新（各至多
         `drain_timeout`）→ 停插件内核 → 停录声音 → 按 R-06 停实时核 → 写完在途的编码、索引
         与元数据。不录制时没有录声音与写录制两步。"""
+        task = self._stop_task
+        if task is None or task.done():
+            task = self._stop_task = asyncio.create_task(self._stop(reason), name="实时运行收尾")
+        return await _wait_cleanup(task)
+
+    async def _stop(self, reason: str) -> SessionResult:
         frames = self.frames
         writer = self._writer
         await frames.close()
@@ -363,13 +423,7 @@ class LiveSession:
             logger.warning("%g 秒内插件没有处理完已接纳的帧，实时输出不完整", timeout)
         if self._kernel is not None:
             await self._kernel.shutdown()
-        audio_failure: BaseException | None = None
-        if self._audio_task is not None:
-            self._audio_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.wait((self._audio_task,))
-            if not self._audio_task.cancelled():
-                audio_failure = self._audio_task.exception()
+        audio_failure = await self._stop_audio()
         core = await self.link.stop()
         failure = frames.failure or audio_failure
         if failure is not None:
