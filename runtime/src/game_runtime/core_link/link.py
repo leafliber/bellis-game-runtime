@@ -32,7 +32,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ValidationError
 
@@ -90,6 +90,9 @@ from game_runtime.core_link.process import ManagedProcess, StopResult, StopStage
 from game_runtime.core_link.process import base_environment as _base_environment
 from game_runtime.frame_ring import FrameRing
 from game_runtime.kernel import ControlGrant, Kernel, Submission
+
+if TYPE_CHECKING:
+    from game_runtime.game_bridge.attempts import AttemptHandler
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +203,8 @@ class CoreLinkOptions:
     """GR-35 自动重启，缺省退避 1、2、4 秒；`None` 时不自动重启（宿主自己 `start`，只用于自己驱动
     重启的测试）。"""
     bellis: BellisCoreOptions | None = None
+    fake_verify_release: bool = False
+    """只在带隔离 Bellis 会话文件的假设备测试中启用显式释放核验。"""
 
     def __post_init__(self) -> None:
         timeouts = (
@@ -231,6 +236,13 @@ class CoreLinkOptions:
                 raise ValueError("真实输入后端不能同时给测试设备的凭据")
         elif self.emergency_hotkey is not None:
             raise ValueError("急停组合键只与真实输入后端一起给出")
+        if self.fake_verify_release and (
+            self.real_input
+            or self.test_device is None
+            or self.bellis is None
+            or self.bellis.test_session_file is None
+        ):
+            raise ValueError("假设备释放核验需要假输入设备和隔离的 Bellis 测试会话")
 
     def argv(self) -> list[str]:
         """拉起实时核的参数列表。"""
@@ -251,6 +263,8 @@ class CoreLinkOptions:
             argv += ["--input-backend", "fake"]
         if self.bellis is not None:
             argv += ["--bellis-control", self.bellis.runtime_id]
+        if self.fake_verify_release:
+            argv.append("--fake-verify-release")
         return argv
 
     def child_env(self) -> dict[str, str]:
@@ -351,6 +365,7 @@ class _Instance:
     closing: asyncio.Task[None] | None = None
     release_failure: str | None = None
     startup_release_id: int | None = None
+    latest_release: InputReleasedParams | None = None
     latest_verification: InputVerificationParams | None = None
     verification_changed: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -402,6 +417,8 @@ class CoreLink:
         """运行中的实例最近一次心跳的代次。"""
         self._block_seq = 0
         """动作块序号，在主进程运行期间全局递增，因而在每个代次内严格递增。"""
+        self._last_action_request_ns = 0
+        self._attempts: AttemptHandler | None = None
         self._submissions: dict[tuple[int, int], _Submission] = {}
         """还在等回应或回执的动作块，按（代次，序号）索引。"""
         self._last_health: CoreHealthParams | None = None
@@ -416,6 +433,11 @@ class CoreLink:
     def bind_control(self, source: Callable[[], ControlGrant | None]) -> None:
         """给出当前的提交资格，通常是 `lambda: kernel.active_control`。资格有效时才发心跳。"""
         self._grant_source = source
+
+    def bind_attempts(self, attempts: "AttemptHandler") -> None:
+        if self._instance is not None or self._attempts is not None:
+            raise RuntimeError("动作账目须在启动实时核前唯一绑定")
+        self._attempts = attempts
 
     # 状态
 
@@ -436,6 +458,36 @@ class CoreLink:
     @property
     def last_health(self) -> CoreHealthParams | None:
         return self._last_health
+
+    def has_verified_release(self, *, after_ns: int = 0) -> bool:
+        """同一核实例最新释放回执与核验须配对，且覆盖最近一次可能写出的动作。"""
+        if not self._requires_release_verification:
+            return False
+        instance = self._instance
+        if (
+            instance is None
+            or instance.release_failure is not None
+            or instance.peer is None
+            or not instance.peer.connection.is_open
+        ):
+            return False
+        release, verification = instance.latest_release, instance.latest_verification
+        return (
+            release is not None
+            and verification is not None
+            and release.release_id == verification.release_id
+            and release.verification is not ReleaseVerification.UP_FAILED
+            and verification.result is VerificationResult.VERIFIED
+            and release.released_at_ns > self._last_action_request_ns
+            and after_ns
+            <= release.released_at_ns
+            <= verification.checked_at_ns
+            <= time.perf_counter_ns()
+        )
+
+    @property
+    def _requires_release_verification(self) -> bool:
+        return self._options.real_input or self._options.fake_verify_release
 
     @property
     def frames(self) -> FrameRing | None:
@@ -730,15 +782,22 @@ class CoreLink:
         if instance is not None and instance.release_failure is not None:
             raise ChannelError("closed", instance.release_failure)
         peer = None if instance is None else instance.peer
-        if peer is None or not peer.connection.is_open:
+        if instance is None or peer is None or not peer.connection.is_open:
             raise ChannelError("closed", "核连接未建立，无法提交动作块")
         if self._heartbeat_generation != grant.generation:
             self._send_heartbeat(peer, grant)
         self._block_seq += 1
         start_ns = time.perf_counter_ns() + _nanos(start_delay)
         deadline_ns = start_ns + _nanos(valid_for)
-        if self._action_deadline is not None:
-            inclusive_bound = self._action_deadline()
+        attempts = self._attempts
+        if attempts is not None or self._action_deadline is not None:
+            inclusive_bound = (
+                attempts.submit_deadline(grant)
+                if attempts is not None
+                else self._action_deadline()
+                if self._action_deadline is not None
+                else None
+            )
             if inclusive_bound is None or inclusive_bound <= start_ns:
                 raise ActionDeadlineError("动作的绝对截止时刻已到")
             deadline_ns = min(deadline_ns, inclusive_bound)
@@ -750,16 +809,39 @@ class CoreLink:
             deadline_ns=deadline_ns,
             steps=list(steps),
         )
+        correlation = (
+            None
+            if attempts is None
+            else await attempts.bind_before_write(grant, instance.number, block)
+        )
+        payload = _dump(block)
         submission = _Submission(block, asyncio.get_running_loop().create_future())
         key = (grant.generation, block.seq)
         # 回执可能先于回应到达：先登记再发。
         self._submissions[key] = submission
         try:
+            if correlation is not None and attempts is not None:
+                if (
+                    self._instance is not instance
+                    or instance.peer is not peer
+                    or not peer.connection.is_open
+                    or instance.release_failure is not None
+                    or self._stopping
+                ):
+                    raise ChannelError("closed", "原核连接已失效")
+                attempts.recheck_before_write(correlation)
+                if time.perf_counter_ns() >= block.deadline_ns:
+                    raise ActionDeadlineError("动作的绝对截止时刻已到")
             grant.check()
+            if correlation is not None and attempts is not None:
+                attempts.begin_request(correlation)
+            self._last_action_request_ns = time.perf_counter_ns()
             reply = await peer.request(
-                ACTION_SUBMIT.name, _dump(block), timeout=self._options.rpc_timeout
+                ACTION_SUBMIT.name, payload, timeout=self._options.rpc_timeout
             )
             result = models.ActionSubmitResult.model_validate(reply).root
+            if correlation is not None and attempts is not None:
+                attempts.submit_result(correlation, result)
         except BaseException as error:
             self._submissions.pop(key, None)
             submission.fail(error)
@@ -778,13 +860,17 @@ class CoreLink:
             self._submissions.pop(key, None)
         return submission
 
-    def _on_receipt_message(self, params: dict[str, Any]) -> None:
+    def _on_receipt_message(self, instance: _Instance, params: dict[str, Any]) -> None:
         receipt = _parse(models.ActionReceiptParams, ACTION_RECEIPT.name, params)
-        if receipt is None:
+        if receipt is None or instance.hello_at_ns is None:
+            return
+        if self._attempts is not None:
+            self._attempts.action_receipt(instance.number, receipt)
+        if self._instance is not instance:
             return
         key = (receipt.producer.generation, receipt.block_seq)
         submission = self._submissions.get(key)
-        if submission is None:
+        if submission is None or submission.block.producer != receipt.producer:
             logger.debug("收到不认识的动作块的回执：%s", key)
             return
         submission.record(receipt.outcomes)
@@ -823,7 +909,7 @@ class CoreLink:
                 return
             if self._instance is not instance or instance.release_failure is not None:
                 return
-            if not self._options.real_input:
+            if not self._requires_release_verification:
                 self._release_through(generation)
                 return
             release_id = revoked.release_id
@@ -868,7 +954,9 @@ class CoreLink:
             INPUT_RELEASED.name, lambda params: self._on_released_message(instance, params)
         )
         peer.on_notification(CORE_HEALTH.name, lambda params: self._on_health_message(params))
-        peer.on_notification(ACTION_RECEIPT.name, self._on_receipt_message)
+        peer.on_notification(
+            ACTION_RECEIPT.name, lambda params: self._on_receipt_message(instance, params)
+        )
         peer.on_notification(
             INPUT_RESIDUAL.name, lambda params: self._on_residual_message(instance, params)
         )
@@ -877,9 +965,13 @@ class CoreLink:
             lambda params: self._on_verification_message(instance, params),
         )
         instance.peer = peer
-        peer.closed.add_done_callback(
-            lambda _: logger.info("实时核 %d 的核连接已断开", instance.number)
-        )
+
+        def closed(_: asyncio.Task[ChannelError | None]) -> None:
+            logger.info("实时核 %d 的核连接已断开", instance.number)
+            if self._attempts is not None:
+                self._attempts.transport_lost(instance.number)
+
+        peer.closed.add_done_callback(closed)
 
     def _on_hello(self, instance: _Instance, peer: RpcPeer, params: dict[str, Any]) -> object:
         if instance.hello_at_ns is not None:
@@ -921,11 +1013,16 @@ class CoreLink:
         )
         if released.verification is ReleaseVerification.UP_FAILED:
             self._fail_release(instance, released.release_id, "系统拒绝抬起")
+        if (
+            instance.latest_release is None
+            or released.release_id > instance.latest_release.release_id
+        ):
+            instance.latest_release = released
         if released.reason is ReleaseReason.CORE_START and not instance.ready.done():
             instance.startup_release_id = released.release_id
             if instance.release_failure is None:
                 instance.ready_at_ns = time.perf_counter_ns()
-                if not self._options.real_input:
+                if not self._requires_release_verification:
                     self._release_through(None)
             instance.ready.set_result(None)
         if self._on_released is not None:

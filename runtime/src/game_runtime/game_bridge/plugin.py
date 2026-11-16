@@ -5,11 +5,10 @@ import logging
 from collections.abc import Awaitable, Callable
 
 from game_runtime.adapter import GAME_ADAPTER
-from game_runtime.channel import ChannelError, RpcPeer, connect
+from game_runtime.channel import ChannelError, connect
 from game_runtime.core_link import CoreLink
 from game_runtime.game_bridge.projection import Projection
 from game_runtime.game_bridge.session import BellisSession
-from game_runtime.game_bridge.wire import decode_request
 from game_runtime.kernel import Manifest, NoConfig, Plugin, PluginContext, Tier
 from game_runtime.narrative import NARRATIVE
 from game_runtime.scene import SCENE
@@ -30,14 +29,15 @@ async def _run(session: BellisSession, select: Callable[[bool], Awaitable[None]]
             cleanup: tuple[Callable[[], None], ...] = ()
             try:
                 conn = await connect(credentials.path, ROLE, credentials.key)
-                peer = RpcPeer(conn, timeout=2.0, json_decoder=decode_request)
-                cleanup = session.attach(peer)
+                peer, cleanup = session.open_peer(conn)
                 selected = False
                 while not peer.closed.done() and session.same_session():
                     if session.live:
-                        if not selected:
-                            await select(True)
-                            selected = True
+                        await session.refresh_ledger()
+                        wanted = session.can_select_control
+                        if selected != wanted:
+                            await select(wanted)
+                            selected = wanted
                         session.tick()
                         session.publish_point()
                         session.notify("health.reported", session.health())

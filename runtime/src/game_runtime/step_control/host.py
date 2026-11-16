@@ -70,6 +70,7 @@ from game_runtime.telemetry.plugin import telemetry_plugin_for
 from game_runtime.voice_activity import VoiceActivityPlugin
 
 if TYPE_CHECKING:
+    from game_runtime.game_bridge.attempts import AttemptHandler
     from game_runtime.game_bridge.session import BellisConfig
 
 logger = logging.getLogger(__name__)
@@ -336,7 +337,10 @@ async def supervise(
         raise ValueError("许可源由监督启动器选择，操作员与 Bellis 只能选一个")
     client = None
     semantic = None
+    attempts: AttemptHandler | None = None
     bellis_control = None
+    core: CoreLink | None = None
+    capture = link_options.capture or capture_config(adapter)
     session: PlaySession
     if bellis is None:
         client = OperatorClient(
@@ -348,27 +352,82 @@ async def supervise(
         )
         session = client
     else:
+        from game_runtime.game_bridge.attempts import AttemptHandler as BridgeAttempts
         from game_runtime.game_bridge.session import BellisSession, read_bellis_session
+        from game_runtime.game_bridge.task_ledger import TaskLedger
 
         info = read_bellis_session(bellis.session_store)
         if info is None:
             raise RuntimeError("未找到 Bellis 本次会话")
         runtime_id = uuid4().hex
         bellis_control = BellisCoreOptions(info.session_id, runtime_id, bellis.test_session_file)
-        semantic = BellisSession(bellis, info, runtime_id, adapter, clock, signals)
+        authority = bellis.task_authority
+        ledger = None
+        if authority is not None:
+            if (
+                real_input
+                or link_options.real_input
+                or link_options.test_device is None
+                or bellis.test_session_file is None
+            ):
+                raise ValueError("GR-38 任务授权目前只供隔离假设备验收")
+            if authority.adapter_id != adapter.id:
+                raise ValueError("任务授权配置的适配包与选定游戏不匹配")
+            if capture.target.type != "fake" and capture.target != adapter.window_rule():
+                raise ValueError("任务授权的采集目标须匹配选定游戏的窗口规则")
+            ledger = await in_thread(
+                partial(
+                    TaskLedger.start,
+                    authority.ledger_path,
+                    authority.control_target_id,
+                    clock_ns=clock.now_ns,
+                )
+            )
+
+        def release_verified(after_ns: int) -> bool:
+            return core is not None and core.has_verified_release(after_ns=after_ns)
+
+        semantic = BellisSession(
+            bellis,
+            info,
+            runtime_id,
+            adapter,
+            clock,
+            signals,
+            ledger=ledger,
+            release_verified=release_verified,
+        )
+        if ledger is not None:
+            attempts = BridgeAttempts(
+                ledger,
+                clock.now_ns,
+                semantic.admission,
+                semantic.task_for_attempt,
+                semantic.attempt_recorded,
+                semantic.ledger_fault,
+                runtime_id=runtime_id,
+            )
+            semantic.attempts = attempts
         session = semantic
 
     def released(message: InputReleasedParams) -> None:
         if semantic is not None and message.reason in _SEMANTIC_RELEASES:
             semantic.suspend(manual=message.reason in _MANUAL_RELEASES)
         signals.released(message)
+        if attempts is not None and (
+            message.reason in _MANUAL_RELEASES
+            or message.reason
+            in (ReleaseReason.CORE_START, ReleaseReason.FRAME_STALE, ReleaseReason.STOP)
+        ):
+            attempts.invalidate_evidence(message.reason.value)
 
     def restarted(attempt: int) -> None:
         if semantic is not None:
             semantic.suspend()
         signals.restart(attempt)
+        if attempts is not None:
+            attempts.invalidate_evidence("core-restarted")
 
-    core: CoreLink | None = None
     kernel: Kernel | None = None
     frames: SequencedFrameSource | None = None
     preparing: asyncio.Task[tuple[RecordingWriter, QuotaKeeper]] | None = None
@@ -393,6 +452,8 @@ async def supervise(
                 await asyncio.gather(*tasks, return_exceptions=True)
 
     async def stop_runtime() -> None:
+        if attempts is not None:
+            attempts.invalidate_evidence("runtime-stopping")
         try:
             if kernel is not None:
                 await kernel.shutdown()
@@ -400,19 +461,24 @@ async def supervise(
             try:
                 await stop_capture()
             finally:
-                if core is not None:
-                    stopped = await core.stop()
-                    if recorder is not None:
-                        if stopped.returncode is None:
-                            recorder.fail(RuntimeError("未确认实时核退出"))
-                        elif stopped.returncode != 0 or stopped.stage is StopStage.KILLED:
-                            detail = f"{stopped.stage}，退出码 {stopped.returncode}"
-                            recorder.fail(RuntimeError(f"实时核异常退出（{detail}）"))
-                    if telemetry is not None and (
-                        stopped.returncode is not None or stopped.stage is StopStage.ALREADY_EXITED
-                    ):
-                        with suppress(Exception):
-                            await telemetry.aclose()
+                try:
+                    if core is not None:
+                        stopped = await core.stop()
+                        if recorder is not None:
+                            if stopped.returncode is None:
+                                recorder.fail(RuntimeError("未确认实时核退出"))
+                            elif stopped.returncode != 0 or stopped.stage is StopStage.KILLED:
+                                detail = f"{stopped.stage}，退出码 {stopped.returncode}"
+                                recorder.fail(RuntimeError(f"实时核异常退出（{detail}）"))
+                        if telemetry is not None and (
+                            stopped.returncode is not None
+                            or stopped.stage is StopStage.ALREADY_EXITED
+                        ):
+                            with suppress(Exception):
+                                await telemetry.aclose()
+                finally:
+                    if attempts is not None:
+                        await attempts.close()
 
     async def finish_recording(reason: str) -> None:
         if preparing is None:
@@ -500,10 +566,11 @@ async def supervise(
             link_options,
             operator=None if client is None else client.credentials,
             bellis=bellis_control,
-            capture=link_options.capture or capture_config(adapter),
+            capture=capture,
             audio=audio,
             real_input=real_input,
             input_policy=adapter.input_policy(),
+            fake_verify_release=bellis is not None and bellis.fake_verify_release,
         )
         factory = core_factory or CoreLink
         if semantic is not None:
@@ -514,6 +581,8 @@ async def supervise(
             on_released=released,
             on_restart=restarted,
         )
+        if attempts is not None:
+            runtime.bind_attempts(attempts)
         await runtime.start()
         ring = runtime.frames
         if ring is None:
@@ -579,7 +648,7 @@ async def supervise(
                     _record_audio(runtime, recorder), name="监督录音读环"
                 )
         control_kernel.add(entries)
-        await control_kernel.set_control_producer(producer)
+        await control_kernel.set_control_producer(producer if attempts is None else None)
         if not control_open():
             raise RuntimeError("监督录制在启动时中断")
         source.start()

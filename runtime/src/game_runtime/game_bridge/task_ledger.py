@@ -37,6 +37,7 @@ class Refusal(StrEnum):
     INPUT_BUDGET = "input-budget"
     ATTEMPT_OUTSTANDING = "attempt-outstanding"
     RELEASE_UNVERIFIED = "release-unverified"
+    RECEIPT_CONFLICT = "core-receipt-conflict"
 
 
 class LedgerError(RuntimeError):
@@ -217,6 +218,7 @@ class AttemptRecord:
 class LedgerStatus:
     active_task: TaskAccount | None
     outstanding: AttemptRecord | None
+    receipt_quarantined: bool = False
 
 
 _TASK_REQUEST: TypeAdapter[TaskRequest] = TypeAdapter(TaskRequest)
@@ -228,8 +230,15 @@ _EFFECT: TypeAdapter[EffectEvidence] = TypeAdapter(EffectEvidence)
 
 _LIVE = (AttemptPhase.RESERVED, AttemptPhase.AWAITING_RECEIPT, AttemptPhase.AWAITING_EFFECT)
 _OUTSTANDING = (*_LIVE, AttemptPhase.PENDING)
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _LOCK_TIMEOUT_S = 0.25
+
+_RECEIPT_QUARANTINE = """CREATE TABLE receipt_quarantine (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+    original BLOB NOT NULL,
+    contradictory BLOB NOT NULL
+)"""
 
 _SCHEMA = (
     """CREATE TABLE owner (
@@ -279,6 +288,7 @@ _SCHEMA = (
     )""",
     """CREATE UNIQUE INDEX outstanding_attempt ON attempts((1))
         WHERE phase IN ('reserved', 'awaiting-receipt', 'awaiting-effect', 'pending')""",
+    _RECEIPT_QUARANTINE,
 )
 
 
@@ -301,12 +311,16 @@ def _transaction(path: Path) -> Generator[sqlite3.Connection]:
         raise LedgerUnavailableError("SQLite 账目事务未成功") from exc
 
 
-def _owner(db: sqlite3.Connection, control_target_id: str) -> sqlite3.Row:
-    if db.execute("PRAGMA user_version").fetchone()[0] != _SCHEMA_VERSION:
+def _owner(db: sqlite3.Connection, control_target_id: str, *, upgrade: bool = False) -> sqlite3.Row:
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version != _SCHEMA_VERSION and not (upgrade and version == 1):
         raise LedgerUnavailableError("任务账目版本不受支持")
     owner = db.execute("SELECT * FROM owner WHERE singleton = 1").fetchone()
     if owner is None or owner["control_target_id"] != control_target_id:
         raise LedgerUnavailableError("任务账目与被控对象不符")
+    if version == 1:
+        db.execute(_RECEIPT_QUARANTINE)
+        db.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     return owner
 
 
@@ -358,8 +372,18 @@ def _outstanding(db: sqlite3.Connection) -> AttemptRecord | None:
 
 
 def _ensure_idle(db: sqlite3.Connection) -> None:
+    _check_receipt_quarantine(db)
     if _outstanding(db) is not None:
         raise LedgerRefusedError(Refusal.ATTEMPT_OUTSTANDING)
+
+
+def _receipt_quarantined(db: sqlite3.Connection) -> bool:
+    return db.execute("SELECT 1 FROM receipt_quarantine WHERE singleton = 1").fetchone() is not None
+
+
+def _check_receipt_quarantine(db: sqlite3.Connection) -> None:
+    if _receipt_quarantined(db):
+        raise LedgerRefusedError(Refusal.RECEIPT_CONFLICT)
 
 
 def _expire(db: sqlite3.Connection, task: TaskAccount, now_ns: int) -> TaskAccount:
@@ -454,7 +478,7 @@ class TaskLedger:
                 "INSERT INTO owner (singleton, control_target_id) VALUES (1, ?)",
                 (control_target_id,),
             )
-            db.execute("PRAGMA user_version = 1")
+            db.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     @classmethod
     def start(
@@ -464,7 +488,7 @@ class TaskLedger:
         path = path.absolute()
         epoch = uuid4().hex
         with _transaction(path) as db:
-            _owner(db, control_target_id)
+            _owner(db, control_target_id, upgrade=True)
             db.execute("UPDATE tasks SET ended = ? WHERE ended IS NULL", (TaskEnd.RESTARTED,))
             db.execute(
                 "UPDATE attempts SET phase = ?, detail = ? WHERE phase IN (?, ?, ?)",
@@ -493,6 +517,7 @@ class TaskLedger:
             return LedgerStatus(
                 task if task is not None and task.end is None else None,
                 None if attempt is None else _expire_attempt(db, attempt, now_ns),
+                _receipt_quarantined(db),
             )
 
     def get_task(self, task_id: str) -> TaskAccount | None:
@@ -510,6 +535,7 @@ class TaskLedger:
     ) -> TaskAccount:
         """已获准的新任务需要核验释放。同 ID 重送保留首次配置的预算。"""
         with self._current() as db:
+            _check_receipt_quarantine(db)
             now_ns = self._clock_ns()
             existing = _find_task(db, request.task_id)
             if existing is not None:
@@ -642,6 +668,7 @@ class TaskLedger:
         """先持久登记原核关联，再由调用方重核许可并至多写出一次。"""
         with self._current() as db:
             attempt = _known_attempt(db, attempt_id)
+            _check_receipt_quarantine(db)
             if attempt.core is not None:
                 if attempt.core != core:
                     raise LedgerConflictError("已关联其它核动作")
@@ -706,6 +733,37 @@ class TaskLedger:
             phase = _receipt_phase(attempt, receipt, now_ns)
             detail = "receipt-uncertain" if phase is AttemptPhase.PENDING else None
             return _set_phase(db, attempt_id, phase, detail)
+
+    def quarantine_conflicting_receipt(
+        self,
+        core: CoreCorrelation,
+        contradictory: CoreReceipt,
+        *,
+        observed: CoreReceipt | None = None,
+    ) -> bool:
+        """隔离确证的同关联矛盾，保留原终态和两条核事实以供审计。"""
+        with self._current() as db:
+            row = db.execute(
+                "SELECT * FROM attempts WHERE core = ?", (_CORE.dump_json(core),)
+            ).fetchone()
+            if row is None:
+                return False
+            attempt = _attempt(row)
+            original = attempt.receipt or observed
+            if original is None or original == contradictory:
+                return False
+            for receipt in (original, contradictory):
+                if not isinstance(receipt, Rejected) and receipt.id != core.action_id:
+                    raise LedgerConflictError("矛盾回执与原核关联不符")
+            db.execute(
+                """INSERT OR IGNORE INTO receipt_quarantine VALUES (1, ?, ?, ?)""",
+                (
+                    attempt.spec.attempt_id,
+                    _RECEIPT.dump_json(original),
+                    _RECEIPT.dump_json(contradictory),
+                ),
+            )
+            return True
 
     def record_effect(self, attempt_id: str, evidence: EffectEvidence) -> AttemptRecord:
         """记录原核执行后新帧的核验结果。调用方核对捕获连续性与效果语义。"""

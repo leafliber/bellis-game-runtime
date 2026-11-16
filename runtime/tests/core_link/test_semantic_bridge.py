@@ -35,7 +35,12 @@ from game_runtime.frame_ring import RingFrame
 from game_runtime.frame_ring.fake import FakeDisplay
 from game_runtime.frames import AdmissionPolicy
 from game_runtime.game_bridge.projection import voice_activity_at
-from game_runtime.game_bridge.session import SESSION_ENTRY, BellisConfig, BellisSession
+from game_runtime.game_bridge.session import (
+    SESSION_ENTRY,
+    BellisConfig,
+    BellisSession,
+    TaskAuthorityConfig,
+)
 from game_runtime.game_bridge.wire import decode_request, ms, ns, v1
 from game_runtime.kernel import Manifest, Plugin, PluginContext, ResolvedEntry, Tier
 from game_runtime.ocr import OCR, FrameLike, OcrConfig, OcrLine, OcrResult, OcrService
@@ -401,6 +406,7 @@ async def rig(
     planner: RecordingPlanner | None = None,
     telemetry: Path | None = None,
     record: bool = False,
+    task_authority: TaskAuthorityConfig | None = None,
 ) -> AsyncGenerator[Rig]:
     if sys.platform == "win32":
         folder = Path("\\\\?\\" + str(folder.resolve()))
@@ -473,7 +479,9 @@ async def rig(
                 extra_plugins=(planner_for(lambda: active_planner),),
                 extra_entries=extra_entries,
                 record=record,
-                bellis=BellisConfig(store, frozenset({"safe"}), info_file),
+                bellis=BellisConfig(
+                    store, frozenset({"safe"}), info_file, task_authority=task_authority
+                ),
             ) as run:
                 await device.until_connected()
                 yield Rig(run, frames, device, peers, store, active_planner)
