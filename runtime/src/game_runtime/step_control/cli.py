@@ -17,6 +17,8 @@ from game_runtime.kernel import ResolvedEntry, State, read_patch, read_profile, 
 from game_runtime.local_data import LocalDataError
 from game_runtime.operator import OperatorError
 from game_runtime.recording.cli import build_realtime_core, data_dir_option, setup_output
+from game_runtime.recording.layout import check_name
+from game_runtime.recording.retention import QuotaRefusedError
 from game_runtime.secret_store import CredentialManagerStore, SecretStore, SecretStoreError
 from game_runtime.step_control.host import supervise
 from game_runtime.telemetry import TelemetryConfig, TelemetryPlugin
@@ -46,6 +48,8 @@ async def _run(
     *,
     real_input: bool,
     bellis: BellisConfig | None = None,
+    record: bool = False,
+    name: str | None = None,
 ) -> int:
     async with supervise(
         game,
@@ -56,6 +60,8 @@ async def _run(
         real_input=real_input,
         profile=entries,
         bellis=bellis,
+        record=record,
+        name=name,
     ) as run:
         for entry in run.kernel.snapshot():
             if entry.enabled and entry.state is not State.ACTIVE:
@@ -70,8 +76,15 @@ async def _run(
             print("已连接操作员控制台，输入许可由控制台管理。", flush=True)
         else:
             print("已启动 Bellis 语义桥，输入许可由实时核直连 Bellis 取得。", flush=True)
+        if run.recording_path is not None:
+            print(f"本地录制目录 {run.recording_path}", flush=True)
         await run.wait_ended()
-        return 0
+    if (meta := run.recording_meta) is not None:
+        reason = meta.stop_reason or "未封存"
+        print(f"录制 {meta.state}（{reason}） {run.recording_path}", flush=True)
+        if meta.state != "complete" or reason in {"error", "quota"}:
+            return 1
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -87,6 +100,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--core", type=Path, help="an already built realtime-core executable")
     parser.add_argument("--data-dir", type=Path, help="local data directory (absolute)")
     parser.add_argument("--telemetry-dir", type=Path, help="local telemetry directory (absolute)")
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="record admitted frames and configured game audio locally",
+    )
+    parser.add_argument("--name", type=check_name, help="recording name (with --record)")
     parser.add_argument("--real-input", action="store_true", help="enable supervised Windows input")
     parser.add_argument("--bellis", action="store_true", help="connect to the active Bellis host")
     parser.add_argument(
@@ -102,6 +121,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--bellis requires an explicit --real-input backend")
     if args.confirm_precondition and not args.bellis:
         parser.error("--confirm-precondition requires --bellis")
+    if args.name is not None and not args.record:
+        parser.error("--name requires --record")
     setup_output(args.verbose)
     try:
         profile = resolve_profile(
@@ -124,10 +145,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     bellis=BellisConfig(
                         CredentialManagerStore("bellis"), frozenset(args.confirm_precondition)
                     ),
+                    record=args.record,
+                    name=args.name,
                 )
             )
         return asyncio.run(
-            _run(args.game, profile, core, data_dir, store, real_input=args.real_input)
+            _run(
+                args.game,
+                profile,
+                core,
+                data_dir,
+                store,
+                real_input=args.real_input,
+                record=args.record,
+                name=args.name,
+            )
         )
     except KeyboardInterrupt:
         return 130
@@ -140,6 +172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         LookupError,
         OperatorError,
         OSError,
+        QuotaRefusedError,
         RuntimeError,
         SecretStoreError,
         ValueError,

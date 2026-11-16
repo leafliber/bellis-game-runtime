@@ -19,8 +19,9 @@ EXAMPLE = GAMES_DIR.parent / "profiles" / "supervised.example.json"
 
 
 @pytest.mark.parametrize("enable_input", [False, True])
+@pytest.mark.parametrize("enable_record", [False, True])
 def test_supervise_cli_resolves_patches_in_order(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enable_input: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enable_input: bool, enable_record: bool
 ) -> None:
     enable_voice = tmp_path / "enable.json"
     disable_voice = tmp_path / "disable.json"
@@ -42,12 +43,16 @@ def test_supervise_cli_resolves_patches_in_order(
         selected_store: SecretStore,
         *,
         real_input: bool,
+        record: bool,
+        name: str | None,
     ) -> int:
         assert game == "synthetic-game"
         assert core == executable
         assert data_dir == tmp_path
         assert selected_store is store
         assert real_input is enable_input
+        assert record is enable_record
+        assert name == ("local-run" if enable_record else None)
         voice = next(entry for entry in entries if entry.id == "voice")
         assert voice.disabled
         assert voice.grant == frozenset({"audio.read"})
@@ -71,6 +76,8 @@ def test_supervise_cli_resolves_patches_in_order(
     ]
     if enable_input:
         args.append("--real-input")
+    if enable_record:
+        args.extend(("--record", "--name", "local-run"))
     assert cli.main(args) == 0
 
 
@@ -122,6 +129,8 @@ def test_supervise_cli_explicit_telemetry_directory(
         store: SecretStore,
         *,
         real_input: bool,
+        record: bool,
+        name: str | None,
     ) -> int:
         (entry,) = entries
         assert entry.id == ("local-traces" if configured else "telemetry")
@@ -130,6 +139,8 @@ def test_supervise_cli_explicit_telemetry_directory(
         assert not entry.grant
         assert entry.config["directory"] == str(directory)
         assert entry.config.get("max_queue") == (12 if configured else None)
+        assert not record
+        assert name is None
         return 0
 
     monkeypatch.setattr(cli, "CredentialManagerStore", MemorySecretStore)
@@ -150,3 +161,9 @@ def test_supervise_cli_explicit_telemetry_directory(
         )
         == 0
     )
+
+
+def test_supervise_cli_recording_name_requires_record(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        cli.main(["synthetic-game", "--profile", str(EXAMPLE), "--name", "local-run"])
+    assert "--name requires --record" in capsys.readouterr().err

@@ -41,6 +41,8 @@ from game_runtime.kernel import Manifest, Plugin, PluginContext, ResolvedEntry, 
 from game_runtime.ocr import OCR, FrameLike, OcrConfig, OcrLine, OcrResult, OcrService
 from game_runtime.ocr.fake import ScriptedRecognizer
 from game_runtime.operator import MonotonicClock
+from game_runtime.recording import Recording
+from game_runtime.recording.layout import read_meta
 from game_runtime.scene import SceneHub, SceneUpdate, store_template
 from game_runtime.secret_store import MemorySecretStore, SessionInfo
 from game_runtime.step_control import (
@@ -367,7 +369,12 @@ class Rig:
 
 @asynccontextmanager
 async def rig(
-    exe: Path, folder: Path, *, policy: Policy | None = None, telemetry: Path | None = None
+    exe: Path,
+    folder: Path,
+    *,
+    policy: Policy | None = None,
+    telemetry: Path | None = None,
+    record: bool = False,
 ) -> AsyncGenerator[Rig]:
     if sys.platform == "win32":
         folder = Path("\\\\?\\" + str(folder.resolve()))
@@ -440,6 +447,7 @@ async def rig(
                 ocr_plugin=ocr_for(frames),
                 extra_plugins=(planner_for(lambda: planner),),
                 extra_entries=extra_entries,
+                record=record,
                 bellis=BellisConfig(
                     store, frozenset({"safe"}), info_file, lambda: risk[-1] if risk else None
                 ),
@@ -491,6 +499,58 @@ async def refused(peer: RpcPeer, method: str, fields: dict[str, object]) -> None
     with pytest.raises(RpcError) as rejected:
         await peer.request(method, fields)
     assert rejected.value.code == RpcErrorCode.INVALID_PARAMS
+
+
+def test_bellis_action_and_telemetry_close_match_the_supervised_recording(
+    semantic_core: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[bool] = []
+    close = RuntimeTelemetry.aclose
+
+    async def run() -> None:
+        async with rig(semantic_core, tmp_path, telemetry=tmp_path / "otel", record=True) as r:
+            path = r.run.recording_path
+            assert path is not None
+            assert r.run.core.audio is None
+
+            async def observe_close(telemetry: RuntimeTelemetry) -> None:
+                closed.append(
+                    not r.run.core.running
+                    and r.run.core.frames is None
+                    and read_meta(path).state == "recording"
+                )
+                await close(telemetry)
+
+            monkeypatch.setattr(RuntimeTelemetry, "aclose", observe_close)
+            r.risk.append(RiskReading(0.23, False))
+            main, core, events = await r.connect(first=True)
+            assert core is not None
+            await ready(r, events)
+            renewing = asyncio.create_task(renew(core, 1))
+            try:
+                assert await main.request("goal.submit", goal("recorded-navigation", 5_000)) == {}
+                action = await until(lambda: events.actions[0] if events.actions else None)
+                assert action.goalId == "recorded-navigation"
+                assert action.category == "navigate"
+                assert action.traceparent is not None
+                assert action.traceparent[3:35] == _TRACE[3:35]
+                assert r.frames.down == ["menu"]
+            finally:
+                renewing.cancel()
+                await asyncio.gather(renewing, return_exceptions=True)
+        recording = Recording.open(path)
+        assert recording.meta.state == "complete"
+        assert recording.meta.audio is None
+        before = [
+            i for i, item in enumerate(recording.frames) if ms(item.capture_ns) <= action.atMs
+        ]
+        after = [i for i, item in enumerate(recording.frames) if ms(item.capture_ns) > action.atMs]
+        assert before
+        assert after
+        assert recording.frame(before[-1]).pixels != recording.frame(after[-1]).pixels
+        assert closed == [True]
+
+    asyncio.run(run())
 
 
 class _AtTime(MonotonicClock):
