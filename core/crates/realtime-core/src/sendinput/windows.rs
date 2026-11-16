@@ -312,8 +312,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             _ => RawEvent::Other,
         };
         let injected = info.flags.0 & LLKHF_INJECTED.0 != 0;
-        let own = injected && info.dwExtraInfo == globals.marker;
-        classify_and_dispatch(globals, raw, injected, own);
+        classify_and_dispatch(globals, raw, injected, info.dwExtraInfo);
     }
     // SAFETY: 透传给下一个钩子，从不吞事件。
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
@@ -338,8 +337,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         };
         // 鼠标钩子的注入标志是 LLMHF_INJECTED（1），不是键盘的 LLKHF_INJECTED（0x10）。
         let injected = info.flags & LLMHF_INJECTED != 0;
-        let own = injected && info.dwExtraInfo == globals.marker;
-        classify_and_dispatch(globals, raw, injected, own);
+        classify_and_dispatch(globals, raw, injected, info.dwExtraInfo);
     }
     // SAFETY: 透传给下一个钩子。
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
@@ -359,13 +357,14 @@ fn mouse_move(info: &MSLLHOOKSTRUCT) -> RawEvent {
     RawEvent::MouseMove { dx, dy }
 }
 
-fn classify_and_dispatch(globals: &HookGlobals, raw: RawEvent, injected: bool, own: bool) {
+fn classify_and_dispatch(globals: &HookGlobals, raw: RawEvent, injected: bool, extra_info: usize) {
     let lease_valid = globals.lease_valid.load(Ordering::Acquire);
     let class = {
         let mut state = globals
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let own = injected && extra_info == globals.marker;
         state.classify(raw, injected, own, &globals.combo, lease_valid)
     };
     match class {
@@ -455,7 +454,7 @@ pub(crate) fn build_backend(
     combo: Combo,
     target: Arc<TargetWindow>,
 ) -> io::Result<(Box<dyn InputBackend>, Wiring)> {
-    let marker = session_marker();
+    let marker = session_marker(getrandom::u32);
     let injected = Arc::new(AtomicU64::new(0));
     let seen = Arc::new(AtomicU64::new(0));
     let verify_keys = Arc::new(Mutex::new(VerifyKeys::default()));
@@ -517,15 +516,13 @@ pub(crate) fn start(control: &Arc<Control>, post: &Post, wiring: Wiring) -> io::
     Ok(())
 }
 
-/// 本实例的会话标记：启动时从系统随机数源取的随机数，放进每个注入事件的 `dwExtraInfo`。不取 0，
-/// 以免与不带标记的注入（`dwExtraInfo` 为 0）混同。
-fn session_marker() -> usize {
+/// 会话标记用非零 `u32`，零扩展到 `dwExtraInfo` 的指针宽度。回调若只保留低 32 位且清零高位，
+/// 仍能与发送的完整标记匹配。
+fn session_marker(mut random_word: impl FnMut() -> Result<u32, getrandom::Error>) -> usize {
     loop {
-        let mut bytes = [0u8; size_of::<usize>()];
-        getrandom::fill(&mut bytes).expect("系统随机数源不可用");
-        let marker = usize::from_ne_bytes(bytes);
+        let marker = random_word().expect("系统随机数源不可用");
         if marker != 0 {
-            return marker;
+            return marker as usize;
         }
     }
 }
@@ -646,4 +643,114 @@ fn spawn_self_check(
             }
         })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hook_state(marker: usize) -> (HookGlobals, Receiver<Class>) {
+        let (worker, classes) = mpsc::channel();
+        let globals = HookGlobals {
+            marker,
+            combo: Combo::default_hotkey(),
+            lease_valid: AtomicBool::new(true),
+            seen: Arc::new(AtomicU64::new(0)),
+            state: Mutex::new(HookState::default()),
+            worker,
+        };
+        (globals, classes)
+    }
+
+    #[test]
+    fn session_marker_retries_zero_and_zero_extends_the_word() {
+        let mut words = [0, 0, u32::MAX].into_iter();
+        let marker = session_marker(|| Ok(words.next().expect("已有非零样本")));
+        assert_eq!(marker, 0xffff_ffff_usize);
+        assert_eq!(words.next(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "系统随机数源不可用")]
+    fn session_marker_fails_if_the_system_rng_fails() {
+        session_marker(|| Err(getrandom::Error::UNSUPPORTED));
+    }
+
+    #[test]
+    fn own_inputs_match_after_a_zero_extended_low_word_round_trip() {
+        let marker = session_marker(|| Ok(0x8000_0001));
+        let (globals, classes) = hook_state(marker);
+        let events = [
+            Event::MouseMoveAbs { x: 1, y: 2 },
+            Event::MouseDown {
+                button: PhysicalButton::Left,
+            },
+            Event::MouseUp {
+                button: PhysicalButton::Left,
+            },
+        ];
+        let callbacks = [
+            RawEvent::MouseMove { dx: 500, dy: 500 },
+            RawEvent::MouseDown,
+            RawEvent::MouseUp,
+        ];
+        for (event, raw) in events.into_iter().zip(callbacks) {
+            let input = to_input(event, marker);
+            assert_eq!(input.r#type, INPUT_MOUSE);
+            // SAFETY: to_input 对这些事件写入 mi。
+            let extra_info = unsafe { input.Anonymous.mi.dwExtraInfo };
+            assert_eq!(extra_info, marker);
+            classify_and_dispatch(&globals, raw, true, (extra_info as u32) as usize);
+        }
+        let seen = globals.seen.load(Ordering::Acquire);
+        assert_eq!(seen, 2);
+        assert_eq!(seen, self_check_count(&events, 3));
+
+        let key_down = Event::KeyDown {
+            scan_code: 0x11,
+            extended: false,
+        };
+        let key_up = Event::KeyUp {
+            scan_code: 0x11,
+            extended: false,
+        };
+        for (event, raw) in [
+            (key_down, RawEvent::KeyDown { vk: 0x57 }),
+            (key_up, RawEvent::KeyUp { vk: 0x57 }),
+        ] {
+            let input = to_input(event, marker);
+            assert_eq!(input.r#type, INPUT_KEYBOARD);
+            // SAFETY: to_input 对这两个键事件写入 ki。
+            let extra_info = unsafe { input.Anonymous.ki.dwExtraInfo };
+            assert_eq!(extra_info, marker);
+            classify_and_dispatch(&globals, raw, true, (extra_info as u32) as usize);
+        }
+        assert_eq!(globals.seen.load(Ordering::Acquire), 4);
+        assert_eq!(classes.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn other_inputs_do_not_match_the_full_marker() {
+        let marker = session_marker(|| Ok(0x8000_0001));
+        let (globals, classes) = hook_state(marker);
+        let cases = [
+            (true, 0),
+            (true, marker ^ 1),
+            (false, marker),
+            #[cfg(target_pointer_width = "64")]
+            (true, marker | (1_usize << 32)),
+        ];
+        for (down, up) in [
+            (RawEvent::MouseDown, RawEvent::MouseUp),
+            (RawEvent::KeyDown { vk: 0x57 }, RawEvent::KeyUp { vk: 0x57 }),
+        ] {
+            for (injected, extra_info) in cases {
+                classify_and_dispatch(&globals, down, injected, extra_info);
+                assert_eq!(classes.try_recv(), Ok(Class::Takeover));
+                classify_and_dispatch(&globals, up, injected, extra_info);
+                assert_eq!(classes.try_recv(), Err(mpsc::TryRecvError::Empty));
+            }
+        }
+        assert_eq!(globals.seen.load(Ordering::Acquire), 0);
+    }
 }
