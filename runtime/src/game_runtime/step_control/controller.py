@@ -178,6 +178,13 @@ class StepController:
     def stuck(self) -> bool:
         return self._progress.stuck
 
+    @property
+    def risk_score(self) -> float | None:
+        if self._closed or not self.grant.is_open:
+            return None
+        limit = self.config.max_rejections
+        return min(self._rejects, limit) / limit
+
     async def propose(self, inputs: PolicyInput) -> Plan:
         async with asyncio.timeout(self.config.policy_timeout):
             return await self.policy.propose(inputs)

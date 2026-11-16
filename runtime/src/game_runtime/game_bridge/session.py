@@ -37,21 +37,10 @@ type Mode = Literal["autonomous", "waiting_vote", "paused", "manual"]
 
 
 @dataclass(frozen=True, slots=True)
-class RiskReading:
-    score: float
-    exceeded: bool
-
-    def __post_init__(self) -> None:
-        if not 0.0 <= self.score <= 1.0:
-            raise ValueError("风险分须在 [0, 1] 内")
-
-
-@dataclass(frozen=True, slots=True)
 class BellisConfig:
     session_store: SecretStore
     confirmed: frozenset[str] = frozenset()
     test_session_file: Path | None = None
-    risk: Callable[[], RiskReading | None] | None = None
 
 
 def read_bellis_session(store: SecretStore) -> SessionInfo | None:
@@ -190,7 +179,7 @@ class BellisSession:
         # 点击改变画面后，scene 会先清掉旧帧，再发布新帧的判别。
         return (
             self._active(self._authorization)
-            and self._safety_ready(self._risk())
+            and self._safety_ready(self._risk_score())
             and self.project is not None
             and self.project.capture_ready(self.clock.now_ns())
         )
@@ -236,37 +225,29 @@ class BellisSession:
         """供核连接在发送时读取的最后一个合法纳秒。"""
         return self._deadline_ns
 
-    def _risk(self) -> RiskReading | None:
-        if self.config.risk is None:
-            return None
-        try:
-            return self.config.risk()
-        except Exception:
-            return None
+    def _risk_score(self) -> float | None:
+        controller = self.signals.controller
+        return None if controller is None else controller.risk_score
 
     def ready(self) -> bool:
         """当前已判别帧可用于接纳目标和提交新动作。"""
         return (
-            self._safety_ready(self._risk())
+            self._safety_ready(self._risk_score())
             and self.project is not None
             and self.project.action_ready(self.signals.controller, self.clock.now_ns())
         )
 
-    def _safety_ready(self, risk: RiskReading | None) -> bool:
-        return (
-            risk is not None
-            and not risk.exceeded
-            and all(item.confirmed for item in self.prerequisites)
-        )
+    def _safety_ready(self, risk_score: float | None) -> bool:
+        return risk_score is not None and all(item.confirmed for item in self.prerequisites)
 
     def health(self) -> v1.GameMainHealth:
         now = self.clock.now_ns()
         goal = self._authorization
         live_goal = goal if goal is not None and now < goal.expires_ns else None
-        risk = self._risk()
+        risk_score = self._risk_score()
         controller = self.signals.controller
         rejection = self.last_rejection
-        if risk is None:
+        if risk_score is None:
             rejection = v1.LastRejection(
                 atMs=ms(now), code="risk-unsupported", summary="本机风险来源尚不可用"
             )
@@ -280,7 +261,7 @@ class BellisSession:
         return v1.GameMainHealth(
             atMs=ms(now),
             ready=(
-                self._safety_ready(risk)
+                self._safety_ready(risk_score)
                 and self.project is not None
                 and self.project.health_ready(controller, now)
             ),
@@ -293,8 +274,8 @@ class BellisSession:
             firstActionMs=self._first_action_ms,
             frameAgeMs=None if self.project is None else self.project.frame_age(now),
             queueDepth=self._inflight + (0 if controller is None else controller.queue_depth),
-            riskScore=0.0 if risk is None else risk.score,
-            riskLimitExceeded=risk is not None and risk.exceeded,
+            riskScore=0.0 if risk_score is None else risk_score,
+            riskLimitExceeded=False,  # GR-37：v1 必填，独立阈值锁存 unsupported。
             lastRejection=rejection,
         )
 

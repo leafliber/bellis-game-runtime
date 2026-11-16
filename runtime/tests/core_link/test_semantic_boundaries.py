@@ -24,7 +24,7 @@ from game_runtime.core_link.link import ActionDeadlineError
 from game_runtime.frame_ring import RingFrame
 from game_runtime.game_bridge import plugin as bridge_plugin
 from game_runtime.game_bridge.projection import Projection
-from game_runtime.game_bridge.session import BellisConfig, BellisSession, RiskReading
+from game_runtime.game_bridge.session import BellisConfig, BellisSession
 from game_runtime.game_bridge.wire import ns, v1
 from game_runtime.operator import MonotonicClock
 from game_runtime.planner import Planner, PlannerConfig
@@ -157,7 +157,6 @@ def test_health_during_effect_analysis_gap(
             r.frames.scene = "choice"
             effect_pixels = r.frames.render()
             r.frames.scene = "menu"
-            r.risk.append(RiskReading(0.15, False))
             main, core, events = await r.connect(first=True)
             assert core is not None
             await ready(r, events)
@@ -264,7 +263,6 @@ def test_bellis_goal_cap_reaches_rust_action_block(
     async def run() -> None:
         async with rig(semantic_core, tmp_path) as r:
             r.frames.scene = "dialogue"
-            r.risk.append(RiskReading(0.15, False))
             main, core, events = await r.connect(first=True)
             assert core is not None
             await ready(r, events)

@@ -35,7 +35,7 @@ from game_runtime.frame_ring import RingFrame
 from game_runtime.frame_ring.fake import FakeDisplay
 from game_runtime.frames import AdmissionPolicy
 from game_runtime.game_bridge.projection import voice_activity_at
-from game_runtime.game_bridge.session import SESSION_ENTRY, BellisConfig, BellisSession, RiskReading
+from game_runtime.game_bridge.session import SESSION_ENTRY, BellisConfig, BellisSession
 from game_runtime.game_bridge.wire import decode_request, ms, ns, v1
 from game_runtime.kernel import Manifest, Plugin, PluginContext, ResolvedEntry, Tier
 from game_runtime.ocr import OCR, FrameLike, OcrConfig, OcrLine, OcrResult, OcrService
@@ -50,6 +50,7 @@ from game_runtime.step_control import (
     Click,
     EffectKind,
     ExpectedEffect,
+    Goal,
     Plan,
     PlannerContext,
     Policy,
@@ -191,6 +192,7 @@ class Frames:
         self.layout = Layout(WIDTH, HEIGHT)
         self.renderer = Renderer(WIDTH, HEIGHT)
         self.scene = "menu"
+        self.menu_selection = 0
         self.timer_end = 0.0
         self.ignore_choice = False
         self.down: list[str] = []
@@ -204,13 +206,14 @@ class Frames:
 
     def render(self) -> bytes:
         tenths = max(0, math.ceil((self.timer_end - time.perf_counter()) * 10))
-        key = self.scene, tenths if self.scene == "timed" else 0
+        variant = {"menu": self.menu_selection, "timed": tenths}.get(self.scene, 0)
+        key = self.scene, variant
         if key in self.known:
             return self.known[key]
         lines: list[OcrLine] = []
         if self.scene == "menu":
             buttons = tuple(
-                Button(self.layout.menu_button(i), label, i == 0)
+                Button(self.layout.menu_button(i), label, i == self.menu_selection)
                 for i, label in enumerate(("开始", "商店", "说明"))
             )
             view = View(MenuView("合成测试", buttons), None)
@@ -264,6 +267,29 @@ class FixturePolicy:
                 ),
             )
         )
+
+
+class RejectionPolicy(FixturePolicy):
+    reject = True
+
+    async def propose(self, inputs: PolicyInput) -> Plan:
+        if self.reject and inputs.scene.screen_state.classification.screen_type is ScreenType.MENU:
+            return Plan(
+                steps=(
+                    StepProposal(
+                        Category.NAVIGATE,
+                        Click(TextTarget("不存在的目标", "menu-start")),
+                        ExpectedEffect(EffectKind.SCREEN, screen_type=ScreenType.CHOICE),
+                    ),
+                )
+            )
+        return await super().propose(inputs)
+
+
+class GoalFollowingPlanner(RecordingPlanner):
+    def submit_goal(self, goal: Goal | None) -> None:
+        super().submit_goal(goal)
+        self.context = PlannerContext(goal)
 
 
 def ocr_for(frames: Frames) -> type[Plugin[OcrConfig]]:
@@ -323,7 +349,6 @@ class Rig:
     peers: asyncio.Queue[Connection]
     store: MemorySecretStore
     planner: RecordingPlanner
-    risk: list[RiskReading]
 
     async def connect(self, *, first: bool) -> tuple[RpcPeer, RpcPeer | None, Events]:
         links: dict[str, RpcPeer] = {}
@@ -373,6 +398,7 @@ async def rig(
     folder: Path,
     *,
     policy: Policy | None = None,
+    planner: RecordingPlanner | None = None,
     telemetry: Path | None = None,
     record: bool = False,
 ) -> AsyncGenerator[Rig]:
@@ -390,10 +416,9 @@ async def rig(
         store_template(folder / "data", adapter.id, template.png)
     frames = Frames(adapter)
     store = MemorySecretStore()
-    risk: list[RiskReading] = []
     peers: asyncio.Queue[Connection] = asyncio.Queue()
     session_id = f"test{secrets.token_hex(4)}"
-    planner = RecordingPlanner(PlannerContext(None))
+    active_planner = planner or RecordingPlanner(PlannerContext(None))
     extra_entries = [
         ResolvedEntry("plan", "fixture-planner", {}, False, frozenset()),
     ]
@@ -445,15 +470,13 @@ async def rig(
                 step=StepConfig(effect_timeout=0.55, decision_margin=0.7),
                 admission=AdmissionPolicy(max_rate=20, idle_interval=0.06),
                 ocr_plugin=ocr_for(frames),
-                extra_plugins=(planner_for(lambda: planner),),
+                extra_plugins=(planner_for(lambda: active_planner),),
                 extra_entries=extra_entries,
                 record=record,
-                bellis=BellisConfig(
-                    store, frozenset({"safe"}), info_file, lambda: risk[-1] if risk else None
-                ),
+                bellis=BellisConfig(store, frozenset({"safe"}), info_file),
             ) as run:
                 await device.until_connected()
-                yield Rig(run, frames, device, peers, store, planner, risk)
+                yield Rig(run, frames, device, peers, store, active_planner)
         finally:
             presenting.cancel()
             await asyncio.gather(presenting, return_exceptions=True)
@@ -501,6 +524,133 @@ async def refused(peer: RpcPeer, method: str, fields: dict[str, object]) -> None
     assert rejected.value.code == RpcErrorCode.INVALID_PARAMS
 
 
+def test_bellis_risk_projects_rejections_and_recovers_on_authorized_goal(
+    semantic_core: Path, tmp_path: Path
+) -> None:
+    async def run() -> None:
+        policy = RejectionPolicy()
+        planner = GoalFollowingPlanner(PlannerContext(None))
+        async with rig(semantic_core, tmp_path, policy=policy, planner=planner) as r:
+            main, core, events = await r.connect(first=True)
+            assert core is not None
+
+            async def risk_at(score: float, goal_id: str | None) -> v1.GameMainHealth:
+                return await until(
+                    lambda: next(
+                        (
+                            item
+                            for item in events.health[-1:]
+                            if item.ready and item.goalId == goal_id and item.riskScore == score
+                        ),
+                        None,
+                    )
+                )
+
+            renewal = asyncio.create_task(renew(core, 1))
+            try:
+                initial = await risk_at(0.0, None)
+                assert not initial.riskLimitExceeded
+                assert await main.request("goal.submit", goal("first", 30_000)) == {}
+                rejected = await risk_at(1 / 3, "first")
+                assert rejected.lastRejection is not None
+                assert rejected.lastRejection.code == "target-not-found"
+                assert not r.frames.down
+
+                policy.reject = False
+                r.frames.menu_selection = 1
+                await until(lambda: events.actions[0] if events.actions else None)
+                await risk_at(0.0, "first")
+                assert r.frames.down == ["menu"]
+
+                policy.reject = True
+                r.frames.scene = "menu"
+                await risk_at(1 / 3, "first")
+                r.frames.menu_selection = 2
+                await risk_at(2 / 3, "first")
+                r.frames.menu_selection = 0
+                capped = await risk_at(1.0, "first")
+                assert not capped.riskLimitExceeded
+                stuck = await until(
+                    lambda: next(
+                        (item for item in events.situations if item.screenType == "卡住"), None
+                    )
+                )
+                assert stuck.failure is not None
+                controller = r.run.controller
+                assert controller is not None
+                assert controller.stuck
+
+                policy.reject = False
+                r.frames.menu_selection = 1
+                await until(
+                    lambda: next(
+                        (
+                            item
+                            for item in events.health
+                            if item.atMs > capped.atMs and item.riskScore == 1.0
+                        ),
+                        None,
+                    )
+                )
+                assert controller.stuck
+                assert len(events.actions) == 1
+                assert r.frames.down == ["menu"]
+                assert await main.request("goal.submit", goal("recovery", 10_000)) == {}
+                recovered = await until(
+                    lambda: next(
+                        (item for item in events.actions if item.goalId == "recovery"), None
+                    )
+                )
+                assert recovered.category == "navigate"
+                await risk_at(0.0, "recovery")
+                assert not controller.stuck
+                assert r.frames.down == ["menu", "menu"]
+                assert not r.device.anomalies
+            finally:
+                renewal.cancel()
+                await asyncio.gather(renewal, return_exceptions=True)
+                await main.close()
+                await core.close()
+
+    asyncio.run(run())
+
+
+def test_bellis_risk_source_expires_with_control_grant(semantic_core: Path, tmp_path: Path) -> None:
+    async def run() -> None:
+        async with rig(semantic_core, tmp_path) as r:
+            main, core, events = await r.connect(first=True)
+            assert core is not None
+            try:
+                await ready(r, events)
+                controller = r.run.controller
+                assert controller is not None
+                assert controller.risk_score == 0.0
+                await r.run.kernel.disable("step-control")
+                assert controller.risk_score is None
+                missing = await until(
+                    lambda: next(
+                        (
+                            item
+                            for item in events.health[-1:]
+                            if item.lastRejection is not None
+                            and item.lastRejection.code == "risk-unsupported"
+                        ),
+                        None,
+                    )
+                )
+                assert not missing.ready
+                assert not missing.riskLimitExceeded
+                assert missing.riskScore == 0.0
+                await refused(main, "goal.submit", goal("missing-risk", 10_000))
+                assert not r.session.may_autoplay
+                assert not r.frames.down
+            finally:
+                await main.close()
+                await core.close()
+
+    asyncio.run(run())
+
+
 def test_bellis_action_and_telemetry_close_match_the_supervised_recording(
     semantic_core: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -522,7 +672,6 @@ def test_bellis_action_and_telemetry_close_match_the_supervised_recording(
                 await close(telemetry)
 
             monkeypatch.setattr(RuntimeTelemetry, "aclose", observe_close)
-            r.risk.append(RiskReading(0.23, False))
             main, core, events = await r.connect(first=True)
             assert core is not None
             await ready(r, events)
@@ -567,7 +716,6 @@ def test_commands_recheck_after_synchronous_tracer(
 ) -> None:
     async def run() -> None:
         async with rig(semantic_core, tmp_path, telemetry=tmp_path / "otel") as r:
-            r.risk.append(RiskReading(0.23, False))
             main, core, events = await r.connect(first=True)
             assert core is not None
             lease = asyncio.create_task(renew(core, 1))
@@ -651,7 +799,6 @@ def test_step_tracer_and_location_keep_real_submission_guards(
 
     async def run() -> None:
         async with rig(semantic_core, tmp_path, telemetry=directory) as r:
-            r.risk.append(RiskReading(0.23, False))
             main, core, events = await r.connect(first=True)
             assert core is not None
             lease = asyncio.create_task(renew(core, 1))
@@ -783,11 +930,6 @@ def test_bellis_vote_and_action_fact_follow_authorized_effect(
         async with rig(semantic_core, tmp_path) as r:
             main, core, events = await r.connect(first=True)
             assert core is not None
-            initial = await until(lambda: events.health[-1] if events.health else None)
-            assert not initial.ready
-            assert initial.lastRejection is not None
-            assert initial.lastRejection.code == "risk-unsupported"
-            r.risk.append(RiskReading(0.23, False))
             await ready(r, events)
             gap = delay_decision_effect_frames(r, monkeypatch)
             assert r.run.core.last_health is not None
@@ -954,7 +1096,6 @@ def test_bellis_phrase_choice_rechecks_authorization_during_reread(
             reads = observe_phrase_crops(monkeypatch, controller.ocr, respond)
             main, core, events = await r.connect(first=True)
             assert core is not None
-            r.risk.append(RiskReading(0.23, False))
             await ready(r, events)
             renew_task = asyncio.create_task(renew(core, 1))
             try:
@@ -1042,7 +1183,6 @@ def test_interrupted_vote_cannot_restore_prior_goal(
         async with rig(semantic_core, tmp_path) as r:
             r.frames.scene = "choice"
             r.frames.ignore_choice = True
-            r.risk.append(RiskReading(0.17, False))
             main, core, events = await r.connect(first=True)
             assert core is not None
             await ready(r, events)
@@ -1147,7 +1287,6 @@ def test_pacing_keeps_timed_selection_and_reconnect_keeps_unknown(
 ) -> None:
     async def run() -> None:
         async with rig(semantic_core, tmp_path) as r:
-            r.risk.append(RiskReading(0.31, False))
             main, core, events = await r.connect(first=True)
             assert core is not None
             await ready(r, events)
