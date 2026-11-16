@@ -9,8 +9,8 @@ pyclipper。
 """
 
 import math
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Protocol
 
@@ -35,6 +35,8 @@ _MIN_BOX_SIDE: Final = 3
 _SORT_ROW_TOLERANCE: Final = 10
 _HORIZONTAL_DEGREES: Final = 5.0
 """上边与水平线的夹角不超过它的框算水平的。"""
+_TEXT_TARGET_MAX_SLOPE: Final = math.tan(math.radians(2.0))
+_TEXT_TARGET_MAX_DRIFT_FRACTION: Final = 0.2
 _REC_HEIGHT: Final = 48
 _REC_BASE_WIDTH: Final = 320
 _REC_MAX_WIDTH: Final = 3200
@@ -73,6 +75,8 @@ class RecognizedLine:
     text: str
     box: PixelRect
     confidence: float
+    horizontal: bool | None = field(default=None, compare=False)
+    """原检测与识别裁片都有水平几何证据。识别器未提供方向时为 None。"""
 
 
 class Recognizer(Protocol):
@@ -183,18 +187,60 @@ def _rect_quad(left: float, top: float, right: float, bottom: float) -> Quad:
     return np.array([[left, top], [right, top], [right, bottom], [left, bottom]], np.float32)
 
 
-def sort_quads(quads: Sequence[Quad]) -> list[Quad]:
-    """按从上到下、从左到右排列；左上角的纵坐标相差不到 10 像素的算同一行（同 PaddleOCR）。"""
-    ordered = sorted(quads, key=lambda q: (float(q[0, 1]), float(q[0, 0])))
+def _crop_size(quad: Quad) -> tuple[int, int]:
+    width = int(max(_distance(quad[0], quad[1]), _distance(quad[2], quad[3])))
+    height = int(max(_distance(quad[0], quad[3]), _distance(quad[1], quad[2])))
+    return width, height
+
+
+def _rotates_crop(width: int, height: int) -> bool:
+    return 2 * height >= 3 * width
+
+
+def _horizontal_evidence(quad: Quad) -> bool:
+    # 原始框的轻微倾角可来自检测噪声，长行的两端仍须贴近同一条基线。
+    if not np.isfinite(quad).all():
+        return False
+    width, crop_height = _crop_size(quad)
+    long_edges = (quad[1] - quad[0], quad[2] - quad[3])
+    sides = (quad[3] - quad[0], quad[2] - quad[1])
+    height = min(float(side[1]) for side in sides)
+    max_drift = height * _TEXT_TARGET_MAX_DRIFT_FRACTION
+    return (
+        width > 0
+        and crop_height > 0
+        and not _rotates_crop(width, crop_height)
+        and all(
+            dx > 0 and abs(dy) <= min(dx * _TEXT_TARGET_MAX_SLOPE, max_drift)
+            for dx, dy in long_edges
+        )
+        and all(dy > 0 and abs(dx) <= dy * _TEXT_TARGET_MAX_SLOPE for dx, dy in sides)
+    )
+
+
+def _sort_by_position[T](items: Sequence[T], quad_of: Callable[[T], Quad]) -> list[T]:
+    def position(item: T) -> tuple[float, float]:
+        quad = quad_of(item)
+        return float(quad[0, 1]), float(quad[0, 0])
+
+    ordered = sorted(items, key=position)
     for i in range(len(ordered) - 1):
         for j in range(i, -1, -1):
-            upper, lower = ordered[j], ordered[j + 1]
+            upper, lower = quad_of(ordered[j]), quad_of(ordered[j + 1])
             same_row = abs(float(lower[0, 1]) - float(upper[0, 1])) < _SORT_ROW_TOLERANCE
             if same_row and float(lower[0, 0]) < float(upper[0, 0]):
-                ordered[j], ordered[j + 1] = lower, upper
+                ordered[j], ordered[j + 1] = ordered[j + 1], ordered[j]
             else:
                 break
     return ordered
+
+
+def sort_quads(quads: Sequence[Quad]) -> list[Quad]:
+    """按从上到下、从左到右排列；左上角的纵坐标相差不到 10 像素的算同一行（同 PaddleOCR）。"""
+    return _sort_by_position(quads, lambda quad: quad)
+
+
+type _Detection = tuple[Quad, bool]
 
 
 def merge_rows(quads: Sequence[Quad], gap_ratio: float) -> list[Quad]:
@@ -204,32 +250,69 @@ def merge_rows(quads: Sequence[Quad], gap_ratio: float) -> list[Quad]:
     `gap_ratio` 乘以两者中较高的那个就合并。不水平的框原样保留。结果按 `sort_quads` 排列。
     DB 常把一行文字在全角标点处断开，或把行末的句号单独检出成小框；分开识别会丢掉标点或认错。
     """
-    boxes = [_bounds(quad) for quad in quads if _is_horizontal(quad)]
-    others = [quad for quad in quads if not _is_horizontal(quad)]
-    rows: list[list[tuple[float, float, float, float]]] = []
-    for box in sorted(boxes, key=lambda b: (b[1] + b[3]) / 2):
+    detected = [(quad, _horizontal_evidence(quad)) for quad in quads]
+    return [quad for quad, _ in _merge_rows(detected, gap_ratio)]
+
+
+def _aligned_baselines(quads: Sequence[Quad]) -> bool:
+    # 各段底边给出基线证据。用较高分段的行高作尺度，短标点可与正文字号共存。
+    bottoms = [float(y) for quad in quads for y in quad[2:, 1]]
+    height = max(
+        min(float(quad[3, 1] - quad[0, 1]), float(quad[2, 1] - quad[1, 1])) for quad in quads
+    )
+    return max(bottoms) - min(bottoms) <= height * _TEXT_TARGET_MAX_DRIFT_FRACTION
+
+
+def _merge_rows(
+    detected: Sequence[_Detection],
+    gap_ratio: float,
+    *,
+    original_quads: Sequence[Quad] | None = None,
+) -> list[_Detection]:
+    originals = [quad for quad, _ in detected] if original_quads is None else original_quads
+    boxes: list[tuple[tuple[float, float, float, float], bool, Quad]] = []
+    others: list[_Detection] = []
+    for (quad, horizontal), original in zip(detected, originals, strict=True):
+        if _is_horizontal(quad):
+            boxes.append((_bounds(quad), horizontal, original))
+        else:
+            others.append((quad, horizontal))
+    rows: list[list[tuple[tuple[float, float, float, float], bool, Quad]]] = []
+    for box, horizontal, original in sorted(boxes, key=lambda item: (item[0][1] + item[0][3]) / 2):
         for row in rows:
-            top = min(b[1] for b in row)
-            bottom = max(b[3] for b in row)
+            top = min(b[1] for b, _, _ in row)
+            bottom = max(b[3] for b, _, _ in row)
             overlap = min(box[3], bottom) - max(box[1], top)
             if overlap >= 0.5 * min(box[3] - box[1], bottom - top):
-                row.append(box)
+                row.append((box, horizontal, original))
                 break
         else:
-            rows.append([box])
-    merged: list[Quad] = []
+            rows.append([(box, horizontal, original)])
+    merged: list[_Detection] = []
     for row in rows:
-        row.sort(key=lambda b: b[0])
-        left, top, right, bottom = row[0]
-        for b_left, b_top, b_right, b_bottom in row[1:]:
+        row.sort(key=lambda item: item[0][0])
+        (left, top, right, bottom), horizontal, original = row[0]
+        segments = [original]
+        for (b_left, b_top, b_right, b_bottom), b_horizontal, b_original in row[1:]:
             height = max(bottom - top, b_bottom - b_top)
             if b_left - right <= gap_ratio * height:
                 top, right, bottom = min(top, b_top), max(right, b_right), max(bottom, b_bottom)
+                horizontal = horizontal and b_horizontal
+                segments.append(b_original)
             else:
-                merged.append(_rect_quad(left, top, right, bottom))
+                merged.append(
+                    (
+                        _rect_quad(left, top, right, bottom),
+                        horizontal and _aligned_baselines(segments),
+                    )
+                )
                 left, top, right, bottom = b_left, b_top, b_right, b_bottom
-        merged.append(_rect_quad(left, top, right, bottom))
-    return sort_quads([*merged, *others])
+                horizontal = b_horizontal
+                segments = [b_original]
+        merged.append(
+            (_rect_quad(left, top, right, bottom), horizontal and _aligned_baselines(segments))
+        )
+    return _sort_by_position([*merged, *others], lambda item: item[0])
 
 
 def pad_horizontal(quad: Quad, ratio: float, width: int) -> Quad:
@@ -249,8 +332,7 @@ def pad_horizontal(quad: Quad, ratio: float, width: int) -> Quad:
 
 def crop_quad(image: Image, quad: Quad) -> Image | None:
     """把四边形透视变换为水平的行图；竖长（高 ≥ 1.5 倍宽）的转 90 度。太小时为 None。"""
-    width = int(max(_distance(quad[0], quad[1]), _distance(quad[2], quad[3])))
-    height = int(max(_distance(quad[0], quad[3]), _distance(quad[1], quad[2])))
+    width, height = _crop_size(quad)
     if width < 1 or height < 1:
         return None
     target = np.array([[0, 0], [width, 0], [width, height], [0, height]], np.float32)
@@ -261,7 +343,7 @@ def crop_quad(image: Image, quad: Quad) -> Image | None:
         ),
         np.uint8,
     )
-    if height / width >= 1.5:
+    if _rotates_crop(width, height):
         crop = np.rot90(crop)
     return np.ascontiguousarray(crop, dtype=np.uint8)
 
@@ -343,13 +425,17 @@ class OcrEngine:
 
     def detect(self, image: Image) -> list[Quad]:
         """图像中的文字框（图像坐标），按从上到下、从左到右排列。"""
+        return [quad for quad, _ in self._detect_lines(image)]
+
+    def _detect_lines(self, image: Image) -> list[_Detection]:
         height, width = image.shape[:2]
         options = self.options
         size = det_input_size(height, width, options.det_limit_side, options.det_max_side)
         prob = self._det.run(det_input(image, size))[0, 0]
         scale = np.array([width / size[1], height / size[0]], np.float32)
         limit = np.array([width, height], np.float32)
-        quads: list[Quad] = []
+        detected: list[_Detection] = []
+        originals: list[Quad] = []
         for quad, _ in db_boxes(
             prob,
             thresh=options.det_thresh,
@@ -357,12 +443,14 @@ class OcrEngine:
             unclip_ratio=options.det_unclip_ratio,
             max_candidates=options.det_max_candidates,
         ):
-            scaled = np.clip(quad * scale, 0, limit).astype(np.float32)
+            original = quad * scale
+            scaled = np.clip(original, 0, limit).astype(np.float32)
             if min(_distance(scaled[0], scaled[1]), _distance(scaled[0], scaled[3])) > 3:
-                quads.append(scaled)
+                detected.append((scaled, _horizontal_evidence(original)))
+                originals.append(original)
         if options.merge_gap_ratio is not None:
-            return merge_rows(quads, options.merge_gap_ratio)
-        return sort_quads(quads)
+            return _merge_rows(detected, options.merge_gap_ratio, original_quads=originals)
+        return _sort_by_position(detected, lambda item: item[0])
 
     def read_lines(self, crops: Sequence[Image]) -> list[tuple[str, float]]:
         """识别若干行图，按输入的顺序给出文字与置信度。"""
@@ -380,14 +468,15 @@ class OcrEngine:
         height, width = image.shape[:2]
         pad = self.options.rec_pad_ratio
         # 识别框报检测框本身；加宽只用于裁出给识别模型的行图。
-        pairs = [
-            (quad, crop_quad(image, pad_horizontal(quad, pad, width) if pad > 0 else quad))
-            for quad in self.detect(image)
-        ]
-        kept = [(quad, crop) for quad, crop in pairs if crop is not None]
-        texts = self.read_lines([crop for _, crop in kept])
+        kept: list[tuple[Quad, Image, bool]] = []
+        for quad, horizontal in self._detect_lines(image):
+            crop_box = pad_horizontal(quad, pad, width) if pad > 0 else quad
+            crop = crop_quad(image, crop_box)
+            if crop is not None:
+                kept.append((quad, crop, horizontal and _horizontal_evidence(crop_box)))
+        texts = self.read_lines([crop for _, crop, _ in kept])
         lines: list[RecognizedLine] = []
-        for (quad, _), (raw, confidence) in zip(kept, texts, strict=True):
+        for (quad, _, horizontal), (raw, confidence) in zip(kept, texts, strict=True):
             text = raw.strip()
             if not text or confidence < self.options.min_confidence:
                 continue
@@ -398,5 +487,5 @@ class OcrEngine:
                 min(width, math.ceil(right)),
                 min(height, math.ceil(bottom)),
             )
-            lines.append(RecognizedLine(text, box, confidence))
+            lines.append(RecognizedLine(text, box, confidence, horizontal))
         return lines
