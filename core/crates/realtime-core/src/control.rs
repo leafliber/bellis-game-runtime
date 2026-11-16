@@ -12,13 +12,12 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-#[cfg(any(windows, test))]
-use core_protocol::messages::VerificationResult;
 use core_protocol::messages::{
     Accepted, Action, ActionBlock, ActionOutcome, ActionReceiptParams, ActionSubmitResult,
     CaptureState, CoreHealthParams, DropReason, Dropped, Executed, HeldInput, InputPolicy,
     InputReleasedParams, InputResidualParams, InputVerificationParams, LeaseGrantParams, Producer,
     ProducerHeartbeatParams, RejectReason, Rejected, ReleaseReason, ReleaseVerification, Uncertain,
+    VerificationResult,
 };
 
 use crate::frames::FrameStatus;
@@ -66,7 +65,7 @@ pub(crate) struct Notices(pub(crate) Vec<Notice>);
 /// 一条要发给主进程的通知。
 #[derive(Debug)]
 pub(crate) enum Notice {
-    Released(InputReleasedParams),
+    Released(ReleasedInput),
     Receipt(ActionReceiptParams),
     /// 真实后端核验出的残留（也发往操作员控制台），见 `docs/modules/realtime-core.md`。
     #[cfg_attr(
@@ -81,6 +80,27 @@ pub(crate) enum Notice {
     Verification(InputVerificationParams),
 }
 
+/// 同一把控制锁内记录一次释放及其关联令牌。核协议只上报 params。
+#[derive(Clone, Debug)]
+pub(crate) struct ReleasedInput {
+    pub(crate) params: InputReleasedParams,
+    pub(crate) token: Option<u64>,
+    pub(crate) awaits_verification: bool,
+}
+
+/// 可立即应答的授予，或仍须等待某次旧许可释放核验的请求。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LeaseGrant {
+    Applied,
+    Verifying(u64),
+}
+
+#[derive(Clone, Copy)]
+struct PendingVerification {
+    release_id: u64,
+    blocks_new_lease: bool,
+}
+
 impl Notices {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -92,7 +112,7 @@ impl Notices {
         self.0
             .iter()
             .filter_map(|notice| match notice {
-                Notice::Released(released) => Some(released.reason),
+                Notice::Released(released) => Some(released.params.reason),
                 Notice::Receipt(_) | Notice::Residual(_) | Notice::Verification(_) => None,
             })
             .collect()
@@ -268,8 +288,8 @@ struct State {
     input_fault: Option<Refusal>,
     last_release_id: u64,
     verifies_release: bool,
-    pending_verification: Option<u64>,
-    last_verification_posted: u64,
+    pending_verification: Option<PendingVerification>,
+    last_verification_posted: Option<InputVerificationParams>,
     plan: Plan,
     /// 输入策略；收到 `input.configure` 后有。
     policy: Option<Policy>,
@@ -307,9 +327,20 @@ impl State {
         first: Outcomes,
         notices: &mut Notices,
     ) -> bool {
+        self.release_for_token(reason, producer, first, self.lease.active_token(), notices)
+    }
+
+    fn release_for_token(
+        &mut self,
+        reason: ReleaseReason,
+        producer: Option<&Producer>,
+        first: Outcomes,
+        token: Option<u64>,
+        notices: &mut Notices,
+    ) -> bool {
         self.last_release_id += 1;
         let release_id = self.last_release_id;
-        if self.verifies_release
+        let awaits_verification = self.verifies_release
             && (self.policy.is_some()
                 || matches!(
                     reason,
@@ -317,9 +348,17 @@ impl State {
                         | ReleaseReason::Stop
                         | ReleaseReason::StdinClosed
                         | ReleaseReason::CoreConnectionLost
-                ))
-        {
-            self.pending_verification = Some(release_id);
+                ));
+        if awaits_verification {
+            // 新的全释放也覆盖旧许可仍待核验的输入。
+            let blocks_new_lease = token.is_some()
+                || self
+                    .pending_verification
+                    .is_some_and(|pending| pending.blocks_new_lease);
+            self.pending_verification = Some(PendingVerification {
+                release_id,
+                blocks_new_lease,
+            });
         }
         let accepted = self.ledger.release_all(reason, release_id);
         let verification = if accepted {
@@ -331,12 +370,16 @@ impl State {
         let released_at_ns = mono_clock::now_ns();
         let mut outcomes = first;
         self.plan.clear(&mut outcomes);
-        notices.0.push(Notice::Released(InputReleasedParams {
-            release_id,
-            reason,
-            producer: producer.cloned(),
-            released_at_ns,
-            verification,
+        notices.0.push(Notice::Released(ReleasedInput {
+            params: InputReleasedParams {
+                release_id,
+                reason,
+                producer: producer.cloned(),
+                released_at_ns,
+                verification,
+            },
+            token,
+            awaits_verification,
         }));
         outcomes.emit(producer, notices);
         accepted
@@ -347,9 +390,97 @@ impl State {
         self.lease.local_revoke();
     }
 
+    fn pending_verification_id(&self) -> Option<u64> {
+        self.pending_verification.map(|release| release.release_id)
+    }
+
+    fn check_lease_grant(&self, grant: &LeaseGrantParams, now: u64) -> Result<Granted, Refusal> {
+        if now == 0 {
+            return Err(Refusal::ClockUnavailable);
+        }
+        if self.stopping {
+            return Err(Refusal::NoSource);
+        }
+        if let Some(fault) = self.input_fault {
+            return Err(fault);
+        }
+        self.lease.check_grant(grant.token, grant.expires_ns, now)
+    }
+
+    fn grant_lease(
+        &mut self,
+        grant: &LeaseGrantParams,
+        read_clock: impl Fn() -> u64,
+        notices: &mut Notices,
+    ) -> Result<LeaseGrant, Refusal> {
+        let now = read_clock();
+        if !self.stopping {
+            self.expire_lease(now, notices);
+        }
+        let granted = self.check_lease_grant(grant, now)?;
+        if granted == Granted::Replaced {
+            let old_token = self.lease.active_token().ok_or(Refusal::NoSource)?;
+            self.lease.revoke(old_token);
+            if !self.release_current_for_token(
+                ReleaseReason::LeaseRevoked,
+                Some(old_token),
+                notices,
+            ) || (self.verifies_release
+                && self.pending_verification_id() != Some(self.last_release_id))
+            {
+                return Err(Refusal::ReleaseFailed);
+            }
+        }
+        if granted != Granted::Renewed
+            && let Some(pending) = self.pending_verification
+            && pending.blocks_new_lease
+        {
+            return Ok(LeaseGrant::Verifying(pending.release_id));
+        }
+        // 释放调用可能耗时，安装令牌前重新核对绝对截止时间。
+        let now = read_clock();
+        self.check_lease_grant(grant, now)?;
+        self.lease.grant(grant.token, grant.expires_ns, now)?;
+        Ok(LeaseGrant::Applied)
+    }
+
+    fn require_verified_release(&self, release_id: u64) -> Result<(), Refusal> {
+        if self.stopping {
+            return Err(Refusal::NoSource);
+        }
+        if let Some(fault) = self.input_fault {
+            return Err(fault);
+        }
+        if self.last_release_id == release_id
+            && self.pending_verification_id().is_none()
+            && self.last_verification_posted.is_some_and(|checked| {
+                checked.release_id == release_id && checked.result == VerificationResult::Verified
+            })
+        {
+            Ok(())
+        } else {
+            Err(Refusal::ReleaseFailed)
+        }
+    }
+
     fn release_current(&mut self, reason: ReleaseReason, notices: &mut Notices) -> bool {
+        self.release_current_for_token(reason, self.lease.active_token(), notices)
+    }
+
+    fn release_current_for_token(
+        &mut self,
+        reason: ReleaseReason,
+        token: Option<u64>,
+        notices: &mut Notices,
+    ) -> bool {
         let producer = self.current_producer();
-        self.release(reason, producer.as_ref(), Outcomes::default(), notices)
+        self.release_for_token(
+            reason,
+            producer.as_ref(),
+            Outcomes::default(),
+            token,
+            notices,
+        )
     }
 
     fn revoke_through(&mut self, generation: u64, notices: &mut Notices) {
@@ -381,11 +512,12 @@ impl State {
         first: Outcomes,
         notices: &mut Notices,
     ) {
+        let token = self.lease.active_token();
         if revoke {
             self.lease.local_revoke();
         }
         let producer = self.current_producer();
-        self.release(reason, producer.as_ref(), first, notices);
+        self.release_for_token(reason, producer.as_ref(), first, token, notices);
     }
 
     /// 丢掉过去 1 秒之前的一次性动作记录。
@@ -433,8 +565,9 @@ impl State {
         }
         // 先抬起到期的瞬时按住：它不是失效，不释放全部；抬起后同一步的下一个一次性动作可以接着做。
         if !self.ledger.lift_due(now) {
+            let token = self.lease.active_token();
             self.lease.local_revoke();
-            self.release_current(ReleaseReason::InjectionBlocked, notices);
+            self.release_current_for_token(ReleaseReason::InjectionBlocked, token, notices);
             return;
         }
         if let Some(current) = self.current.as_mut()
@@ -443,9 +576,7 @@ impl State {
             current.deadline = None;
             self.release_current(ReleaseReason::HeartbeatTimeout, notices);
         }
-        if self.lease.expire(now) {
-            self.release_current(ReleaseReason::LeaseExpired, notices);
-        }
+        self.expire_lease(now, notices);
         // 持续状态不只在发新动作时检查：持有输入期间帧龄一超限就释放。
         if !self.ledger.is_empty() && !frame_is_fresh(frames, now, limits) {
             self.release_current(ReleaseReason::FrameStale, notices);
@@ -458,6 +589,13 @@ impl State {
             && now >= active.deadline_ns
         {
             self.release_current(ReleaseReason::DeadlineExpired, notices);
+        }
+    }
+
+    fn expire_lease(&mut self, now: u64, notices: &mut Notices) {
+        let token = self.lease.active_token();
+        if self.lease.expire(now) {
+            self.release_current_for_token(ReleaseReason::LeaseExpired, token, notices);
         }
     }
 
@@ -845,7 +983,7 @@ impl Control {
                 last_release_id: 0,
                 verifies_release,
                 pending_verification: None,
-                last_verification_posted: 0,
+                last_verification_posted: None,
                 plan: Plan::default(),
                 policy: None,
                 requires_policy,
@@ -867,7 +1005,7 @@ impl Control {
     }
 
     /// 启动时先释放全部输入（`core_start`），之后才处理产出者与动作。
-    pub(crate) fn release_on_start(&self) -> InputReleasedParams {
+    pub(crate) fn release_on_start(&self) -> ReleasedInput {
         let mut notices = Notices::default();
         self.lock().release(
             ReleaseReason::CoreStart,
@@ -889,7 +1027,7 @@ impl Control {
         check: impl FnOnce() -> (T, bool),
     ) -> Option<T> {
         let mut state = self.lock();
-        if state.pending_verification != Some(release_id) {
+        if state.pending_verification_id() != Some(release_id) {
             return None;
         }
         let (observed, repair_rejected) = check();
@@ -907,7 +1045,7 @@ impl Control {
         observed: VerificationResult,
     ) -> InputVerificationParams {
         let mut state = self.lock();
-        let result = if state.pending_verification == Some(release_id) {
+        let result = if state.pending_verification_id() == Some(release_id) {
             match observed {
                 VerificationResult::Verified if state.input_fault.is_some() => {
                     VerificationResult::Unavailable
@@ -932,10 +1070,15 @@ impl Control {
 
     /// 回执入队后才放开对应的门禁；旧回执不能放开新的。
     #[cfg(any(windows, test))]
-    pub(crate) fn verification_posted(&self, release_id: u64) {
+    pub(crate) fn verification_posted(&self, observed: InputVerificationParams) {
         let mut state = self.lock();
-        state.last_verification_posted = state.last_verification_posted.max(release_id);
-        if state.pending_verification == Some(release_id) {
+        if state
+            .last_verification_posted
+            .is_none_or(|last| last.release_id < observed.release_id)
+        {
+            state.last_verification_posted = Some(observed);
+        }
+        if state.pending_verification_id() == Some(observed.release_id) {
             state.pending_verification = None;
         }
         self.done(state);
@@ -943,14 +1086,19 @@ impl Control {
 
     /// 退出前给最后一次释放的物理核验一段有限时间。
     pub(crate) fn wait_for_final_verification(&self, timeout: Duration) -> bool {
+        let has_report = |state: &State| {
+            state
+                .last_verification_posted
+                .map_or(0, |checked| checked.release_id)
+                == state.last_release_id
+        };
         let (state, _) = self
             .changed
             .wait_timeout_while(self.lock(), timeout, |state| {
-                state.verifies_release && state.last_verification_posted != state.last_release_id
+                state.verifies_release && !has_report(state)
             })
             .unwrap_or_else(PoisonError::into_inner);
-        state.input_fault.is_none()
-            && (!state.verifies_release || state.last_verification_posted == state.last_release_id)
+        state.input_fault.is_none() && (!state.verifies_release || has_report(&state))
     }
 
     /// `producer.heartbeat`。有效的心跳刷新截止时刻；更高的代次先释放（`producer_changed`）再切换。
@@ -1143,39 +1291,88 @@ impl Control {
         ActionSubmitResult::Accepted(Accepted {})
     }
 
-    /// 许可源的授予（`operator_lease.grant` 或 `test_lease.grant`）。换发了更大的令牌时先释放旧许可负责的
-    /// 输入（`lease_revoked`）。
+    /// 从同一把锁内读时钟并尝试授予。入站许可请求只处理到期与释放，执行计划由调度线程负责。
     pub(crate) fn grant_lease(
         &self,
         grant: &LeaseGrantParams,
-        now: u64,
-    ) -> (Result<(), Refusal>, Notices) {
+        read_clock: impl Fn() -> u64,
+    ) -> (Result<LeaseGrant, Refusal>, Notices) {
         let mut state = self.lock();
         let mut notices = Notices::default();
-        state.tick(now, &self.frames, &self.limits, &mut notices);
-        let mut result = if let Some(fault) = state.input_fault {
-            Err(fault)
-        } else {
-            state.lease.grant(grant.token, grant.expires_ns, now)
-        };
-        if result == Ok(Granted::Replaced)
-            && !state.release_current(ReleaseReason::LeaseRevoked, &mut notices)
-        {
-            result = Err(Refusal::ReleaseFailed);
-        }
+        let result = state.grant_lease(grant, read_clock, &mut notices);
         self.done(state);
-        (result.map(|_| ()), notices)
+        (result, notices)
+    }
+
+    /// 给核验线程有限时间。等待期间不持控制锁，旧令牌已失效且新令牌尚未安装。
+    pub(crate) fn wait_for_lease_proof(&self, release_id: u64) -> Result<(), Refusal> {
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(self.lock(), Duration::from_millis(200), |state| {
+                !state.stopping
+                    && state.input_fault.is_none()
+                    && state.last_release_id == release_id
+                    && state.pending_verification_id() == Some(release_id)
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        state.require_verified_release(release_id)
+    }
+
+    /// 核验已发布后在锁内复查释放编号、许可状态与本次授予的绝对截止，再安装令牌。
+    pub(crate) fn confirm_lease_grant(
+        &self,
+        grant: &LeaseGrantParams,
+        release_id: u64,
+        read_clock: impl FnOnce() -> u64,
+    ) -> Result<(), Refusal> {
+        let mut state = self.lock();
+        state.require_verified_release(release_id)?;
+        let now = read_clock();
+        if state.check_lease_grant(grant, now)? != Granted::New {
+            return Err(Refusal::ReleaseFailed);
+        }
+        state.lease.grant(grant.token, grant.expires_ns, now)?;
+        self.done(state);
+        Ok(())
     }
 
     /// 许可源的吊销（`operator_lease.revoke` 或 `test_lease.revoke`）：吊销 `token` 及更早的令牌；吊销了
     /// 有效的许可时先释放（`lease_revoked`）。
     /// 返回时释放已完成。
-    pub(crate) fn revoke_lease(&self, token: u64, now: u64) -> Notices {
+    pub(crate) fn revoke_lease(&self, token: u64, read_clock: impl FnOnce() -> u64) -> Notices {
         let mut state = self.lock();
         let mut notices = Notices::default();
-        state.tick(now, &self.frames, &self.limits, &mut notices);
+        state.expire_lease(read_clock(), &mut notices);
+        let previous = state.lease.active_token();
         if state.lease.revoke(token) {
-            state.release_current(ReleaseReason::LeaseRevoked, &mut notices);
+            state.release_current_for_token(ReleaseReason::LeaseRevoked, previous, &mut notices);
+        }
+        self.done(state);
+        notices
+    }
+
+    /// Bellis 要求在本次停止后重新核验，即使这个令牌已经停止。旧停止不得触碰更新的有效许可。
+    pub(crate) fn stop_bellis_input(
+        &self,
+        through: u64,
+        read_clock: impl FnOnce() -> u64,
+    ) -> Notices {
+        let mut state = self.lock();
+        let mut notices = Notices::default();
+        if !state.stopping {
+            state.expire_lease(read_clock(), &mut notices);
+            let newer = state
+                .lease
+                .active_token()
+                .is_some_and(|token| token > through);
+            state.lease.revoke(through);
+            if !newer {
+                state.release_current_for_token(
+                    ReleaseReason::LeaseRevoked,
+                    (through != 0).then_some(through),
+                    &mut notices,
+                );
+            }
         }
         self.done(state);
         notices
@@ -1235,12 +1432,13 @@ impl Control {
         let mut notices = Notices::default();
         let hook_lost = reason == ReleaseReason::HookLost;
         if !(state.stopping || hook_lost && state.input_fault.is_some()) {
+            let token = state.lease.active_token();
             if hook_lost {
                 state.latch_input_fault(Refusal::HookLost);
             } else {
                 state.lease.local_revoke();
             }
-            state.release_current(reason, &mut notices);
+            state.release_current_for_token(reason, token, &mut notices);
         }
         self.done(state);
         notices
@@ -1259,9 +1457,9 @@ impl Control {
     pub(crate) fn lease_source_lost(&self) -> Notices {
         let mut state = self.lock();
         let mut notices = Notices::default();
-        if !state.stopping {
-            state.lease.source_lost();
-            state.release_current(ReleaseReason::LeaseSourceLost, &mut notices);
+        let token = state.lease.active_token();
+        if !state.stopping && state.lease.source_lost() {
+            state.release_current_for_token(ReleaseReason::LeaseSourceLost, token, &mut notices);
         }
         self.done(state);
         notices
@@ -1303,10 +1501,15 @@ impl Control {
     /// 控制状态不知道音频：`audio` 为 `idle`、`latest_audio` 为 `null`，由会话按音频线程的状态填写
     /// （在这之后读，所以同样不早于 `now_ns`）。
     pub(crate) fn health(&self) -> CoreHealthParams {
+        self.health_with_queue_depth().0
+    }
+
+    pub(crate) fn health_with_queue_depth(&self) -> (CoreHealthParams, u32) {
         let now_ns = mono_clock::now_ns();
         let (capture, latest_frame) = self.frames.snapshot();
         let state = self.lock();
-        CoreHealthParams {
+        let depth = u32::try_from(state.plan.entries.len()).unwrap_or(u32::MAX);
+        let health = CoreHealthParams {
             now_ns,
             capture,
             inputs_held: !state.ledger.is_empty(),
@@ -1315,7 +1518,8 @@ impl Control {
             lease: state.lease.status(now_ns),
             audio: CaptureState::Idle,
             latest_audio: None,
-        }
+        };
+        (health, depth)
     }
 
     /// 下一次需要醒来的时刻：心跳截止、许可到期、下一步、在效块的截止时刻，以及持有输入时帧龄超限

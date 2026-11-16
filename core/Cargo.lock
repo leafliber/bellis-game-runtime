@@ -265,6 +265,7 @@ dependencies = [
  "capture",
  "core-protocol",
  "frame-ring",
+ "game-bridge-protocol",
  "getrandom",
  "mono-clock",
  "serde",

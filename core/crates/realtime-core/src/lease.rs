@@ -46,6 +46,8 @@ pub(crate) enum Refusal {
     Lapsed { token: u64 },
     /// 到期时刻不晚于现在。
     PastExpiry { expires_ns: u64, now: u64 },
+    /// 系统单调时钟读数不可用。
+    ClockUnavailable,
     /// 没有许可源，或与它的连接已断开。
     NoSource,
     /// 本实例的接管钩子失效。
@@ -70,6 +72,7 @@ impl fmt::Display for Refusal {
             Self::PastExpiry { expires_ns, now } => {
                 write!(f, "expires_ns {expires_ns} is not after now ({now})")
             }
+            Self::ClockUnavailable => f.write_str("the system monotonic clock is unavailable"),
             Self::NoSource => f.write_str("there is no lease source"),
             Self::HookLost => f.write_str("the input hook has failed; restart the core"),
             Self::ReleaseFailed => f.write_str("input release failed; restart the core"),
@@ -106,6 +109,19 @@ impl Lease {
         expires_ns: u64,
         now: u64,
     ) -> Result<Granted, Refusal> {
+        let granted = self.check_grant(token, expires_ns, now)?;
+        self.current_token = Some(token);
+        self.state = State::Valid { token, expires_ns };
+        Ok(granted)
+    }
+
+    /// 核对授予或续约。换发令牌可能要先完成旧许可的物理释放，因此这里不改变状态。
+    pub(crate) fn check_grant(
+        &self,
+        token: u64,
+        expires_ns: u64,
+        now: u64,
+    ) -> Result<Granted, Refusal> {
         if !self.has_source || self.state == State::SourceLost {
             return Err(Refusal::NoSource);
         }
@@ -122,19 +138,23 @@ impl Lease {
         if expires_ns <= now {
             return Err(Refusal::PastExpiry { expires_ns, now });
         }
-        let granted = match self.state {
-            State::Valid { token: held, .. } if held == token => Granted::Renewed,
-            State::Valid { .. } => Granted::Replaced,
-            State::Expired { token: lapsed } if lapsed == token => {
-                return Err(Refusal::Lapsed { token });
+        match self.state {
+            State::Valid {
+                token: held,
+                expires_ns: previous_deadline,
+            } if held == token => {
+                if now < previous_deadline {
+                    Ok(Granted::Renewed)
+                } else {
+                    Err(Refusal::Lapsed { token })
+                }
             }
+            State::Valid { .. } => Ok(Granted::Replaced),
+            State::Expired { token: lapsed } if lapsed == token => Err(Refusal::Lapsed { token }),
             State::NotGranted | State::Expired { .. } | State::Revoked | State::SourceLost => {
-                Granted::New
+                Ok(Granted::New)
             }
-        };
-        self.current_token = Some(token);
-        self.state = State::Valid { token, expires_ns };
-        Ok(granted)
+        }
     }
 
     /// 吊销 `token` 及更早的全部令牌；返回是否吊销了一个有效的许可（调用方随之释放）。
@@ -175,9 +195,19 @@ impl Lease {
     }
 
     /// 与许可源的连接断开。
-    pub(crate) fn source_lost(&mut self) {
-        if self.has_source {
-            self.state = State::SourceLost;
+    pub(crate) fn source_lost(&mut self) -> bool {
+        if !self.has_source || self.state == State::SourceLost {
+            return false;
+        }
+        self.state = State::SourceLost;
+        true
+    }
+
+    /// 本次授予的实际令牌。撤销水位可能高于所有授予过的令牌。
+    pub(crate) fn active_token(&self) -> Option<u64> {
+        match self.state {
+            State::Valid { token, .. } => Some(token),
+            _ => None,
         }
     }
 

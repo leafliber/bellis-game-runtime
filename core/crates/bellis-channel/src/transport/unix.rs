@@ -66,15 +66,35 @@ impl Transport for UnixTransport {
         }
     }
 
-    fn write_all(&self, buf: &[u8]) -> io::Result<()> {
+    fn write_all(&self, mut buf: &[u8], deadline: Option<Instant>) -> io::Result<()> {
         let _guard = self
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.closed.load(Ordering::Acquire) {
-            return Err(shut_down());
+        while !buf.is_empty() {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(shut_down());
+            }
+            let timeout = match remaining(deadline) {
+                Some(left) if left.is_zero() => return Err(timed_out()),
+                Some(left) => Some(left.max(Duration::from_millis(1))),
+                None => None,
+            };
+            self.stream.set_write_timeout(timeout)?;
+            match (&self.stream).write(buf) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => buf = &buf[written..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if deadline.is_some()
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                Err(error) => return Err(error),
+            }
         }
-        (&self.stream).write_all(buf)
+        Ok(())
     }
 
     fn shutdown(&self) {

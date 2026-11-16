@@ -11,6 +11,7 @@ use core_protocol::messages::{
     HeldMouseButton, KeyPress, LatestFrame, LeaseGrantParams, LeaseStatus, MouseButton, Producer,
     ProducerHeartbeatParams, RejectReason, ReleaseReason, Scroll,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -166,8 +167,8 @@ impl Armed {
     fn grant(&self, token: u64, expires_ns: u64, now: u64) -> Notices {
         let (result, notices) = self
             .control
-            .grant_lease(&LeaseGrantParams { token, expires_ns }, now);
-        result.unwrap();
+            .grant_lease(&LeaseGrantParams { token, expires_ns }, || now);
+        assert_eq!(result.unwrap(), super::LeaseGrant::Applied);
         notices
     }
 
@@ -186,7 +187,7 @@ impl Armed {
 fn start_releases_without_a_producer() {
     let backend = Recorder::default();
     let control = Control::new(limits(), Arc::default(), backend.backend(), false);
-    let released = control.release_on_start();
+    let released = control.release_on_start().params;
     assert_eq!(released.reason, ReleaseReason::CoreStart);
     assert_eq!(released.producer, None);
     assert!(released.released_at_ns > 0);
@@ -195,6 +196,69 @@ fn start_releases_without_a_producer() {
     assert!(!health.inputs_held);
     assert_eq!(health.producer, None);
     assert_eq!(health.lease, LeaseStatus::NotGranted);
+}
+
+#[test]
+fn bellis_stop_for_an_old_token_does_not_touch_a_newer_held_input() {
+    let armed = Armed::new();
+    let replacement = armed.grant(2, T0 + 10_000 * MS, T0);
+    let [super::Notice::Released(previous)] = replacement.0.as_slice() else {
+        panic!("replacing the token must release the old lease");
+    };
+    assert_eq!(previous.token, Some(1));
+    armed.inputs();
+
+    let inputs = block(1, T0, 1_000, vec![step(0, vec![key(0x11)], vec![])]);
+    assert!(accepted(&armed.submit(inputs, T0).0));
+    armed.control.tick(T0);
+    assert_ne!(armed.inputs(), [] as [String; 0]);
+    assert!(armed.control.stop_bellis_input(1, || T0 + MS).is_empty());
+    assert_eq!(armed.inputs(), [] as [String; 0]);
+    assert!(armed.control.health().inputs_held);
+}
+
+#[test]
+fn a_renewal_waiting_for_the_control_lock_cannot_revive_an_expired_token() {
+    let armed = Armed::new();
+    let expires = T0 + 50 * MS;
+    let short_grant = LeaseGrantParams {
+        token: 1,
+        expires_ns: expires,
+    };
+    let (shortened, _) = armed.control.grant_lease(&short_grant, || {
+        assert!(matches!(
+            armed.control.state.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        T0
+    });
+    assert_eq!(shortened.unwrap(), super::LeaseGrant::Applied);
+    let old_plan = block(1, T0, 200, vec![step(25, vec![key(0x11)], vec![])]);
+    assert!(accepted(&armed.submit(old_plan, T0).0));
+
+    let clock = AtomicU64::new(T0 + 25 * MS);
+    let (arrived, ready) = mpsc::channel();
+    let locked = armed.control.lock();
+    let (result, notices) = thread::scope(|scope| {
+        let renewal = scope.spawn(|| {
+            arrived.send(()).unwrap();
+            armed.control.grant_lease(
+                &LeaseGrantParams {
+                    token: 1,
+                    expires_ns: T0 + 500 * MS,
+                },
+                || clock.load(Ordering::Relaxed),
+            )
+        });
+        ready.recv().unwrap();
+        clock.store(expires, Ordering::Relaxed);
+        drop(locked);
+        renewal.join().unwrap()
+    });
+    assert_eq!(result, Err(crate::lease::Refusal::Lapsed { token: 1 }));
+    assert_eq!(notices.released(), [ReleaseReason::LeaseExpired]);
+    assert!(!armed.control.health().inputs_held);
+    assert_eq!(armed.inputs(), ["release all LeaseExpired"]);
 }
 
 #[test]
@@ -707,7 +771,7 @@ fn every_authority_condition_gates_every_input() {
         (
             "the lease was revoked",
             |armed| {
-                armed.control.revoke_lease(1, T0);
+                armed.control.revoke_lease(1, || T0);
                 T0
             },
             ReleaseReason::LeaseRevoked,
@@ -946,7 +1010,7 @@ fn a_renewal_with_a_stale_token_does_not_extend_the_lease() {
             token: 4,
             expires_ns: T0 + 10_000 * MS,
         },
-        T0 + MS,
+        || T0 + MS,
     );
     assert!(result.is_err());
     assert_eq!(
@@ -1074,7 +1138,7 @@ fn the_scheduler_runs_steps_and_timers_in_real_time() {
             token: 1,
             expires_ns: now + 10_000 * MS,
         },
-        now,
+        || now,
     );
     result.unwrap();
     control.heartbeat(&beat("a", 1, 1), now).unwrap();
@@ -1124,7 +1188,7 @@ fn releasing_never_waits_for_the_capture_side() {
             reasons
                 .lock()
                 .unwrap()
-                .push(control.release_on_start().reason);
+                .push(control.release_on_start().params.reason);
             control.heartbeat(&beat("a", 1, 1), T0).unwrap();
             push(control.heartbeat(&beat("b", 2, 1), T0).unwrap());
             push(control.tick(T0 + HEARTBEAT_TIMEOUT));
@@ -1133,14 +1197,14 @@ fn releasing_never_waits_for_the_capture_side() {
                 token: 1,
                 expires_ns: T0 + 10 * MS,
             };
-            control.grant_lease(&first, T0).0.unwrap();
+            control.grant_lease(&first, || T0).0.unwrap();
             push(control.tick(T0 + 10 * MS));
             let second = LeaseGrantParams {
                 token: 2,
                 expires_ns: T0 + 100 * MS,
             };
-            control.grant_lease(&second, T0 + 10 * MS).0.unwrap();
-            push(control.revoke_lease(2, T0 + 20 * MS));
+            control.grant_lease(&second, || T0 + 10 * MS).0.unwrap();
+            push(control.revoke_lease(2, || T0 + 20 * MS));
             push(control.lease_source_lost());
             push(control.stop());
             push(control.release_on_exit(ReleaseReason::CoreConnectionLost));
@@ -1449,7 +1513,7 @@ fn a_local_revoke_releases_and_invalidates_the_token() {
             token: 1,
             expires_ns: T0 + 20_000 * MS,
         },
-        T0 + MS,
+        || T0 + MS,
     );
     assert!(result.is_err());
     let (result, _) = armed.control.grant_lease(
@@ -1457,7 +1521,7 @@ fn a_local_revoke_releases_and_invalidates_the_token() {
             token: 2,
             expires_ns: T0 + 20_000 * MS,
         },
-        T0 + MS,
+        || T0 + MS,
     );
     assert!(result.is_ok(), "换发更大的令牌被接受");
 }
@@ -1475,7 +1539,7 @@ fn regression_hook_lost_cannot_be_rearmed_in_the_same_instance() {
             token: 2,
             expires_ns: T0 + 10_000 * MS,
         },
-        T0 + MS,
+        || T0 + MS,
     );
     assert!(result.is_err(), "钩子失效的实例不能接受新许可");
 }
@@ -1483,6 +1547,6 @@ fn regression_hook_lost_cannot_be_rearmed_in_the_same_instance() {
 #[test]
 fn regression_core_start_marks_unchecked_physical_release_as_unverified() {
     let armed = Armed::new_real();
-    let released = serde_json::to_value(armed.control.release_on_start()).unwrap();
+    let released = serde_json::to_value(armed.control.release_on_start().params).unwrap();
     assert_eq!(released["verification"], "unverified");
 }

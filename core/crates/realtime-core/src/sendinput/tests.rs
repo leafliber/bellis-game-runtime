@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use core_protocol::messages::{
     Action, ActionBlock, ActionSubmitResult, Click, ControlStep, HeldInput, HeldKey,
-    HeldMouseButton, KeyPress, LatestFrame, LeaseGrantParams, MouseButton, Producer,
+    HeldMouseButton, KeyPress, LatestFrame, LeaseGrantParams, LeaseStatus, MouseButton, Producer,
     ProducerHeartbeatParams, RejectReason, ReleaseReason, ReleaseVerification, ResidualCause,
     Scroll, VerificationResult,
 };
@@ -27,8 +27,9 @@ use super::{
     VerifyKey, VerifyKeys, Win32, absolute, check_release, normalize_vk, physical_button,
     self_check_count, verify_residual,
 };
-use crate::control::{Control, Limits, Notice};
+use crate::control::{Control, LeaseGrant, Limits, Notice};
 use crate::frames::{FrameStatus, Geometry};
+use crate::lease::Refusal;
 use crate::ledger::{Inject, InputBackend, Momentary};
 use crate::sendinput::SendInputBackend;
 
@@ -758,7 +759,7 @@ fn regression_rejected_key_up_is_reported() {
                 token: 1,
                 expires_ns: 500,
             },
-            100,
+            || 100,
         )
         .0
         .unwrap();
@@ -807,9 +808,9 @@ fn regression_rejected_key_up_is_reported() {
     let [Notice::Released(released)] = notices.0.as_slice() else {
         panic!("expected one release, got {notices:?}");
     };
-    assert_eq!(release_id, Some(released.release_id));
+    assert_eq!(release_id, Some(released.params.release_id));
     assert_eq!(
-        serde_json::to_value(released).unwrap()["verification"],
+        serde_json::to_value(&released.params).unwrap()["verification"],
         "up_failed"
     );
     assert!(
@@ -819,7 +820,7 @@ fn regression_rejected_key_up_is_reported() {
                     token: 2,
                     expires_ns: 600
                 },
-                200
+                || 200
             )
             .0
             .is_err(),
@@ -883,10 +884,197 @@ fn verifying_control(
 }
 
 #[test]
+fn bellis_stop_rechecks_an_already_expired_or_revoked_token() {
+    let win32 = FakeWin32::with_target(target(1));
+    let (control, keys, rx) = verifying_control(&win32);
+    control.release_on_start();
+    control.configure(&verification_policy()).unwrap();
+    let keys = keys.lock().unwrap().clone();
+    let check = |request| {
+        let observed = check_release(
+            &control,
+            win32.as_ref(),
+            &keys,
+            request,
+            |_| unreachable!(),
+            || unreachable!(),
+        );
+        control.verification_posted(observed);
+        observed
+    };
+    assert_eq!(
+        check(rx.try_recv().unwrap()).result,
+        VerificationResult::Verified
+    );
+    control
+        .grant_lease(
+            &LeaseGrantParams {
+                token: 7,
+                expires_ns: 300,
+            },
+            || 100,
+        )
+        .0
+        .unwrap();
+    control.tick(300);
+    let expired = check(rx.try_recv().unwrap());
+    assert_eq!(expired.result, VerificationResult::Verified);
+
+    let mut previous_id = expired.release_id;
+    for (through, token) in [(7, Some(7)), (7, Some(7)), (0, None)] {
+        let stop_boundary = mono_clock::now_ns();
+        let notices = control.stop_bellis_input(through, || 301);
+        let [Notice::Released(released)] = notices.0.as_slice() else {
+            panic!("stop must initiate its own release");
+        };
+        assert_eq!(released.token, token);
+        assert!(released.params.release_id > previous_id);
+        assert!(released.params.released_at_ns >= stop_boundary);
+        assert!(released.awaits_verification);
+        let observed = check(rx.try_recv().unwrap());
+        assert_eq!(observed.release_id, released.params.release_id);
+        assert_eq!(observed.result, VerificationResult::Verified);
+        assert!(observed.checked_at_ns >= released.params.released_at_ns);
+        previous_id = observed.release_id;
+    }
+}
+
+#[test]
+fn a_replacement_is_not_acknowledged_before_old_input_is_verified() {
+    for residual in [true, false] {
+        let win32 = FakeWin32::with_target(target(1));
+        let (control, keys, rx) = verifying_control(&win32);
+        control.release_on_start();
+        control.configure(&verification_policy()).unwrap();
+        let keys = keys.lock().unwrap().clone();
+        let observe =
+            |request| check_release(&control, win32.as_ref(), &keys, request, |_| {}, || {});
+        control.verification_posted(observe(rx.try_recv().unwrap()));
+        let now = mono_clock::now_ns();
+        let replacement = LeaseGrantParams {
+            token: 2,
+            expires_ns: now + 1_000_000_000,
+        };
+        let first = LeaseGrantParams {
+            token: 1,
+            ..replacement
+        };
+        assert_eq!(
+            control.grant_lease(&first, || now).0,
+            Ok(LeaseGrant::Applied)
+        );
+        let (grant, notices) = control.grant_lease(&replacement, || now);
+        let [Notice::Released(old)] = notices.0.as_slice() else {
+            panic!("expected release of token 1");
+        };
+        let id = old.params.release_id;
+        assert_eq!(old.token, Some(1));
+        assert_eq!(grant, Ok(LeaseGrant::Verifying(id)));
+        assert_eq!(control.health().lease, LeaseStatus::Revoked);
+        assert_eq!(
+            control.confirm_lease_grant(&replacement, id, || now),
+            Err(Refusal::ReleaseFailed)
+        );
+        if residual {
+            win32.inner().down_scans.push(0x11);
+        }
+        let request = rx.try_recv().unwrap();
+        assert_eq!(request.release_id, id);
+        let checked = observe(request);
+        assert_eq!(control.health().lease, LeaseStatus::Revoked);
+        assert_eq!(
+            control.confirm_lease_grant(&replacement, id, || now),
+            Err(Refusal::ReleaseFailed)
+        );
+        control.verification_posted(checked);
+        if residual {
+            assert_eq!(checked.result, VerificationResult::Residual);
+            assert_eq!(
+                control.wait_for_lease_proof(id),
+                Err(Refusal::ReleaseFailed)
+            );
+            assert_eq!(
+                control.confirm_lease_grant(&replacement, id, || now),
+                Err(Refusal::ReleaseFailed)
+            );
+        } else {
+            assert_eq!(checked.result, VerificationResult::Verified);
+            control.wait_for_lease_proof(id).unwrap();
+            let expires = replacement.expires_ns;
+            assert_eq!(
+                control.confirm_lease_grant(&replacement, id, || expires),
+                Err(Refusal::PastExpiry {
+                    expires_ns: expires,
+                    now: expires
+                })
+            );
+        }
+        assert_eq!(control.health().lease, LeaseStatus::Revoked);
+    }
+}
+
+#[test]
+fn retry_waits_for_the_release_that_superseded_the_old_lease_check() {
+    let win32 = FakeWin32::with_target(target(1));
+    let (control, keys, rx) = verifying_control(&win32);
+    control.configure(&verification_policy()).unwrap();
+    let keys = keys.lock().unwrap().clone();
+    let observe = |request| {
+        check_release(
+            &control,
+            win32.as_ref(),
+            &keys,
+            request,
+            |_| unreachable!(),
+            || unreachable!(),
+        )
+    };
+    let now = mono_clock::now_ns();
+    let first = LeaseGrantParams {
+        token: 1,
+        expires_ns: now + 1_000_000_000,
+    };
+    control.grant_lease(&first, || now).0.unwrap();
+    let replacement = LeaseGrantParams { token: 2, ..first };
+    let (grant, _) = control.grant_lease(&replacement, || now);
+    let old = rx.try_recv().unwrap();
+    assert_eq!(grant, Ok(LeaseGrant::Verifying(old.release_id)));
+
+    let stopped = control.local_revoke(ReleaseReason::EmergencyStop);
+    let [Notice::Released(new)] = stopped.0.as_slice() else {
+        panic!("expected another release");
+    };
+    assert_eq!(new.token, None);
+    let new_id = new.params.release_id;
+    let superseded = observe(old);
+    assert_eq!(superseded.result, VerificationResult::Superseded);
+    control.verification_posted(superseded);
+    assert_eq!(
+        control.wait_for_lease_proof(old.release_id),
+        Err(Refusal::ReleaseFailed)
+    );
+    assert_eq!(
+        control.grant_lease(&replacement, || now).0,
+        Ok(LeaseGrant::Verifying(new_id))
+    );
+    assert_eq!(control.health().lease, LeaseStatus::Revoked);
+
+    let checked = observe(rx.try_recv().unwrap());
+    assert_eq!(checked.release_id, new_id);
+    assert_eq!(checked.result, VerificationResult::Verified);
+    control.verification_posted(checked);
+    control.wait_for_lease_proof(new_id).unwrap();
+    control
+        .confirm_lease_grant(&replacement, new_id, || now)
+        .unwrap();
+    assert_eq!(control.health().lease, LeaseStatus::Valid);
+}
+
+#[test]
 fn an_old_check_never_opens_a_new_release_gate() {
     let win32 = FakeWin32::with_target(target(1));
     let (control, keys, rx) = verifying_control(&win32);
-    let startup = control.release_on_start();
+    let startup = control.release_on_start().params;
     assert_eq!(startup.verification, ReleaseVerification::Unverified);
     assert!(rx.try_recv().is_err());
     control.configure(&verification_policy()).unwrap();
@@ -908,13 +1096,13 @@ fn an_old_check_never_opens_a_new_release_gate() {
     };
     let old_result = observe(old);
     assert_eq!(old_result.result, VerificationResult::Superseded);
-    control.verification_posted(old_result.release_id);
+    control.verification_posted(old_result);
 
     let lease = LeaseGrantParams {
         token: 1,
         expires_ns: 600,
     };
-    control.grant_lease(&lease, 100).0.unwrap();
+    control.grant_lease(&lease, || 100).0.unwrap();
     let producer = Producer {
         id: "fake-win32".into(),
         generation: 1,
@@ -948,7 +1136,7 @@ fn an_old_check_never_opens_a_new_release_gate() {
         control.submit(inputs.clone(), 100).0,
         ActionSubmitResult::Rejected(_)
     ));
-    control.verification_posted(new_result.release_id);
+    control.verification_posted(new_result);
     assert!(matches!(
         control.submit(inputs, 100).0,
         ActionSubmitResult::Accepted(_)
@@ -979,14 +1167,14 @@ fn regression_a_replacement_producer_cannot_press_before_release_verification() 
             || unreachable!(),
         );
         assert_eq!(checked.result, VerificationResult::Verified);
-        control.verification_posted(checked.release_id);
+        control.verification_posted(checked);
     };
     check(rx.try_recv().unwrap());
     let lease = LeaseGrantParams {
         token: 1,
         expires_ns: 600,
     };
-    control.grant_lease(&lease, 100).0.unwrap();
+    control.grant_lease(&lease, || 100).0.unwrap();
     let old = Producer {
         id: "old".into(),
         generation: 1,
@@ -1064,14 +1252,14 @@ fn regression_a_replacement_producer_cannot_press_before_release_verification() 
         ActionSubmitResult::Rejected(_)
     ));
 
-    let (grant, lease_release) = control.grant_lease(
-        &LeaseGrantParams {
-            token: 2,
-            expires_ns: 700,
-        },
-        203,
-    );
-    grant.unwrap();
+    let next_lease = LeaseGrantParams {
+        token: 2,
+        expires_ns: 700,
+    };
+    let (grant, lease_release) = control.grant_lease(&next_lease, || 203);
+    let Ok(LeaseGrant::Verifying(release_id)) = grant else {
+        panic!("replacement must wait for release");
+    };
     assert_eq!(lease_release.released(), [ReleaseReason::LeaseRevoked]);
     assert!(matches!(
         control.submit(next_block.clone(), 203).0,
@@ -1093,12 +1281,18 @@ fn regression_a_replacement_producer_cannot_press_before_release_verification() 
         || unreachable!(),
     );
     assert_eq!(heartbeat_check.result, VerificationResult::Superseded);
-    control.verification_posted(heartbeat_check.release_id);
+    control.verification_posted(heartbeat_check);
     assert!(matches!(
         control.submit(next_block.clone(), 203).0,
         ActionSubmitResult::Rejected(_)
     ));
-    check(rx.try_recv().unwrap());
+    let replacement_check = rx.try_recv().unwrap();
+    assert_eq!(replacement_check.release_id, release_id);
+    check(replacement_check);
+    control.wait_for_lease_proof(release_id).unwrap();
+    control
+        .confirm_lease_grant(&next_lease, release_id, || 203)
+        .unwrap();
     assert!(matches!(
         control.submit(next_block, 203).0,
         ActionSubmitResult::Accepted(_)
@@ -1143,7 +1337,7 @@ fn a_rejected_residual_repair_or_unreadable_desktop_blocks_new_leases() {
             assert_eq!(residual.release_id, request.release_id);
             assert!(!residual.repair_accepted);
         }
-        control.verification_posted(checked.release_id);
+        control.verification_posted(checked);
         assert!(
             control
                 .grant_lease(
@@ -1151,7 +1345,7 @@ fn a_rejected_residual_repair_or_unreadable_desktop_blocks_new_leases() {
                         token: 2,
                         expires_ns: 600
                     },
-                    200
+                    || 200
                 )
                 .0
                 .is_err()

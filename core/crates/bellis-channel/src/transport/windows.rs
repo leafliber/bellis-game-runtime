@@ -236,7 +236,7 @@ impl Transport for NamedPipeTransport {
         }
     }
 
-    fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
+    fn write_all(&self, mut buf: &[u8], deadline: Option<Instant>) -> io::Result<()> {
         let _guard = self
             .write_lock
             .lock()
@@ -244,6 +244,9 @@ impl Transport for NamedPipeTransport {
         while !buf.is_empty() {
             if self.closed.load(Ordering::Acquire) {
                 return Err(shut_down());
+            }
+            if remaining(deadline).is_some_and(|left| left.is_zero()) {
+                return Err(timed_out());
             }
             let length = buf.len().min(u32::MAX as usize);
             let mut overlapped = OVERLAPPED {
@@ -264,10 +267,12 @@ impl Transport for NamedPipeTransport {
                 Err(error) if is(&error, ERROR_IO_PENDING) => {}
                 Err(error) => return Err(os_error(&error)),
             }
-            match self.finish(&overlapped, &self.write_event, None)? {
+            match self.finish(&overlapped, &self.write_event, deadline)? {
+                Outcome::Done(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Outcome::Done(count) => buf = &buf[count..],
                 Outcome::Eof => return Err(io::Error::from(io::ErrorKind::BrokenPipe)),
-                Outcome::Interrupted { .. } => return Err(shut_down()),
+                Outcome::Interrupted { closed: true } => return Err(shut_down()),
+                Outcome::Interrupted { closed: false } => return Err(timed_out()),
             }
         }
         Ok(())

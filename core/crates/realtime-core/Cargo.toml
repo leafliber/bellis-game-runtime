@@ -12,6 +12,7 @@ bellis-channel = { path = "../bellis-channel" }
 capture = { path = "../capture" }
 core-protocol = { path = "../core-protocol" }
 frame-ring = { path = "../frame-ring" }
+game-bridge-protocol = { path = "../game-bridge-protocol" }
 mono-clock = { path = "../mono-clock" }
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +21,7 @@ serde_json.workspace = true
 getrandom.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security_Credentials",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_StationsAndDesktops",

@@ -563,7 +563,7 @@ fn spawn_verify(
                     || thread::sleep(VERIFY_DELAY),
                 );
                 post(Notices(vec![Notice::Verification(verified)]));
-                control.verification_posted(verified.release_id);
+                control.verification_posted(verified);
             }
         })?;
     Ok(())

@@ -141,7 +141,11 @@ impl Connection {
         };
         let deadline = Instant::now() + options.handshake_timeout;
         let mut reader = FrameReader::new();
-        let write = |bytes: &[u8]| transport.write_all(bytes).map_err(|error| io_error(&error));
+        let write = |bytes: &[u8]| {
+            transport
+                .write_all(bytes, Some(deadline))
+                .map_err(|error| io_error(&error))
+        };
         let result = (|| {
             write(&handshake.hello())?;
             let challenge = reader.read(&*transport, HANDSHAKE_MAX_FRAME_BYTES, Some(deadline))?;
@@ -195,7 +199,24 @@ impl Connection {
     ///
     /// 超出帧长上限时为 `frame-too-large`，连接不受影响；连接已关闭或写入失败时为 `closed`。
     pub fn send(&self, message: &Value) -> Result<(), ChannelError> {
-        self.send_frame(FrameKind::Json, &json::dumps(message))
+        self.send_frame(FrameKind::Json, &json::dumps(message), None)
+    }
+
+    /// 在时限内写完整的 JSON 帧。用于只有一个发送线程的连接。
+    ///
+    /// # Errors
+    ///
+    /// 同 `send`。已尝试发送的帧在写入超时后关闭连接，因为对端可能持有半帧。
+    pub fn send_with_timeout(
+        &self,
+        message: &Value,
+        timeout: Duration,
+    ) -> Result<(), ChannelError> {
+        self.send_frame(
+            FrameKind::Json,
+            &json::dumps(message),
+            Some(Instant::now() + timeout),
+        )
     }
 
     /// 发送一帧二进制数据。
@@ -204,14 +225,19 @@ impl Connection {
     ///
     /// 同 `send`。
     pub fn send_binary(&self, data: &[u8]) -> Result<(), ChannelError> {
-        self.send_frame(FrameKind::Binary, data)
+        self.send_frame(FrameKind::Binary, data, None)
     }
 
     pub(crate) fn send_json_bytes(&self, payload: &[u8]) -> Result<(), ChannelError> {
-        self.send_frame(FrameKind::Json, payload)
+        self.send_frame(FrameKind::Json, payload, None)
     }
 
-    fn send_frame(&self, kind: FrameKind, payload: &[u8]) -> Result<(), ChannelError> {
+    fn send_frame(
+        &self,
+        kind: FrameKind,
+        payload: &[u8],
+        deadline: Option<Instant>,
+    ) -> Result<(), ChannelError> {
         if !self.is_open() {
             return Err(ChannelError::new(ErrorCode::Closed, "连接未打开"));
         }
@@ -226,8 +252,15 @@ impl Connection {
             ));
         }
         self.transport
-            .write_all(&encode_frame(kind, payload))
-            .map_err(|error| self.fail(io_error(&error)))
+            .write_all(&encode_frame(kind, payload), deadline)
+            .map_err(|error| {
+                let error = if error.kind() == io::ErrorKind::TimedOut {
+                    ChannelError::new(ErrorCode::Timeout, "超过截止时间仍未写出完整的帧")
+                } else {
+                    io_error(&error)
+                };
+                self.fail(error)
+            })
     }
 
     /// 接收下一条消息，阻塞到收到为止或超过 `timeout`。
@@ -237,6 +270,20 @@ impl Connection {
     /// 超过 `timeout` 时为 `timeout`，连接仍可用；对端关闭时为 `closed`；帧超长、帧类型未知、
     /// 认证后收到握手帧或 JSON 不合法时断开连接并返回对应的错误。
     pub fn recv(&self, timeout: Option<Duration>) -> Result<Message, ChannelError> {
+        let frame = self.recv_frame(timeout)?;
+        if frame.kind == FrameKind::Json {
+            return json::loads(&frame.payload, "消息")
+                .map(Message::Json)
+                .map_err(|error| self.fail(error));
+        }
+        Ok(Message::Binary(frame.payload))
+    }
+
+    /// 接收认证后的 JSON 或二进制帧，交给调用方解析原始负载。
+    ///
+    /// # Errors
+    /// 读超时保留半帧。其它读取错误、帧长或帧类型不合法、认证后收到握手帧时关闭连接。
+    pub fn recv_frame(&self, timeout: Option<Duration>) -> Result<Frame, ChannelError> {
         if let Some(error) = self.failure() {
             return Err(error);
         }
@@ -250,16 +297,13 @@ impl Connection {
             Err(error) if error.code() == ErrorCode::Timeout => return Err(error),
             Err(error) => return Err(self.fail(error)),
         };
-        match frame.kind {
-            FrameKind::Binary => Ok(Message::Binary(frame.payload)),
-            FrameKind::Handshake => Err(self.fail(ChannelError::new(
+        if frame.kind == FrameKind::Handshake {
+            return Err(self.fail(ChannelError::new(
                 ErrorCode::ProtocolError,
                 "认证后收到握手帧",
-            ))),
-            FrameKind::Json => json::loads(&frame.payload, "消息")
-                .map(Message::Json)
-                .map_err(|error| self.fail(error)),
+            )));
         }
+        Ok(frame)
     }
 
     /// 断开连接，唤醒阻塞中的 `recv`。可以从任一线程调用，可以重复调用。

@@ -9,7 +9,7 @@ use std::fmt;
 use std::io::{self, Write as _};
 use std::process::ExitCode;
 
-use realtime_core::config::{InputSetup, Launch, Options, USAGE};
+use realtime_core::config::{Launch, Options, USAGE};
 use realtime_core::{install_panic_exit, session};
 
 /// 写一行到 stderr；写失败时丢弃，不 panic。
@@ -43,12 +43,7 @@ fn main() -> ExitCode {
     };
     // 门禁：许可源只有一个；测试许可源只能与假输入后端一起、且只在没有操作员许可连接时启用；操作员许可
     // 连接离不开输入后端。
-    let input = match InputSetup::select(
-        options.input_backend,
-        launch.test_device.take(),
-        launch.operator.take(),
-        options.emergency_hotkey.clone(),
-    ) {
+    let input = match launch.select_input(&options) {
         Ok(input) => input,
         Err(error) => {
             say(format_args!("{error}\n{USAGE}"));
