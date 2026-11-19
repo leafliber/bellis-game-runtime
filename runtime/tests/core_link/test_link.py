@@ -12,9 +12,11 @@ import time
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
+from core_protocol import models
 from core_protocol.models import (
     CoreHealthParams,
     InputReleasedParams,
@@ -23,6 +25,7 @@ from core_protocol.models import (
     ReleaseReason,
     VerificationResult,
 )
+from game_runtime.channel import ChannelError
 from game_runtime.core_link import (
     CoreLink,
     CoreLinkOptions,
@@ -30,6 +33,10 @@ from game_runtime.core_link import (
     StopResult,
     StopStage,
     shutdown_runtime,
+)
+from game_runtime.core_link.link import (
+    _Instance,  # pyright: ignore[reportPrivateUsage]
+    _Submission,  # pyright: ignore[reportPrivateUsage]
 )
 from game_runtime.kernel import (
     CONTROL_SUBMIT,
@@ -47,6 +54,59 @@ from game_runtime.kernel import (
 )
 
 WAIT = 5.0
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_receipt_matches_the_original_producer_and_action(
+    conflicting: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def exercise() -> None:
+        producer = Producer(id="controller", generation=1)
+        block = models.ActionBlock(
+            producer=producer,
+            seq=1,
+            base_frame=1,
+            start_ns=10,
+            deadline_ns=100,
+            steps=[
+                models.ControlStep(
+                    offset_ns=0,
+                    held=[],
+                    actions=[models.Action(root=models.KeyPress(id=1, scan_code=1))],
+                )
+            ],
+        )
+        link = CoreLink(link_options(Path("realtime-core")))
+        instance = Mock(spec=_Instance, hello_at_ns=10)
+        monkeypatch.setattr(link, "_instance", instance)
+        submission = _Submission(block, asyncio.get_running_loop().create_future())
+        link._submissions[(producer.generation, block.seq)] = submission  # pyright: ignore[reportPrivateUsage]
+        submission.resolve(models.Accepted())
+        executed = models.Executed(id=1, at_ns=10)
+        wrong_producer = models.ActionReceiptParams(
+            producer=Producer(id="other", generation=producer.generation),
+            block_seq=block.seq,
+            outcomes=[models.ActionOutcome(root=executed)],
+        )
+        link._on_receipt_message(instance, wrong_producer.model_dump())  # pyright: ignore[reportPrivateUsage]
+        assert not submission.settled
+
+        outcomes = [models.ActionOutcome(root=executed)]
+        if conflicting:
+            outcomes.append(
+                models.ActionOutcome(root=models.Dropped(id=1, reason=models.DropReason.RELEASED))
+            )
+        receipt = models.ActionReceiptParams(
+            producer=producer, block_seq=block.seq, outcomes=outcomes
+        )
+        link._on_receipt_message(instance, receipt.model_dump())  # pyright: ignore[reportPrivateUsage]
+        if conflicting:
+            with pytest.raises(ChannelError, match="互相矛盾"):
+                await submission.outcomes()
+        else:
+            assert await submission.outcomes() == {1: executed}
+
+    asyncio.run(exercise())
 
 
 def link_options(exe: Path) -> CoreLinkOptions:

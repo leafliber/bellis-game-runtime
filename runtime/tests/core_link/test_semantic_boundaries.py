@@ -164,6 +164,7 @@ def test_health_during_effect_analysis_gap(
             assert controller is not None
             assert project is not None
             scene_service = controller.scene
+            controller.config = controller.config.model_copy(update={"effect_timeout": 1.2})
             max_age = round(controller.config.max_frame_age * 1e9)
             release = Event()
             loop = asyncio.get_running_loop()
@@ -221,7 +222,7 @@ def test_health_during_effect_analysis_gap(
                     assert not r.session.failures
                     return
 
-                expired = await until(
+                during_verification = await until(
                     lambda: next(
                         (
                             item
@@ -231,7 +232,8 @@ def test_health_during_effect_analysis_gap(
                         None,
                     )
                 )
-                assert not expired.ready
+                assert during_verification.ready
+                assert controller.awaiting_effect(r.session.clock.now_ns())
                 health = r.run.core.last_health
                 assert health is not None
                 assert health.latest_frame is not None
@@ -242,6 +244,7 @@ def test_health_during_effect_analysis_gap(
                 await refused(main, "goal.submit", goal("past-frame-age", 8_000))
                 failure = await until(lambda: r.session.unknown)
                 assert failure.outcome is StepStatus.UNKNOWN
+                assert not r.session.health().ready
                 assert r.frames.down == ["menu"]
                 assert not events.actions
             finally:

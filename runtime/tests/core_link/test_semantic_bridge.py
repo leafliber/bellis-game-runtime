@@ -19,6 +19,7 @@ import pytest
 
 from core_protocol import models
 from game_runtime.adapter import GAMES_DIR, Adapter, PixelRect, ScreenType, load_adapter
+from game_runtime.adapter.schema import Signature
 from game_runtime.channel import (
     ChannelError,
     Connection,
@@ -916,13 +917,22 @@ def delay_decision_effect_frames(
         revision: int,
         *,
         until: int,
+        dialogue_choice: Signature | None = None,
     ) -> StepStatus:
         if decision is not None and not started.done():
             # begin_frame 使旧画面失效后，新的签名判别可能仍在处理。
-            scene.invalidate()
+            monkeypatch.setattr(scene, "_latest", None)
             assert not r.session.ready()
-            started.set_result(controller.clock.now_ns())
-        return await verify(before, expected, executed_ns, decision, revision, until=until)
+            started.set_result(until)
+        return await verify(
+            before,
+            expected,
+            executed_ns,
+            decision,
+            revision,
+            until=until,
+            dialogue_choice=dialogue_choice,
+        )
 
     if resume_frames is not None:
         monkeypatch.setattr(scene, "publish", publish_unless_waiting)
@@ -1220,7 +1230,7 @@ def test_interrupted_vote_cannot_restore_prior_goal(
                     == {}
                 )
                 await until(lambda: True if r.frames.down else None)
-                verifying_since = None if gap is None else await asyncio.wait_for(gap, WAIT)
+                verification_deadline = None if gap is None else await asyncio.wait_for(gap, WAIT)
                 match interruption:
                     case "pause":
                         assert (
@@ -1258,12 +1268,8 @@ def test_interrupted_vote_cannot_restore_prior_goal(
                 assert failure.choice.source == "vote"
                 assert failure.choice.decision_id == point.decisionPointId
                 if interruption == "missing-frame":
-                    controller = r.run.controller
-                    assert controller is not None
-                    assert verifying_since is not None
-                    assert failure.at_ns >= verifying_since + round(
-                        controller.config.effect_timeout * 1e9
-                    )
+                    assert verification_deadline is not None
+                    assert failure.at_ns >= verification_deadline
                 expected_id = {
                     "pause": "paused",
                     "replace": "replacement",

@@ -7,12 +7,14 @@ import asyncio
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
 from game_runtime.adapter import Adapter, NotCalibratedError, PixelRect
 from game_runtime.frame_ring import RingFrame
+from game_runtime.narrative.plugin import crop_roi
 from game_runtime.ocr import (
     OCR,
     LanguageCheck,
@@ -129,6 +131,112 @@ def test_a_named_roi_is_converted_for_the_frame_size(synthetic_adapter: Adapter)
     (image,) = recognizer.images
     assert image.shape == (expected.bottom - expected.top, expected.right - expected.left, 3)
     assert image[0, 0].tolist() == [expected.left % 256, expected.top % 256, 0]
+
+
+def test_identical_crop_reuses_local_lines_with_current_frame_coordinates(
+    synthetic_adapter: Adapter,
+) -> None:
+    recognizer = ScriptedRecognizer([[scripted_line("原句")], [scripted_line("新句")]])
+    service = OcrService(synthetic_adapter, recognizer, model="fake")
+    frame = gradient_frame(320, 180, stride_pad=12)
+    rect = synthetic_adapter.roi("speaker").to_pixels(frame.width, frame.height)
+    crop = crop_roi(frame, "speaker", rect, None)
+
+    async def scenario() -> None:
+        try:
+            local = await service.recognize_rect(crop, PixelRect(0, 0, crop.width, crop.height))
+            current = replace(frame, frame_number=43, transform_version=6)
+            found = await service.recognize(current, "speaker")
+            assert len(recognizer.images) == 1
+            assert local.lines[0].box == PixelRect(0, 0, 10, 10)
+            assert found.text == "原句"
+            assert (found.frame_number, found.transform_version, found.roi, found.rect) == (
+                current.frame_number,
+                current.transform_version,
+                "speaker",
+                rect,
+            )
+            assert found.lines[0].box == PixelRect(
+                rect.left, rect.top, rect.left + 10, rect.top + 10
+            )
+
+            pixels = bytearray(current.pixels)
+            pixels[rect.top * current.row_stride + rect.left * 4 + 3] ^= 1
+            changed = replace(current, frame_number=44, pixels=bytes(pixels))
+            assert (await service.recognize(changed, "speaker")).text == "新句"
+            assert len(recognizer.images) == 2
+        finally:
+            await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_dialogue_retry_remaps_boxes_and_shares_the_named_crop_cache(
+    synthetic_adapter: Adapter,
+) -> None:
+    frame = gradient_frame(320, 180, stride_pad=12)
+    roi = synthetic_adapter.dialogue_boxes[0].text
+    rect = synthetic_adapter.roi(roi).to_pixels(frame.width, frame.height)
+    crop = crop_roi(frame, roi, rect, None)
+    recognizer = ScriptedRecognizer(
+        [
+            [],
+            [],
+            [
+                RecognizedLine("！？", PixelRect(3, 5, 15, 17), 0.7649, True),
+                RecognizedLine("越界", PixelRect(0, 0, 2 * crop.width + 1, 9), 0.9, True),
+                RecognizedLine("空框", PixelRect(3, 5, 3, 17), 0.9, True),
+            ],
+        ]
+    )
+    service = OcrService(synthetic_adapter, recognizer, model="fake")
+
+    async def scenario() -> None:
+        try:
+            assert not (await service.recognize_rect(frame, rect)).lines
+            local = await service.recognize_cropped_roi(crop, roi)
+            assert local.lines == (OcrLine("！？", PixelRect(1, 2, 8, 9), 0.7649),)
+            current = replace(frame, frame_number=43, transform_version=6)
+            found = await service.recognize(current, roi)
+            assert (found.frame_number, found.transform_version, found.roi, found.rect) == (
+                43,
+                6,
+                roi,
+                rect,
+            )
+            (line,) = found.lines
+            assert line == OcrLine(
+                "！？",
+                PixelRect(rect.left + 1, rect.top + 2, rect.left + 8, rect.top + 9),
+                0.7649,
+            )
+            assert line.horizontal is True
+            assert not (await service.recognize_rect(current, rect)).lines
+        finally:
+            await service.aclose()
+
+    asyncio.run(scenario())
+    assert [image.shape for image in recognizer.images] == [
+        (crop.height, crop.width, 3),
+        (crop.height, crop.width, 3),
+        (2 * crop.height, 2 * crop.width, 3),
+    ]
+
+
+def test_a_nonempty_dialogue_read_uses_only_the_original_crop(synthetic_adapter: Adapter) -> None:
+    recognizer = ScriptedRecognizer([[scripted_line("正文")]])
+    service = OcrService(synthetic_adapter, recognizer, model="fake")
+    frame = gradient_frame(320, 180)
+    roi = synthetic_adapter.dialogue_boxes[0].text
+
+    async def scenario() -> None:
+        try:
+            assert (await service.recognize(frame, roi)).text == "正文"
+        finally:
+            await service.aclose()
+
+    asyncio.run(scenario())
+    assert len(recognizer.images) == 1
 
 
 def test_an_uncalibrated_roi_is_reported_without_fallback(witch_trial_adapter: Adapter) -> None:
