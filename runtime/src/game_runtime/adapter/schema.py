@@ -7,8 +7,10 @@
 任何一层有未知字段即不合法。
 """
 
+import re
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
+from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal, NamedTuple, Self, cast
 from unicodedata import normalize
@@ -421,6 +423,52 @@ class RestartTarget(_Model):
     success_signature: Ident
 
 
+class AutoSaveSlot(_Model):
+    label: Text
+    label_roi: Ident
+    click_roi: Ident
+
+
+class AutoSaveRecovery(_Model):
+    """游戏自带的自动存档读取页及其槽位声明。"""
+
+    open: RestartTarget
+    timestamp_format: Text
+    slots: Annotated[tuple[AutoSaveSlot, ...], Field(min_length=1, max_length=32)]
+    success_signature: Ident
+    empty_text: Text | None = None
+
+    @property
+    def timestamp_pattern(self) -> str:
+        return _squash(normalize("NFKC", self.timestamp_format))
+
+    @model_validator(mode="after")
+    def _valid_slots(self) -> Self:
+        labels = {_squash(normalize("NFKC", slot.label).casefold()) for slot in self.slots}
+        regions = {roi for slot in self.slots for roi in (slot.label_roi, slot.click_roi)}
+        if len(labels) != len(self.slots) or len(regions) != 2 * len(self.slots):
+            raise ValueError("自动存档槽位的标签和 ROI 须各自唯一")
+        fmt = self.timestamp_pattern
+        # 超出两位年份的推断范围，核对显示确有完整日历日期与时分秒。
+        sample = datetime(2142, 11, 27, 21, 34, 56)
+        try:
+            roundtrip = datetime.strptime(sample.strftime(fmt), fmt)
+        except (ValueError, re.error) as error:
+            raise ValueError("自动存档时间格式无效") from error
+        if roundtrip != sample:
+            raise ValueError("自动存档时间格式须包含完整日期与时间")
+        if self.empty_text is not None:
+            marker = _squash(normalize("NFKC", self.empty_text))
+            try:
+                empty_at = datetime.strptime(marker, fmt)
+            except ValueError:
+                pass
+            else:
+                if empty_at.strftime(fmt).casefold() == marker.casefold():
+                    raise ValueError("空槽标记不能与完整时间重叠")
+        return self
+
+
 # 参数与快路径
 
 
@@ -551,6 +599,9 @@ class Adapter(_Model):
     risk: Risk
     decisions: Mapping[Ident, DecisionRegion] = Field(default_factory=dict[Ident, DecisionRegion])
     restarts: Mapping[Ident, RestartTarget] = Field(default_factory=dict[Ident, RestartTarget])
+    recoveries: Mapping[Ident, AutoSaveRecovery] = Field(
+        default_factory=dict[Ident, AutoSaveRecovery]
+    )
     rois: Mapping[Ident, Roi] = Field(default_factory=dict[str, Roi])
     pacing: Pacing | None = None
     """本游戏的阅读节奏覆盖；没有即用通用缺省（由使用方定义，G2）。不是标定项。"""
@@ -633,6 +684,43 @@ class Adapter(_Model):
                 for signature in self.signatures
             ):
                 yield f"restarts.{screen}.success_signature 须指向已标定的可核验结果画面"
+        signatures = {item.id: item for item in self.signatures}
+        for screen, recovery in self.recoveries.items():
+            where = f"recoveries.{screen}"
+            if screen not in screens:
+                continue
+            if screen in self.restarts:
+                yield f"{where} 不能与同一画面的 restarts 并存"
+            if self.generic_type(screen) is not ScreenType.BAD_ENDING or not any(
+                item.screen == screen and item.calibrated for item in self.signatures
+            ):
+                yield f"{where} 须为签名已标定的坏结局画面"
+            menu = signatures.get(recovery.open.success_signature)
+            if (
+                menu is None
+                or not menu.calibrated
+                or menu.screen not in screens
+                or self.generic_type(menu.screen) is not ScreenType.SAVE_LOAD
+            ):
+                yield f"{where}.open.success_signature 须为已标定的自动存档读取页签名"
+            success = signatures.get(recovery.success_signature)
+            if (
+                success is None
+                or not success.calibrated
+                or success.screen not in screens
+                or self.generic_type(success.screen)
+                in {
+                    ScreenType.BAD_ENDING,
+                    ScreenType.SAVE_LOAD,
+                    ScreenType.SETTINGS,
+                    ScreenType.SHOP,
+                    ScreenType.CUTSCENE,
+                    ScreenType.LOADING,
+                    ScreenType.STUCK,
+                    ScreenType.UNKNOWN,
+                }
+            ):
+                yield f"{where}.success_signature 须为已标定的读档后游戏画面签名"
 
     def _dialogue_box_problems(self) -> Iterator[str]:
         """对白框：写了画面的，画面是对话类，每个画面至多一项；不写画面的至多一项；引用的 ROI 与
@@ -693,6 +781,7 @@ class Adapter(_Model):
             ("risk.returns", self.risk.returns),
             ("decisions", self.decisions),
             ("restarts", self.restarts),
+            ("recoveries", self.recoveries),
         ):
             for screen in group:
                 yield f"{field}.{screen}", screen
@@ -713,6 +802,12 @@ class Adapter(_Model):
             yield f"risk.returns.{screen}.roi", target.roi
         for screen, target in self.restarts.items():
             yield f"restarts.{screen}.roi", target.roi
+        for screen, recovery in self.recoveries.items():
+            where = f"recoveries.{screen}"
+            yield f"{where}.open.roi", recovery.open.roi
+            for index, slot in enumerate(recovery.slots):
+                yield f"{where}.slots[{index}].label_roi", slot.label_roi
+                yield f"{where}.slots[{index}].click_roi", slot.click_roi
         for screen, decision in self.decisions.items():
             yield f"decisions.{screen}.options", decision.options
             if decision.prompt is not None:
