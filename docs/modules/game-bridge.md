@@ -39,6 +39,7 @@ Game Runtime 与 Bellis 之间的连接、消息与行为。Bellis 侧的游戏�
 - 启动实时核时，主进程以 `--bellis-control <runtimeId>` 选择 Bellis，并设置 `BELLIS_SESSION_ID` 为自己读到的 Bellis 会话号。同一次 Runtime 内的实时核重启继续使用相同的 `runtimeId`，供 Bellis 匹配语义与控制连接。实时核独立读取 Windows 凭据 `session.bellis`，其值是 UTF-16LE 编码的 `SessionInfo`，字段为 `v`、`sessionId`、`channelPath`、`channelKey`、`launcherPid`、`startedAt`。这里的地址与密钥只在凭据管理器交付。操作员许可源和 Bellis 只选一个。[Bellis 会话契约](https://github.com/leafliber/bellis/blob/main/packages/protocol/src/process.ts)
 - 实时核先发起本机通道认证，再以原始 JSON 接收 `game.describe`，应答该 Runtime 的会话号、主版本与系统单调时刻。写出兼容应答后才接收许可并以核健康周期上报 `health.reported`。续约把 Bellis 给出的绝对截止换算为纳秒，过期或失效的令牌回 `-32004`。断线或凭据变化时释放全部输入并锁存 `lease_source_lost`，在本实时核实例内保持停止。
 - 控制连接每帧发送有 200 ms 的写入时限。未能写完时关闭连接，按许可源失效释放。真实后端换令在核验旧许可的释放后复查会话信息，再确认新许可。[输入许可](core-protocol.md#输入许可)
+- Bellis R-30、R-31 与 R-32 的本机控制许可在 `lease.renew` 中携带 `localDialogue` 或 `localRecovery`，二者互斥。实时核独立核对宿主会话、Runtime 标识、策略与期限，每个核实例只接纳一个范围。续约沿用原令牌、范围与剩余次数。测试会话来源的范围许可和主进程语义入口的范围命令均为 unsupported，当前入口收到时拒绝。[原生动作块校验](realtime-core.md#动作块的执行)
 - `input.stop` 吊销截至 `throughToken` 的许可。当前有效令牌高于该上界时只更新撤销水位。其余情形创建新的释放编号并尝试释放，随后应答 `{}`，即使输入此前已经释放。此次 `input.released` 以 `throughToken` 关联，零对应 `null`。其它释放使用产生该释放时的相关许可令牌。
 - 释放事实保留对应释放请求完成的单调时刻。实时核按本实例的 `release_id` 匹配物理核验，限时等候后上报一次。只有对应核验成功才报 `verified`，最终仍有残留或补发被拒报 `residual`，其余结果及假后端报 `unverified`。[核内释放与核验](core-protocol.md#消息集)
 - 进程联调以 `GAME_RUNTIME_TEST_BELLIS_SESSION_FILE` 提供临时 `SessionInfo`，仅在显式选用 Bellis、假后端与测试设备时可用。该测试设备只接收假输入事件。
