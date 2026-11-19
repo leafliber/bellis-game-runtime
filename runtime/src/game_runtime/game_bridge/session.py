@@ -1,22 +1,51 @@
 """认证语义连接的目标、决策实例和节奏状态。"""
 
+import asyncio
 import logging
 import re
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ValidationError
 
-from game_runtime.adapter import Adapter
-from game_runtime.channel import ChannelError, RpcError, RpcErrorCode, RpcPeer
-from game_runtime.game_bridge.wire import ms, ns, params, selection_source, v1
+from core_protocol.models import Executed
+from game_runtime._threads import in_thread
+from game_runtime.adapter import Adapter, ScreenType
+from game_runtime.channel import ChannelError, Connection, RpcError, RpcErrorCode, RpcPeer
+from game_runtime.game_bridge.task_ledger import (
+    AttemptKind,
+    AttemptPhase,
+    AttemptRecord,
+    AttemptSpec,
+    CallKind,
+    FrameStamp,
+    LedgerError,
+    LedgerRefusedError,
+    LedgerStatus,
+    LedgerUnavailableError,
+    Resolution,
+    TaskAccount,
+    TaskEnd,
+    TaskLedger,
+    TaskLimits,
+    TaskRequest,
+)
+from game_runtime.game_bridge.wire import decode_request, ms, ns, params, selection_source, v1, v2
 from game_runtime.operator import Clock, SessionState, messages
 from game_runtime.secret_store import SecretStore, SecretStoreError, SessionInfo
-from game_runtime.step_control.contracts import Category, Goal, StepStatus
+from game_runtime.step_control.contracts import (
+    Category,
+    EffectKind,
+    ExpectedEffect,
+    Goal,
+    StepStatus,
+)
 from game_runtime.step_control.supervision import ActionOutcome, SemanticPauseError, SubmittedChoice
 from game_runtime.telemetry import RuntimeTelemetry, SpanContext
 from game_runtime.telemetry.consumer import (
@@ -27,6 +56,7 @@ from game_runtime.telemetry.consumer import (
 )
 
 if TYPE_CHECKING:
+    from game_runtime.game_bridge.attempts import AttemptHandler
     from game_runtime.game_bridge.projection import Projection
     from game_runtime.step_control.plugin import SessionSignals
 
@@ -36,11 +66,33 @@ HOLD_LIMIT_NS = 30_000_000_000
 type Mode = Literal["autonomous", "waiting_vote", "paused", "manual"]
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TaskAuthorityConfig:
+    control_target_id: str
+    adapter_id: str
+    ledger_path: Path
+    limits: TaskLimits
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", self.control_target_id) is None:
+            raise ValueError("被控对象身份无效")
+        if not self.adapter_id or not self.ledger_path.is_absolute():
+            raise ValueError("任务授权需要固定适配包与绝对账库路径")
+
+
 @dataclass(frozen=True, slots=True)
 class BellisConfig:
     session_store: SecretStore
     confirmed: frozenset[str] = frozenset()
     test_session_file: Path | None = None
+    task_authority: TaskAuthorityConfig | None = None
+    fake_verify_release: bool = False
+
+    def require_task_backend(self, *, real_input: bool, has_test_device: bool) -> None:
+        if self.task_authority is not None and (
+            real_input or not has_test_device or self.test_session_file is None
+        ):
+            raise ValueError("GR-38 v2 真实输入 unsupported，任务授权目前只供隔离假设备验收")
 
 
 def read_bellis_session(store: SecretStore) -> SessionInfo | None:
@@ -66,6 +118,12 @@ class _Goal:
     accepted_ns: int
     traceparent: str | None
     decision_id: str | None
+    task_id: str | None = None
+
+
+@dataclass(slots=True)
+class _WireVersion:
+    major: int = v1.GAME_BRIDGE_MAJOR
 
 
 @dataclass(slots=True)
@@ -75,6 +133,13 @@ class _Decision:
     traceparent: str | None
     latest: v1.GameDecisionPointOpened | None = None
     resolved: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _AttemptReport:
+    action_id: str
+    goal: _Goal
+    finish: ActionOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,9 +172,24 @@ class BellisSession:
         adapter: Adapter,
         clock: Clock,
         signals: "SessionSignals",
+        *,
+        ledger: TaskLedger | None = None,
+        release_verified: Callable[[int], bool] | None = None,
     ) -> None:
         self.config, self.info, self.runtime_id = config, info, runtime_id
         self.clock, self.signals = clock, signals
+        if (ledger is None) != (config.task_authority is None):
+            raise ValueError("任务授权与账库必须一起配置")
+        self._adapter = adapter
+        self._ledger = ledger
+        self._release_verified = release_verified
+        self._ledger_status: LedgerStatus | None = None
+        self._ledger_status_revision = 0
+        self._ledger_failed = False
+        self.admission = asyncio.Lock()
+        self.attempts: AttemptHandler | None = None
+        self._wire_version = _WireVersion()
+        self._attempt_report: _AttemptReport | None = None
         required = {item.id for item in adapter.risk.preconditions}
         if config.confirmed - required:
             raise ValueError("确认的前置条件不属于选定的适配包")
@@ -171,6 +251,15 @@ class BellisSession:
         return self._plan_goal
 
     @property
+    def planning_task(self) -> TaskRequest | None:
+        """供 planner 接收的原任务身份、根目标与整体完成条件。"""
+        status = self._ledger_status
+        task = None if status is None else status.active_task
+        if task is None or not self.live or not self._task_active(task.request.task_id):
+            return None
+        return task.request
+
+    @property
     def may_autoplay(self) -> bool:
         return self._active(self._authorization) and self.ready()
 
@@ -185,9 +274,11 @@ class BellisSession:
         )
 
     def _active(self, goal: _Goal | None) -> bool:
+        return goal is not None and self._goal_authorized(goal) and self._task_active(goal.task_id)
+
+    def _goal_authorized(self, goal: _Goal) -> bool:
         return (
-            goal is not None
-            and goal.connection == self._connection
+            goal.connection == self._connection
             and self.live
             and self._unknown is None
             and not self._manual
@@ -195,10 +286,43 @@ class BellisSession:
             and self.clock.now_ns() < goal.expires_ns
         )
 
+    def _task_active(self, task_id: str | None, *, status: LedgerStatus | None = None) -> bool:
+        if self._ledger is None:
+            return True
+        if status is None:
+            status = self._ledger_status
+        if (
+            status is None
+            or status.receipt_quarantined
+            or self._ledger_failed
+            or self._wire_version.major != v2.GAME_BRIDGE_MAJOR
+        ):
+            return False
+        if status.outstanding is not None and status.outstanding.phase is AttemptPhase.PENDING:
+            return False
+        task = status.active_task
+        return (
+            task is not None
+            and task.request.task_id == task_id
+            and self.clock.now_ns()
+            < min(task.request.expires_at_ns, task.last_progress_ns + task.limits.no_progress_ns)
+        )
+
     @property
     def live(self) -> bool:
         return (
             self.peer is not None and self.peer.connection.is_open and self.described_ns is not None
+        )
+
+    @property
+    def can_select_control(self) -> bool:
+        return self.live and (
+            self._ledger is None
+            or (
+                self._ledger_status is not None
+                and not self._ledger_failed
+                and self._pending() is None
+            )
         )
 
     @property
@@ -233,6 +357,7 @@ class BellisSession:
         """当前已判别帧可用于接纳目标和提交新动作。"""
         return (
             self._safety_ready(self._risk_score())
+            and (self._ledger is None or self.can_select_control)
             and self.project is not None
             and self.project.action_ready(self.signals.controller, self.clock.now_ns())
         )
@@ -240,14 +365,19 @@ class BellisSession:
     def _safety_ready(self, risk_score: float | None) -> bool:
         return risk_score is not None and all(item.confirmed for item in self.prerequisites)
 
-    def health(self) -> v1.GameMainHealth:
+    def _pending(self) -> AttemptRecord | None:
+        status = self._ledger_status
+        attempt = None if status is None else status.outstanding
+        return attempt if attempt is not None and attempt.phase is AttemptPhase.PENDING else None
+
+    def health(self) -> v1.GameMainHealth | v2.GameMainHealthV2:
         now = self.clock.now_ns()
         goal = self._authorization
         live_goal = goal if goal is not None and now < goal.expires_ns else None
         risk_score = self._risk_score()
         controller = self.signals.controller
         rejection = self.last_rejection
-        if risk_score is None:
+        if risk_score is None and not self._ledger_failed:
             rejection = v1.LastRejection(
                 atMs=ms(now), code="risk-unsupported", summary="本机风险来源尚不可用"
             )
@@ -258,7 +388,7 @@ class BellisSession:
             if self._unknown is not None or live_goal is None
             else live_goal.mode
         )
-        return v1.GameMainHealth(
+        health = v1.GameMainHealth(
             atMs=ms(now),
             ready=(
                 self._safety_ready(risk_score)
@@ -278,6 +408,33 @@ class BellisSession:
             riskLimitExceeded=False,  # GR-37：v1 必填，独立阈值锁存 unsupported。
             lastRejection=rejection,
         )
+        if self._wire_version.major != v2.GAME_BRIDGE_MAJOR:
+            return health
+        attempt = self._pending()
+        status = self._ledger_status
+        task = None if status is None else status.active_task
+        pending = None
+        if attempt is not None:
+            spec = attempt.spec
+            pending = v2.PendingActionOutcome(
+                attemptId=spec.attempt_id,
+                runtimeId=spec.runtime_id,
+                sessionId=spec.session_id,
+                goalId=spec.goal_id,
+                actionId=spec.action_id,
+                decisionPointId=spec.decision_point_id,
+                reason=(attempt.detail or "action-outcome-unknown")[:200],
+            )
+        fields = health.model_dump(mode="json")
+        fields.update(
+            ready=health.ready
+            and status is not None
+            and not self._ledger_failed
+            and pending is None,
+            activeTaskId=None if task is None else task.request.task_id,
+            pendingActionOutcome=None if pending is None else pending.model_dump(mode="json"),
+        )
+        return v2.GameMainHealthV2.model_validate(fields)
 
     def same_session(self) -> bool:
         try:
@@ -285,50 +442,219 @@ class BellisSession:
         except SecretStoreError:
             return False
 
-    def attach(self, peer: RpcPeer) -> tuple[Callable[[], None], ...]:
+    def open_peer(self, connection: Connection) -> tuple[RpcPeer, tuple[Callable[[], None], ...]]:
+        version = _WireVersion()
+        peer = RpcPeer(
+            connection,
+            timeout=2.0,
+            json_decoder=lambda raw: decode_request(raw, major=version.major),
+        )
+        return peer, self.attach(peer, version=version)
+
+    def _require_peer(self, peer: RpcPeer | None) -> None:
+        if (
+            peer is None
+            or self.peer is not peer
+            or not peer.connection.is_open
+            or not self.same_session()
+        ):
+            raise _refuse("Bellis 会话已失效")
+
+    def attach(
+        self, peer: RpcPeer, *, version: _WireVersion | None = None
+    ) -> tuple[Callable[[], None], ...]:
+        if self._ledger is not None and version is None:
+            raise ValueError("语义 v2 需要逐连接原始解码器")
         self.peer = peer
         self._connection += 1
+        self._wire_version = version or _WireVersion()
 
         def handle(
-            handler: Callable[[object], BaseModel],
-        ) -> Callable[[object], dict[str, object]]:
-            def request(value: object) -> dict[str, object]:
-                if self.peer is not peer or not peer.connection.is_open or not self.same_session():
-                    raise _refuse("Bellis 会话已失效")
-                return handler(value).model_dump(mode="json")
+            handler: Callable[[object], BaseModel | Awaitable[BaseModel]],
+        ) -> Callable[[object], Awaitable[dict[str, object]]]:
+            async def request(value: object) -> dict[str, object]:
+                self._require_peer(peer)
+                result = handler(value)
+                if not isinstance(result, BaseModel):
+                    result = await result
+                    self._require_peer(peer)
+                return result.model_dump(mode="json")
 
             return request
 
-        return tuple(
-            peer.handle(method, handle(handler))
-            for method, handler in (
-                ("game.describe", self._describe),
-                ("goal.submit", self._submit_goal),
-                ("decision.resolve", self._resolve),
-                ("pacing.hold", self._hold),
-                ("pacing.release", self._release),
-            )
+        handlers: tuple[tuple[str, Callable[[object], BaseModel | Awaitable[BaseModel]]], ...] = (
+            ("game.describe", self._describe),
+            ("goal.submit", self._submit_goal),
+            ("decision.resolve", self._resolve),
+            ("pacing.hold", self._hold),
+            ("pacing.release", self._release),
         )
+        if self._ledger is not None:
+            handlers += (
+                ("task.open", self._open_task),
+                ("action.resolve_outcome", self._resolve_outcome),
+            )
+        return tuple(peer.handle(method, handle(handler)) for method, handler in handlers)
 
-    def _describe(self, value: object) -> v1.GameMainDescription | v1.GameDescribeVersion:
+    def _describe(
+        self, value: object
+    ) -> v1.GameMainDescription | v2.GameMainDescriptionV2 | v1.GameDescribeVersion:
         request = params(v1.GameDescribeParams, value)
-        if request.major != v1.GAME_BRIDGE_MAJOR:
-            return v1.GameDescribeVersion(major=v1.GAME_BRIDGE_MAJOR)
+        authority = self.config.task_authority
+        major = v1.GAME_BRIDGE_MAJOR if authority is None else v2.GAME_BRIDGE_MAJOR
+        if request.major != major:
+            return v1.GameDescribeVersion(major=major)
         if self.described_ns is not None:
             raise _refuse("语义握手已完成")
         now = self.clock.now_ns()
-        self.described_ns = now
-        return v1.GameMainDescription(
+        legacy = v1.GameMainDescription(
             major=v1.GAME_BRIDGE_MAJOR,
             runtimeId=self.runtime_id,
             nowMs=ms(now),
             adapter=self.adapter,
             prerequisites=list(self.prerequisites),
         )
+        result = (
+            legacy
+            if authority is None
+            else v2.GameMainDescriptionV2.model_validate(
+                legacy.model_dump(mode="json")
+                | {"major": major, "controlTargetId": authority.control_target_id}
+            )
+        )
+        self._wire_version.major = major
+        self.described_ns = now
+        return result
 
     def _require_live(self) -> None:
         if not self.live:
             raise _refuse("语义握手尚未完成")
+
+    def _require_tasks(self) -> TaskLedger:
+        self._require_live()
+        if self._wire_version.major != v2.GAME_BRIDGE_MAJOR or self._ledger is None:
+            raise _refuse("任务操作需要语义 v2")
+        if self._ledger_failed:
+            raise _refuse("task-ledger-unavailable")
+        return self._ledger
+
+    def ledger_fault(self, detail: str) -> None:
+        if self._ledger_failed:
+            return
+        self._ledger_failed = True
+        self.rejected(detail)
+        self.suspend()
+
+    async def refresh_ledger(self) -> None:
+        if self._ledger is not None and not self._ledger_failed:
+            async with self.admission:
+                try:
+                    await self._refresh_ledger(self._ledger)
+                except RpcError:
+                    self.ledger_fault("task-ledger-unavailable")
+
+    async def _refresh_ledger(self, ledger: TaskLedger) -> None:
+        revision = self._ledger_status_revision
+        status = await self._read_ledger(ledger.status)
+        self._apply_ledger_status(revision, status)
+
+    def _apply_ledger_status(self, revision: int, status: LedgerStatus) -> None:
+        if revision == self._ledger_status_revision:
+            self._ledger_status = status
+        if status.receipt_quarantined:
+            self.ledger_fault("core-receipt-conflict")
+        goal = self._authorization
+        if goal is not None and goal.mode != "paused" and not self._task_active(goal.task_id):
+            self.suspend()
+
+    async def _read_ledger[T](self, operation: Callable[[], T]) -> T:
+        if self._ledger_failed:
+            raise _refuse("task-ledger-unavailable")
+        try:
+            return await in_thread(operation)
+        except LedgerUnavailableError:
+            self.ledger_fault("task-ledger-unavailable")
+            raise _refuse("task-ledger-unavailable") from None
+        except LedgerRefusedError as error:
+            self.rejected(error.reason.value)
+            raise _refuse(error.reason.value) from None
+        except LedgerError:
+            raise _refuse("task-ledger-conflict") from None
+
+    def _overall_completion(
+        self,
+        completion: v2.OverallCompletion | v2.OverallCompletion1 | v2.OverallCompletion2 | None,
+    ) -> ExpectedEffect | None:
+        if completion is None:
+            return None
+        if isinstance(completion, v2.OverallCompletion):
+            if not any(
+                item.id == completion.signature and item.calibrated
+                for item in self._adapter.signatures
+            ):
+                raise _refuse("整体终局须使用已标定签名")
+            return ExpectedEffect(EffectKind.SIGNATURE, signature=completion.signature)
+        if isinstance(completion, v2.OverallCompletion1):
+            return ExpectedEffect(EffectKind.SCREEN, screen_type=ScreenType(completion.screenType))
+        roi = self._adapter.rois.get(completion.roi)
+        if roi is None or roi.rect is None or not completion.text.strip():
+            raise _refuse("整体终局须使用已标定的文字区域")
+        return ExpectedEffect(EffectKind(completion.kind), text=completion.text, roi=completion.roi)
+
+    async def _open_task(self, value: object) -> v2.GameTaskOpenResult:
+        ledger = self._require_tasks()
+        authority = self.config.task_authority
+        if authority is None:
+            raise _refuse("task-authority-unavailable")
+        wire = params(v2.GameTaskOpenParams, value)
+        if not wire.objective.strip() or wire.expiresAtMs <= 0:
+            raise _refuse("任务目标或时限无效")
+        request = TaskRequest(
+            task_id=wire.taskId,
+            objective=wire.objective,
+            expires_at_ns=ns(wire.expiresAtMs),
+            overall_completion=self._overall_completion(wire.overallCompletion),
+        )
+        peer = self.peer
+        async with self.admission:
+            self._require_peer(peer)
+            released = self._release_verified
+            await self._read_ledger(
+                partial(
+                    ledger.open_task,
+                    request,
+                    authority.limits,
+                    release_verified=released is not None and released(0),
+                )
+            )
+            await self._refresh_ledger(ledger)
+        return v2.GameTaskOpenResult(taskId=wire.taskId)
+
+    async def _resolve_outcome(self, value: object) -> v2.GameActionResolveOutcomeResult:
+        ledger = self._require_tasks()
+        request = params(v2.GameActionResolveOutcomeParams, value)
+        peer = self.peer
+        async with self.admission:
+            self._require_peer(peer)
+            attempt = await self._read_ledger(partial(ledger.get_attempt, request.attemptId))
+            self._require_peer(peer)
+            if attempt is None:
+                raise _refuse("task-ledger-conflict")
+            cutoff = attempt.bound_at_ns or 0 if attempt.spec.runtime_id == self.runtime_id else 0
+            released = self._release_verified
+            await self._read_ledger(
+                partial(
+                    ledger.resolve_pending,
+                    request.sessionId,
+                    request.attemptId,
+                    Resolution(request.resolution),
+                    release_verified=released is not None and released(cutoff),
+                )
+            )
+            await self._refresh_ledger(ledger)
+        return v2.GameActionResolveOutcomeResult(
+            attemptId=request.attemptId, resolution=request.resolution
+        )
 
     def _telemetry(self) -> RuntimeTelemetry | None:
         return None if self.telemetry is None else try_telemetry(self.telemetry)
@@ -396,16 +722,51 @@ class BellisSession:
             )
         return SpanContext(goal.connection, parent, goal_id=goal.id, decision_id=decision_id)
 
-    def _submit_goal(self, value: object) -> v1.GameAck:
-        request = params(v1.GameGoalSubmitParams, value)
+    async def _submit_goal(self, value: object) -> v1.GameAck:
         self._require_live()
-        context = SpanContext(self._connection, request.traceparent, goal_id=request.goalId)
-        with self._received(context, "goal.submit") as parent:
-            return self._accept_goal(request, parent)
+        if self._ledger is None:
+            request = params(v1.GameGoalSubmitParams, value)
+            context = SpanContext(self._connection, request.traceparent, goal_id=request.goalId)
+            with self._received(context, "goal.submit") as parent:
+                return self._accept_goal(request, parent)
 
-    def _accept_goal(self, request: v1.GameGoalSubmitParams, parent: str | None) -> v1.GameAck:
+        request_v2 = params(v2.GameGoalSubmitParamsV2, value)
+        request = params(v1.GameGoalSubmitParams, request_v2.model_dump(exclude={"taskId"}))
+        context = SpanContext(self._connection, request.traceparent, goal_id=request.goalId)
+        if request.mode == "paused":
+            with self._received(context, "goal.submit") as parent:
+                return self._accept_goal(request, parent, task_id=request_v2.taskId)
+
+        ledger = self._require_tasks()
+        peer, revision = self.peer, self._plan_generation
+        async with self.admission:
+            self._require_peer(peer)
+            task = await self._read_ledger(partial(ledger.check_goal, request_v2.taskId))
+            self._require_peer(peer)
+            if revision != self._plan_generation:
+                raise _refuse("目标授权已变化")
+            with self._received(context, "goal.submit") as parent:
+                return self._accept_goal(
+                    request,
+                    parent,
+                    task_id=request_v2.taskId,
+                    task_deadline=task.request.expires_at_ns,
+                    overall_completion=task.request.overall_completion,
+                )
+
+    def _accept_goal(
+        self,
+        request: v1.GameGoalSubmitParams,
+        parent: str | None,
+        *,
+        task_id: str | None = None,
+        task_deadline: int | None = None,
+        overall_completion: ExpectedEffect | None = None,
+    ) -> v1.GameAck:
         now = self.clock.now_ns()
         expires = ns(request.expiresAtMs)
+        if task_deadline is not None:
+            expires = min(expires, task_deadline)
         if expires <= now or request.goalId in self._goals_seen or not request.objective.strip():
             raise _refuse("目标已过期、已使用或缺少内容")
         if request.mode == "manual":
@@ -421,6 +782,7 @@ class BellisSession:
                 prior is None
                 or prior.mode != "autonomous"
                 or not self._active(prior)
+                or prior.task_id != task_id
                 or point is None
                 or point.latest is None
                 or point.resolved
@@ -443,6 +805,7 @@ class BellisSession:
             now,
             parent,
             request.decisionPointId,
+            task_id,
         )
         self._goals_seen.add(request.goalId)
         self._before_vote = before_vote
@@ -454,21 +817,279 @@ class BellisSession:
                 self._unknown = None
                 self._manual = False
                 self._plan_goal = Goal(
-                    request.objective, deadline_ns=expires, constraints=tuple(request.constraints)
+                    request.objective,
+                    completion=overall_completion,
+                    deadline_ns=expires,
+                    constraints=tuple(request.constraints),
                 )
         self._announce()
         if previous is not None:
             self._invalidate_trace(previous.connection, goal_id=previous.id)
         return v1.GameAck()
 
-    def _resolve(self, value: object) -> v1.GameAck:
+    async def _resolve(self, value: object) -> v1.GameAck:
         request = params(v1.GameDecisionResolveParams, value)
         self._require_live()
         context = SpanContext(
             self._connection, request.traceparent, decision_id=request.decisionPointId
         )
+        if self._ledger is not None:
+            ledger = self._require_tasks()
+            goal, peer = self._authorization, self.peer
+            async with self.admission:
+                self._require_peer(peer)
+                status = await self._read_ledger(ledger.status)
+                self._require_peer(peer)
+                if status.receipt_quarantined:
+                    self.ledger_fault("core-receipt-conflict")
+                    raise _refuse("core-receipt-conflict")
+                task = status.active_task
+                if (
+                    status.outstanding is not None
+                    or task is None
+                    or goal is None
+                    or goal is not self._authorization
+                    or goal.task_id != task.request.task_id
+                    or task.inputs_spent >= task.limits.inputs
+                ):
+                    raise _refuse("决策任务或输入余量线已经失效")
+                with self._received(context, "decision.resolve") as parent:
+                    return self._accept_choice(request, parent)
         with self._received(context, "decision.resolve") as parent:
             return self._accept_choice(request, parent)
+
+    def model_budget(self, goal_revision: int) -> Callable[[str, CallKind], Awaitable[bool]] | None:
+        if self._ledger is None:
+            return None
+        goal = self._authorization
+        ledger = self._ledger
+
+        def current() -> bool:
+            return (
+                goal is not None
+                and goal is self._authorization
+                and goal_revision == self._plan_generation
+                and self._active(goal)
+                and self.same_session()
+            )
+
+        async def reserve(call_id: str, kind: CallKind) -> bool:
+            async with self.admission:
+                if goal is None or goal.task_id is None or not current():
+                    return False
+                try:
+                    first = await self._read_ledger(
+                        partial(ledger.reserve_call, goal.task_id, call_id, kind)
+                    )
+                except RpcError:
+                    return False
+                return first and current()
+
+        return reserve
+
+    def task_for_attempt(self, spec: AttemptSpec) -> bool:
+        goal = self._authorization
+        return (
+            self._ledger is not None
+            and goal is not None
+            and self._active(goal)
+            and self.ready()
+            and self.same_session()
+            and goal.task_id == spec.task_id
+            and goal.id == spec.goal_id
+            and self.runtime_id == spec.runtime_id
+            and self.session_id == spec.session_id
+            and spec.submit_deadline_ns < goal.expires_ns
+            and spec.outcome_deadline_ns <= goal.expires_ns
+            and (goal.mode != "waiting_vote" or goal.decision_id == spec.decision_point_id)
+            and (spec.decision_point_id is not None or not self.progress_held())
+        )
+
+    def attempt_spec(
+        self,
+        action_id: str,
+        kind: AttemptKind,
+        base_frame: FrameStamp,
+        expected: ExpectedEffect,
+        submit_deadline_ns: int,
+        outcome_deadline_ns: int,
+        *,
+        decision_point_id: str | None = None,
+    ) -> AttemptSpec:
+        goal = self._authorization
+        if goal is None or goal.task_id is None or not self._active(goal):
+            raise SemanticPauseError("attempt-authority-revoked")
+        submit_deadline_ns = min(submit_deadline_ns, goal.expires_ns - 1)
+        outcome_deadline_ns = min(outcome_deadline_ns, goal.expires_ns)
+        if max(base_frame.capture_ns, self.clock.now_ns()) >= min(
+            submit_deadline_ns, outcome_deadline_ns
+        ):
+            raise SemanticPauseError("action-window-expired")
+        return AttemptSpec(
+            attempt_id=uuid4().hex,
+            task_id=goal.task_id,
+            runtime_id=self.runtime_id,
+            session_id=self.session_id,
+            goal_id=goal.id,
+            action_id=action_id,
+            kind=kind,
+            base_frame=base_frame,
+            expected=expected,
+            submit_deadline_ns=submit_deadline_ns,
+            outcome_deadline_ns=outcome_deadline_ns,
+            decision_point_id=decision_point_id,
+        )
+
+    def attempt_recorded(self, attempt: AttemptRecord) -> None:
+        report = self._attempt_report
+        if (
+            report is not None
+            and report.action_id == attempt.spec.action_id
+            and report.goal.id == attempt.spec.goal_id
+        ):
+            self._attempt_report = None
+            status = {
+                AttemptPhase.VERIFIED: StepStatus.VERIFIED,
+                AttemptPhase.NO_EFFECT: StepStatus.NO_EFFECT,
+                AttemptPhase.NOT_EXECUTED: StepStatus.REJECTED,
+                AttemptPhase.PENDING: StepStatus.UNKNOWN,
+            }.get(attempt.phase)
+            if status is not None:
+                receipt = attempt.receipt
+                report.finish(
+                    status,
+                    attempt.detail or attempt.phase.value,
+                    receipt.at_ns if isinstance(receipt, Executed) else None,
+                )
+        if attempt.phase is AttemptPhase.PENDING:
+            self._ledger_status_revision += 1
+            cached = self._ledger_status
+            if cached is not None:
+                self._ledger_status = LedgerStatus(
+                    cached.active_task, attempt, cached.receipt_quarantined
+                )
+            self.suspend()
+            if self.live:
+                self.notify("health.reported", self.health())
+        self.signals.became_ready()
+
+    async def record_subgoal(
+        self,
+        goal_revision: int,
+        progress_id: str,
+        *,
+        recheck: Callable[[], None],
+        on_recorded: Callable[[], None],
+    ) -> bool:
+        def write(ledger: TaskLedger, task_id: str, before_write: Callable[[], None]) -> bool:
+            return ledger.record_subgoal(task_id, progress_id, before_write=before_write)
+
+        return await self._record_completion(goal_revision, write, recheck, on_recorded)
+
+    async def complete_task(
+        self,
+        goal_revision: int,
+        *,
+        recheck: Callable[[], None],
+        on_recorded: Callable[[], None],
+    ) -> TaskAccount:
+        def write(
+            ledger: TaskLedger, task_id: str, before_write: Callable[[], None]
+        ) -> TaskAccount:
+            return ledger.close_task(task_id, TaskEnd.COMPLETED, before_write=before_write)
+
+        return await self._record_completion(
+            goal_revision, write, recheck, on_recorded, overall=True
+        )
+
+    async def _record_completion[T: (bool, TaskAccount)](
+        self,
+        goal_revision: int,
+        write: Callable[[TaskLedger, str, Callable[[], None]], T],
+        recheck: Callable[[], None],
+        on_recorded: Callable[[], None],
+        *,
+        overall: bool = False,
+    ) -> T:
+        goal = self._authorization
+        controller = self.signals.controller
+        if goal is None or goal.task_id is None or controller is None:
+            raise SemanticPauseError("completion-authority-revoked")
+        grant = controller.grant
+        origin = asyncio.current_task()
+        task_id = goal.task_id
+        admitted = False
+
+        def current() -> bool:
+            return (
+                goal is self._authorization
+                and goal.mode == "autonomous"
+                and goal_revision == self._plan_generation
+                and self.signals.controller is controller
+                and controller.grant is grant
+                and grant.is_open
+                and (origin is None or origin.cancelling() == 0)
+                and self._goal_authorized(goal)
+                and not self._ledger_failed
+                and self.same_session()
+            )
+
+        def require_current() -> None:
+            if not current() or not self._task_active(task_id):
+                raise SemanticPauseError("completion-authority-revoked")
+
+        async def check_evidence() -> None:
+            nonlocal admitted
+            require_current()
+            if not self.ready():
+                raise SemanticPauseError("completion-evidence-unavailable")
+            recheck()
+            require_current()
+            admitted = True
+
+        async def record() -> T:
+            async with self.admission:
+                require_current()
+                ledger = self._require_tasks()
+                if overall and (self._plan_goal is None or self._plan_goal.completion is None):
+                    raise SemanticPauseError("task-completion-condition-missing")
+                loop = asyncio.get_running_loop()
+
+                def before_write() -> None:
+                    # SQLite 持有写事务时，把最后一次取证复核交还给事件循环。
+                    asyncio.run_coroutine_threadsafe(check_evidence(), loop).result()
+
+                result = await self._read_ledger(partial(write, ledger, task_id, before_write))
+                revision = self._ledger_status_revision
+                status = await self._read_ledger(ledger.status)
+                try:
+                    if (
+                        admitted
+                        and result is not False
+                        and revision == self._ledger_status_revision
+                        and not status.receipt_quarantined
+                        and status.outstanding is None
+                        and current()
+                        and (overall or self._task_active(task_id, status=status))
+                    ):
+                        on_recorded()
+                finally:
+                    self._apply_ledger_status(revision, status)
+                return result
+
+        owner = asyncio.create_task(record(), name="GR-38 完成账目")
+        try:
+            return await asyncio.shield(owner)
+        except asyncio.CancelledError:
+            # 等待方取消不丢弃可能已经提交的事实，读回后才交出取消。
+            while not owner.done():
+                try:
+                    await asyncio.wait((owner,))
+                except asyncio.CancelledError:
+                    continue
+            if not owner.cancelled():
+                owner.exception()
+            raise
 
     def _accept_choice(
         self, request: v1.GameDecisionResolveParams, parent: str | None
@@ -559,6 +1180,7 @@ class BellisSession:
     def detach(self) -> None:
         self.peer = None
         self.described_ns = None
+        self._wire_version = _WireVersion()
         self.suspend()
 
     def suspend(self, *, manual: bool = False) -> None:
@@ -755,10 +1377,12 @@ class BellisSession:
             if trace_context is not None:
                 parent = trace_context.traceparent
             point.resolved = True
-        self._inflight += 1
-        # _active 已核对 now < expires_ns。语义授权的排他截止转换为核动作块的包容截止；
-        # 更早的决策期限或动作块上限仍是原值。
-        self._deadline_ns = min(deadline_ns, goal.expires_ns - 1)
+        durable = self._ledger is not None
+        if not durable:
+            self._inflight += 1
+            # _active 已核对 now < expires_ns。语义授权的排他截止转换为核动作块的包容截止；
+            # 更早的决策期限或动作块上限仍是原值。
+            self._deadline_ns = min(deadline_ns, goal.expires_ns - 1)
 
         def traceparent() -> str | None:
             child = (
@@ -769,15 +1393,18 @@ class BellisSession:
             return child or parent
 
         def finished(status: StepStatus, detail: str, executed_ns: int | None) -> None:
-            self._inflight -= 1
-            self._deadline_ns = None
+            if not durable:
+                self._inflight -= 1
+                self._deadline_ns = None
             if status is StepStatus.VERIFIED and executed_ns is not None:
                 if self._authorization is goal and self._first_action_ms is None:
                     self._first_action_ms = min(
                         2**32 - 1, ms(max(0, executed_ns - goal.accepted_ns))
                     )
                 trace = traceparent() if self._connection == goal.connection else None
-                if self._connection == goal.connection:
+                if self._connection == goal.connection and (
+                    not durable or self._authorization is goal
+                ):
                     self.notify(
                         "action.committed",
                         v1.GameActionCommitted.model_validate(
@@ -797,10 +1424,21 @@ class BellisSession:
                     action_id, goal.id, choice, status, detail, self.clock.now_ns(), traceparent()
                 )
                 self.failures.append(failure)
-                if status is StepStatus.UNKNOWN or (
-                    choice is not None and status is StepStatus.NO_EFFECT
+                if not durable and (
+                    status is StepStatus.UNKNOWN
+                    or (choice is not None and status is StepStatus.NO_EFFECT)
                 ):
                     self._unknown = failure
                     self.rejected("action-outcome-unknown")
 
+        if durable:
+            self._attempt_report = _AttemptReport(action_id, goal, finished)
+
+            # 控制器可能取消等待。这里只由动作账目完成事实回调。
+            def controller_finished(
+                _status: StepStatus, _detail: str, _executed_ns: int | None
+            ) -> None:
+                pass
+
+            return controller_finished
         return finished
