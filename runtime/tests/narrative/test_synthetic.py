@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
+import cv2
+import numpy as np
 import pytest
 
 from core_protocol import models
@@ -151,8 +153,17 @@ class TruthRecognizer:
         self.gate: threading.Event | None = None
         self.waiting = threading.Event()
 
-    def teach(self, frame: RingFrame, rect: PixelRect, text: str) -> None:
-        key = image_key(crop_bgr(frame, rect))
+    def teach(
+        self, frame: RingFrame, rect: PixelRect, text: str, *, retry_if_empty: bool = False
+    ) -> None:
+        image = crop_bgr(frame, rect)
+        self._teach(image, text)
+        if not text and retry_if_empty:
+            doubled = cv2.resize(image, (0, 0), fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+            self._teach(np.asarray(doubled, dtype=np.uint8), text)
+
+    def _teach(self, image: Image, text: str) -> None:
+        key = image_key(image)
         known = self.answers.setdefault(key, text)
         assert known == text, f"同样的像素教了两种文字：{known!r} 与 {text!r}"
 
@@ -427,7 +438,12 @@ class Play:
             subtitle = truth.text if truth.scene is SceneType.CUTSCENE else ""
             texts = {"speaker": "", "dialogue": subtitle}
         for roi, text in texts.items():
-            self.recognizer.teach(frame, self.adapter.roi(roi).to_pixels(*size), text)
+            self.recognizer.teach(
+                frame,
+                self.adapter.roi(roi).to_pixels(*size),
+                text,
+                retry_if_empty=any(box.text == roi for box in self.adapter.dialogue_boxes),
+            )
         # 画面签名的固定文字项（标题菜单的“开始”、坏结局的“重来”）：ROI 里的按钮文字。
         for signature in self.adapter.signatures:
             for item in signature.texts:

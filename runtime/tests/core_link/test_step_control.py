@@ -130,6 +130,7 @@ class World:
         self.bad_timer = False
         self.timer_override: str | None = None
         self.first_choice_label: str | None = None
+        self.choice_background_line: OcrLine | None = None
         self.freeze_after_input = False
         self.inputs: list[tuple[GameScene, GameClick | GamePress]] = []
         self.submitted_click: tuple[int, int] | None = None
@@ -176,6 +177,8 @@ class World:
             lines.append(self._text(truth.visible_text, self.rect("dialogue")))
         if truth.scene in (GameScene.CHOICE, GameScene.TIMED_CHOICE):
             lines.append(self._text(truth.text, self.rect("choice-prompt")))
+        if truth.scene is GameScene.CHOICE and self.choice_background_line is not None:
+            lines.append(self.choice_background_line)
         if truth.timer_remaining is not None:
             seconds = math.ceil(truth.timer_remaining * 10) / 10
             timing = self.timer_override or (
@@ -261,6 +264,12 @@ def ocr_for(world: World) -> type[Plugin[OcrConfig]]:
         async def recognize_rect(self, frame: FrameLike, rect: PixelRect) -> OcrResult:
             return OcrResult(
                 frame.frame_number, frame.transform_version, None, rect, self._read(frame, rect)
+            )
+
+        async def recognize_cropped_roi(self, frame: FrameLike, roi: str) -> OcrResult:
+            rect = PixelRect(0, 0, frame.width, frame.height)
+            return OcrResult(
+                frame.frame_number, frame.transform_version, roi, rect, self._read(frame, rect)
             )
 
     class TestOcr(Plugin[OcrConfig]):
@@ -1969,6 +1978,50 @@ def test_fast_dialogue_can_retry_a_submission_proven_not_executed(
             await until(
                 lambda: any(item.status is StepStatus.VERIFIED for item in c.recent) or None
             )
+
+    asyncio.run(main())
+
+
+def test_fast_dialogue_verifies_the_choice_overlay_with_the_old_text_still_present(
+    core_exe: Path, root: Path
+) -> None:
+    async def main() -> None:
+        voice = VoiceHub()
+        async with rig(core_exe, root, reading=True, voice=voice) as r:
+            controller = r.run.controller
+            assert controller is not None
+            world = r.world
+            world.click("menu.start")
+            for _ in range(2):
+                world.clock.advance(0.5)
+                world.click("dialogue.box")
+            world.clock.advance(0.5)
+            before = world.game.truth()
+            assert before.scene is GameScene.DIALOGUE
+            assert before.visible_text
+            world.choice_background_line = world._text(  # pyright: ignore[reportPrivateUsage]
+                before.visible_text, world.rect("dialogue")
+            )
+            r.follow_idle_voice(voice)
+            world.presenting = True
+            await r.start()
+            await until(
+                lambda: (
+                    any(
+                        step.status is StepStatus.VERIFIED and step.category is Category.ADVANCE
+                        for step in controller.recent
+                    )
+                    or None
+                )
+            )
+            after = controller.scene.latest
+            assert after is not None
+            assert after.state.screen == "choice"
+            text = await controller.ocr.recognize(after.frame, "dialogue")
+            assert text.text == before.visible_text
+            [(screen, action)] = world.inputs
+            assert screen is GameScene.DIALOGUE
+            assert isinstance(action, GameClick)
 
     asyncio.run(main())
 

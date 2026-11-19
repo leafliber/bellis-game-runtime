@@ -65,7 +65,14 @@ class Projection:
         return update is not None and self._ready(controller, now, update.analyzed_capture_ns)
 
     def health_ready(self, controller: StepController | None, now: int) -> bool:
-        return self._ready(controller, now, self.scene.last_analyzed_capture_ns)
+        analyzed = self.scene.last_analyzed_capture_ns
+        return self._ready(controller, now, analyzed) or (
+            analyzed is not None
+            and self.scene.latest is None
+            and controller is not None
+            and controller.awaiting_effect(now)
+            and self.capture_ready(now)
+        )
 
     def _ready(self, controller: StepController | None, now: int, capture_ns: int | None) -> bool:
         return (

@@ -315,15 +315,22 @@ class _Submission:
         return dict(self._outcomes)
 
     def resolve(self, result: models.Accepted | models.Rejected) -> None:
-        self._result = result
         if isinstance(result, models.Rejected):
             # 被拒绝的块不执行任何动作，也没有回执。
+            if self._outcomes:
+                raise ChannelError("protocol-error", "被拒绝的动作块已经收到动作回执")
             self._expected = set()
+        self._result = result
         self._settle()
 
     def record(self, outcomes: Sequence[models.ActionOutcome]) -> None:
         for outcome in outcomes:
-            self._outcomes.setdefault(outcome.root.id, outcome.root)
+            item = outcome.root
+            if item.id not in self._expected:
+                continue
+            if self._outcomes.setdefault(item.id, item) != item:
+                self.fail(ChannelError("protocol-error", "同一动作收到互相矛盾的回执"))
+                return
         self._settle()
 
     def fail(self, error: BaseException) -> None:
@@ -842,11 +849,11 @@ class CoreLink:
             result = models.ActionSubmitResult.model_validate(reply).root
             if correlation is not None and attempts is not None:
                 attempts.submit_result(correlation, result)
+            submission.resolve(result)
         except BaseException as error:
             self._submissions.pop(key, None)
             submission.fail(error)
             raise
-        submission.resolve(result)
         if isinstance(result, models.Rejected):
             logger.warning(
                 "实时核拒绝了动作块 %s#%d seq %d：%s（%s）",

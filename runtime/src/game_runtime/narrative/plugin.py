@@ -552,9 +552,7 @@ class Recorder:
         key = (pixels.roi, pixels.width, pixels.height, digest)
         reading = self._cache.get(key)
         if reading is None:
-            result = await self._ocr.recognize_rect(
-                pixels, PixelRect(0, 0, pixels.width, pixels.height)
-            )
+            result = await self._ocr.recognize_cropped_roi(pixels, pixels.roi)
             reading = Reading(
                 pixels.roi, tuple((line.text, line.confidence) for line in result.lines)
             )

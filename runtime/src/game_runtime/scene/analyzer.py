@@ -61,6 +61,8 @@ class SceneUpdate:
         default_factory=object, repr=False, compare=False, kw_only=True
     )
     """连续未变的画面共用；由 scene@1 发布时设置。"""
+    capture_scope: object | None = field(default=None, repr=False, compare=False, kw_only=True)
+    """同一段连续采集共用；由 scene@1 发布时设置。"""
 
     @property
     def analyzed_capture_ns(self) -> int | None:

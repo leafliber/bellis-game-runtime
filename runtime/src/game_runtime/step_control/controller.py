@@ -5,7 +5,7 @@ import logging
 from collections import Counter, deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from time import perf_counter_ns
 from typing import Annotated, Literal
 from uuid import uuid4
@@ -14,14 +14,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core_protocol import models
 from game_runtime.adapter import Adapter, ScreenType
-from game_runtime.adapter.schema import DecisionTimer, DialogueBox
+from game_runtime.adapter.schema import DecisionTimer, DialogueBox, Signature
 from game_runtime.channel import ChannelError
 from game_runtime.core_link.link import ActionDeadlineError
 from game_runtime.kernel import ControlGrant, ControlRevokedError
+from game_runtime.kernel.control import Submission
 from game_runtime.narrative import NarrativeRecord
 from game_runtime.ocr import OcrResult, OcrService
 from game_runtime.operator import Clock, SessionState, messages
 from game_runtime.scene import (
+    Outcome,
     SceneService,
     SceneUpdate,
     ScreenObservation,
@@ -82,6 +84,22 @@ from game_runtime.telemetry import RuntimeTelemetry, SpanContext
 from game_runtime.telemetry.consumer import StepTrace, try_telemetry
 
 logger = logging.getLogger(__name__)
+_UNTIMED_CHOICE_ONLY = frozenset({ScreenType.CHOICE})
+
+
+class _EffectFrameChangedError(ActionRefusedError):
+    """OCR 返回时原核验帧已失效，可在原期限内尝试更新的帧。"""
+
+
+@dataclass(slots=True)
+class _VerificationWindow:
+    capture_scope: object
+    session_id: str | None
+    revision: int
+    last_capture_ns: int
+    continuous: bool = True
+    until_ns: int | None = None
+
 
 type Seconds = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 
@@ -154,6 +172,7 @@ class StepController:
         self._recent: deque[StepResult] = deque(maxlen=24)
         self._plan: deque[StepProposal] = deque()
         self._verified_scope: object | None = None
+        self._verification: _VerificationWindow | None = None
         self._last_proposed: object | None = None
         self._last_action_ns: int | None = None
         self._next_id = 0
@@ -192,7 +211,25 @@ class StepController:
     def wake(self) -> None:
         self._wake.set()
 
+    def awaiting_effect(self, now_ns: int) -> bool:
+        window = self._verification
+        return (
+            window is not None
+            and window.until_ns is not None
+            and now_ns < window.until_ns
+            and self._verification_current(window)
+            and self._allowed(verifying=True)
+        )
+
     def observe(self, update: SceneUpdate) -> None:
+        window = self._verification
+        if window is not None and window.continuous:
+            captured = update.frame.capture_ns
+            window.continuous = (
+                update.capture_scope is window.capture_scope
+                and 0 <= captured - window.last_capture_ns <= _ns(self.config.max_frame_age)
+            )
+            window.last_capture_ns = captured
         if (
             update.state.stability is Stability.STABLE
             and update.state.verdict is Verdict.SCREEN
@@ -510,8 +547,7 @@ class StepController:
             raise SemanticPauseError("pacing-held")
 
     def _fresh(self, update: SceneUpdate) -> bool:
-        age = max(0, self.clock.now_ns() - update.frame.capture_ns)
-        return age <= _ns(self.config.max_frame_age)
+        return 0 <= self.clock.now_ns() - update.frame.capture_ns <= _ns(self.config.max_frame_age)
 
     def _waiting_time(self) -> bool:
         interval = max(
@@ -620,6 +656,26 @@ class StepController:
             await self._issue_with_retry(
                 here, proposal, found, revision, fast_dialogue=record, trace=trace
             )
+
+    def _dialogue_choice_effect(self, update: SceneUpdate) -> Signature | None:
+        candidates = [
+            signature
+            for signature in self.adapter.signatures
+            if signature.calibrated
+            and self.adapter.generic_type(signature.screen) is ScreenType.CHOICE
+            and (decision := self.adapter.decisions.get(signature.screen)) is not None
+            and decision.timer is None
+            and self.adapter.rois[decision.options].rect is not None
+        ]
+        if len(candidates) != 1:
+            return None
+        (signature,) = candidates
+        if signature.id not in update.state.matched and any(
+            result.id == signature.id and result.outcome is Outcome.NO_MATCH
+            for result in update.state.signatures
+        ):
+            return signature
+        return None
 
     def _restart_permitted(self, update: SceneUpdate) -> bool:
         ending = self._progress.ending
@@ -1097,6 +1153,24 @@ class StepController:
             await self.clock.sleep_until(min(end, self.clock.now_ns() + _ns(0.025)))
         return None
 
+    def _can_verify(self, before: SceneUpdate, revision: int) -> bool:
+        window = self._verification
+        return (
+            revision == self._revision
+            and before.capture_scope is not None
+            and self.scene.capture_scope is before.capture_scope
+            and self._allowed(verifying=True)
+            and (window is None or self._verification_current(window))
+        )
+
+    def _verification_current(self, window: _VerificationWindow) -> bool:
+        return (
+            window.continuous
+            and window.revision == self._revision
+            and self.scene.capture_scope is window.capture_scope
+            and self.operator.session_id == window.session_id
+        )
+
     async def _read_timer(self, update: SceneUpdate, timer: DecisionTimer) -> tuple[OcrResult, int]:
         timing = await self.ocr.recognize(update.frame, timer.roi)
         verify_ocr(update, timing)
@@ -1509,6 +1583,13 @@ class StepController:
         action_id = self._next_id
         action = core_action(proposal, found, action_id)
         category = Category.SELECT if decision is not None else proposal.category
+        dialogue_choice = (
+            self._dialogue_choice_effect(here)
+            if fast_dialogue is not None
+            and category is Category.ADVANCE
+            and proposal.expected.kind is EffectKind.TEXT_DISAPPEARED
+            else None
+        )
         outcome = None
         if self._semantic is not None:
             outcome = self._semantic.action_started(
@@ -1528,8 +1609,17 @@ class StepController:
             self._progress.restart_attempt_revision = self._operator_goal.revision
         self._choice_submitting = decision is not None
         status, detail = StepStatus.UNKNOWN, "submission-unknown"
+        sent: Submission | None = None
         receipt: models.Executed | models.Dropped | models.Uncertain | None = None
         effect_checked = None
+        window = (
+            None
+            if here.capture_scope is None
+            else _VerificationWindow(
+                here.capture_scope, self.operator.session_id, revision, here.frame.capture_ns
+            )
+        )
+        self._verification = window
         loop = asyncio.get_running_loop()
         receipt_until = loop.time() + self.config.receipt_timeout
         try:
@@ -1559,7 +1649,12 @@ class StepController:
                         receipt.id != action_id
                         or (
                             isinstance(receipt, models.Executed)
-                            and not started <= receipt.at_ns < end
+                            and not (
+                                sent.block.base_frame == here.frame.frame_number
+                                and started <= receipt.at_ns < end
+                                and sent.block.start_ns <= receipt.at_ns <= sent.block.deadline_ns
+                                and receipt.at_ns <= self.clock.now_ns()
+                            )
                         )
                     ):
                         receipt = None
@@ -1575,13 +1670,28 @@ class StepController:
                         detail = "receipt-uncertain"
             if isinstance(receipt, models.Executed):
                 until = self.clock.now_ns() + _ns(self.config.effect_timeout)
+                goal = self._progress.goal
+                if (
+                    goal is not None
+                    and goal.deadline_ns is not None
+                    and not self._waiting_for(decision)
+                ):
+                    until = min(until, goal.deadline_ns)
+                if window is not None:
+                    window.until_ns = until
                 if trace is not None:
                     executed_at = perf_counter_ns()
                     # 回执等待已结束，固定核验截止以后才交付积攒的遥测事件。
                     trace.flush_submitted()
                     trace.event("executed", at_monotonic_ns=executed_at)
                 status = await self._verify(
-                    here, proposal.expected, receipt.at_ns, decision, revision, until=until
+                    here,
+                    proposal.expected,
+                    receipt.at_ns,
+                    decision,
+                    revision,
+                    until=until,
+                    dialogue_choice=dialogue_choice,
                 )
                 effect_checked = perf_counter_ns()
                 if status is StepStatus.VERIFIED:
@@ -1589,9 +1699,11 @@ class StepController:
                 elif status is not StepStatus.UNKNOWN:
                     detail = status.value
         except ControlRevokedError:
-            status, detail = StepStatus.REJECTED, "producer-revoked"
+            if sent is None:
+                status, detail = StepStatus.REJECTED, "producer-revoked"
         except ActionDeadlineError:
-            status, detail = StepStatus.REJECTED, "action-window-expired"
+            if sent is None:
+                status, detail = StepStatus.REJECTED, "action-window-expired"
         except (TimeoutError, ChannelError):
             pass
         except ActionRefusedError:
@@ -1608,6 +1720,7 @@ class StepController:
             detail = "execution-verification-failed"
             logger.exception("无法确认已提交动作的效果")
         finally:
+            self._verification = None
             try:
                 if outcome is not None:
                     outcome(
@@ -1638,6 +1751,7 @@ class StepController:
         revision: int,
         *,
         until: int,
+        dialogue_choice: Signature | None = None,
     ) -> StepStatus:
         last = before.frame.frame_number
         unchanged = False
@@ -1645,11 +1759,7 @@ class StepController:
         if deadline is not None and executed_ns >= deadline:
             return StepStatus.UNKNOWN
         early_destination: str | None = None
-        while (
-            self._allowed(verifying=True)
-            and revision == self._revision
-            and self.clock.now_ns() < until
-        ):
+        while self._can_verify(before, revision) and self.clock.now_ns() < until:
             after = self.scene.latest
             if (
                 after is not None
@@ -1687,9 +1797,26 @@ class StepController:
                             )
                         elif expected.kind is EffectKind.UNCHANGED:
                             verified = unchanged
-                        else:
-                            verified = not unchanged and await self._matches(expected, after)
-                if verified and self._allowed(verifying=True) and revision == self._revision:
+                        elif not unchanged:
+                            try:
+                                remaining = max(0, until - self.clock.now_ns()) / 1e9
+                                async with asyncio.timeout(remaining):
+                                    verified = await self._matches(expected, after)
+                                    if not verified and dialogue_choice is not None:
+                                        verified = await self._matches_dialogue_choice(
+                                            after, dialogue_choice
+                                        )
+                            except _EffectFrameChangedError:
+                                continue
+                latest = self.scene.latest
+                if (
+                    verified
+                    and self._can_verify(before, revision)
+                    and self.clock.now_ns() < until
+                    and latest is not None
+                    and latest.observation_scope is after.observation_scope
+                    and self._fresh(latest)
+                ):
                     self._verified_scope = after.observation_scope
                     return StepStatus.VERIFIED
             self._wake.clear()
@@ -1698,16 +1825,38 @@ class StepController:
                     await self._wake.wait()
         latest = self.scene.latest
         if (
-            self._allowed(verifying=True)
-            and revision == self._revision
+            self._can_verify(before, revision)
             and decision is None
             and unchanged
             and latest is not None
+            and latest.state.stability is Stability.STABLE
+            and executed_ns < latest.frame.capture_ns < until
             and self._fresh(latest)
             and latest.observation_scope is before.observation_scope
         ):
             return StepStatus.NO_EFFECT
         return StepStatus.UNKNOWN
+
+    async def _matches_dialogue_choice(self, update: SceneUpdate, signature: Signature) -> bool:
+        if (
+            update.state.verdict is not Verdict.SCREEN
+            or update.state.screen != signature.screen
+            or signature.id not in update.state.matched
+            or update.screen_state.classification.source is not ScreenSource.SIGNATURE
+            or update.screen_state.restrictions != _UNTIMED_CHOICE_ONLY
+        ):
+            return False
+        try:
+            here, evidence, (options, *_) = await self._scene_evidence(update)
+        except ActionRefusedError:
+            return False
+        roi = self.adapter.decisions[signature.screen].options
+        return (
+            here.screen_state.restrictions == _UNTIMED_CHOICE_ONLY
+            and evidence.deadline_ns is None
+            and options.roi == roi
+            and options.rect == self.adapter.roi(roi).to_pixels(here.frame.width, here.frame.height)
+        )
 
     async def _matches(self, expected: ExpectedEffect, update: SceneUpdate) -> bool:
         match expected.kind:
@@ -1726,19 +1875,26 @@ class StepController:
                 if expected.roi is not None and expected.text is not None:
                     result = await self.ocr.recognize(update.frame, expected.roi)
                     verify_ocr(update, result)
+                    if result.roi != expected.roi or result.rect != self.adapter.roi(
+                        expected.roi
+                    ).to_pixels(update.frame.width, update.frame.height):
+                        raise ActionRefusedError("stale-ocr")
                     current = self.scene.with_ocr(update, (result,))
                     if current is None:
-                        raise ActionRefusedError("scene-changed")
+                        raise _EffectFrameChangedError("scene-changed")
                     if current.state.verdict in (
                         Verdict.DISABLED,
                         Verdict.UNDETERMINED,
                         Verdict.AMBIGUOUS,
                     ):
                         return False
-                    found = any(
-                        text_key(expected.text) in text_key(line.text)
-                        for line in current.screen_state.text_targets
-                    )
+                    lines = current.screen_state.text_targets
+                    if not lines:
+                        return False
+                    key = text_key(expected.text)
+                    if not key:
+                        return False
+                    found = key in text_key("".join(line.text for line in lines))
                     return found == (expected.kind is EffectKind.TEXT_APPEARED)
             case EffectKind.CHANGED | EffectKind.UNCHANGED:
                 pass

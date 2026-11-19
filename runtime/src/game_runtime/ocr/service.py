@@ -7,16 +7,19 @@
 
 import asyncio
 import functools
+from collections import OrderedDict
 from collections.abc import Buffer, Callable
 from concurrent.futures import CancelledError, ThreadPoolExecutor
-from dataclasses import dataclass, field
-from typing import Protocol
+from dataclasses import dataclass, field, replace
+from typing import Final, Protocol
 
+import cv2
 import numpy as np
+from numpy.typing import NDArray
 
 from game_runtime._threads import in_thread
 from game_runtime.adapter import Adapter, FixedText, PixelRect
-from game_runtime.ocr.engine import Image, Recognizer
+from game_runtime.ocr.engine import Image, RecognizedLine, Recognizer
 from game_runtime.ocr.script import (
     Script,
     ScriptCheck,
@@ -26,6 +29,9 @@ from game_runtime.ocr.script import (
 )
 
 BYTES_PER_PIXEL = 4
+_CACHE_ENTRIES: Final = 4
+_MAX_CACHED_BYTES: Final = 1024 * 1024
+type _CropKey = tuple[int, int, bool, bytes]
 
 
 class UnsupportedLanguageError(Exception):
@@ -118,8 +124,7 @@ class LanguageCheck:
         return tuple(outcome for outcome in self.outcomes if not outcome.matched)
 
 
-def crop_bgr(frame: FrameLike, rect: PixelRect) -> Image:
-    """从帧里拷贝出 `rect`（客户区物理像素）的 BGR 图像。"""
+def _crop_bgra(frame: FrameLike, rect: PixelRect) -> NDArray[np.uint8]:
     left, top, right, bottom = rect
     if not (0 <= left < right <= frame.width and 0 <= top < bottom <= frame.height):
         raise ValueError(f"区域 {tuple(rect)} 为空或超出 {frame.width}×{frame.height} 的帧")
@@ -131,8 +136,12 @@ def crop_bgr(frame: FrameLike, rect: PixelRect) -> Image:
         raise ValueError(f"像素只有 {data.size} 字节，少于 {stride * frame.height}")
     rows = data[: stride * frame.height].reshape(frame.height, stride)
     region = rows[top:bottom, left * BYTES_PER_PIXEL : right * BYTES_PER_PIXEL]
-    pixels = region.reshape(bottom - top, right - left, BYTES_PER_PIXEL)
-    return np.ascontiguousarray(pixels[:, :, :3])
+    return region.reshape(bottom - top, right - left, BYTES_PER_PIXEL)
+
+
+def crop_bgr(frame: FrameLike, rect: PixelRect) -> Image:
+    """从帧里拷贝出 `rect`（客户区物理像素）的 BGR 图像。"""
+    return np.ascontiguousarray(_crop_bgra(frame, rect)[:, :, :3])
 
 
 def recognize_frame(
@@ -142,6 +151,12 @@ def recognize_frame(
 
     `ocr@1` 在工作线程里调用它；离线工具（GS-04 评测）直接调用。
     """
+    return _frame_result(frame, rect, roi, tuple(recognizer.recognize(crop_bgr(frame, rect))))
+
+
+def _frame_result(
+    frame: FrameLike, rect: PixelRect, roi: str | None, reading: tuple[RecognizedLine, ...]
+) -> OcrResult:
     lines = tuple(
         OcrLine(
             line.text,
@@ -154,7 +169,7 @@ def recognize_frame(
             line.confidence,
             line.horizontal,
         )
-        for line in recognizer.recognize(crop_bgr(frame, rect))
+        for line in reading
     )
     return OcrResult(frame.frame_number, frame.transform_version, roi, rect, lines)
 
@@ -185,7 +200,10 @@ class OcrService:
         self.model = model
         """所用模型组的名字。"""
         self._recognizer = recognizer
+        self._dialogue_rois = frozenset(box.text for box in adapter.dialogue_boxes)
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr")
+        # 仅识别线程访问。缓存保留裁片坐标，由每次调用重新附上帧号、变换和原点。
+        self._cache: OrderedDict[_CropKey, tuple[RecognizedLine, ...]] = OrderedDict()
         self._closed = False
 
     async def recognize(self, frame: FrameLike, roi: str) -> OcrResult:
@@ -195,14 +213,53 @@ class OcrService:
         归一化矩形按这一帧的宽高换算为物理像素（`NormalizedRect.to_pixels`）。
         """
         rect = self.adapter.roi(roi).to_pixels(frame.width, frame.height)
-        return await self._run(
-            functools.partial(recognize_frame, self._recognizer, frame, rect, roi)
-        )
+        return await self._run(functools.partial(self._recognize, frame, rect, roi))
+
+    async def recognize_cropped_roi(self, frame: FrameLike, roi: str) -> OcrResult:
+        """识别已裁出的标定 ROI，坐标仍以裁片为原点。"""
+        self.adapter.roi(roi)
+        rect = PixelRect(0, 0, frame.width, frame.height)
+        return await self._run(functools.partial(self._recognize, frame, rect, roi))
 
     async def recognize_rect(self, frame: FrameLike, rect: PixelRect) -> OcrResult:
         """识别客户区物理像素的矩形 `rect`；为空或超出帧即 `ValueError`。"""
         rect = PixelRect(*rect)
-        return await self._run(functools.partial(recognize_frame, self._recognizer, frame, rect))
+        return await self._run(functools.partial(self._recognize, frame, rect))
+
+    def _recognize(self, frame: FrameLike, rect: PixelRect, roi: str | None = None) -> OcrResult:
+        crop = _crop_bgra(frame, rect)
+        height, width = crop.shape[:2]
+        dialogue = roi in self._dialogue_rois
+        key = (
+            (height, width, dialogue, crop.tobytes()) if crop.nbytes <= _MAX_CACHED_BYTES else None
+        )
+        if key is not None and (reading := self._cache.get(key)) is not None:
+            self._cache.move_to_end(key)
+            return _frame_result(frame, rect, roi, reading)
+
+        image = np.ascontiguousarray(crop[:, :, :3])
+        reading = tuple(self._recognizer.recognize(image))
+        if not reading and dialogue:
+            reading = self._recognize_enlarged(image)
+        if key is not None:
+            self._cache[key] = reading
+            if len(self._cache) > _CACHE_ENTRIES:
+                self._cache.popitem(last=False)
+        return _frame_result(frame, rect, roi, reading)
+
+    def _recognize_enlarged(self, image: Image) -> tuple[RecognizedLine, ...]:
+        height, width = image.shape[:2]
+        width, height = width * 2, height * 2
+        enlarged = np.asarray(
+            cv2.resize(image, (width, height), interpolation=cv2.INTER_CUBIC), dtype=np.uint8
+        )
+        lines: list[RecognizedLine] = []
+        for line in self._recognizer.recognize(enlarged):
+            left, top, right, bottom = line.box
+            if 0 <= left < right <= width and 0 <= top < bottom <= height:
+                box = PixelRect(left // 2, top // 2, (right + 1) // 2, (bottom + 1) // 2)
+                lines.append(replace(line, box=box))
+        return tuple(lines)
 
     async def check_language(self, frame: FrameLike, screen: str) -> LanguageCheck:
         """语言核对的固定文字一层：`frame` 是画面 `screen` 的稳定帧，对这个画面声明的每一项的 ROI
@@ -231,7 +288,7 @@ class OcrService:
         多个线程里同时调用，按先后排队；不能在事件循环里调用（会阻塞它）。区域为空或超出帧即
         `ValueError`，服务已停用即 `OcrClosedError`。
         """
-        job = functools.partial(recognize_frame, self._recognizer, frame, PixelRect(*rect))
+        job = functools.partial(self._recognize, frame, PixelRect(*rect))
         if self._closed:
             raise OcrClosedError("ocr@1 已停用")
         try:
@@ -247,6 +304,7 @@ class OcrService:
         """停用：不再接受识别，等在途的识别做完；还没开始的取消。"""
         self._closed = True
         await in_thread(functools.partial(self._executor.shutdown, wait=True, cancel_futures=True))
+        self._cache.clear()
 
     async def _run(self, job: Callable[[], OcrResult]) -> OcrResult:
         if self._closed:

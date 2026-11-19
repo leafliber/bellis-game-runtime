@@ -54,6 +54,11 @@ class SceneService(Protocol):
         """最近可判帧的采集时刻，画面像素变化待判时保留，判别或帧源失效时清空。"""
         ...
 
+    @property
+    def capture_scope(self) -> object:
+        """随采集失效或几何变化而更换。"""
+        ...
+
     def subscribe(self, listener: SceneListener) -> Callable[[], None]:
         """监听者按处理的顺序收到每一帧的结果，返回取消订阅的函数（可重复调用）。
 
@@ -92,6 +97,8 @@ class SceneHub:
         self._uncalibrated = uncalibrated
         self._latest: SceneUpdate | None = None
         self._last_analyzed_capture_ns: int | None = None
+        self._last_frame: RingFrame | None = None
+        self._capture_scope = object()
         self._listeners: dict[object, SceneListener] = {}
         self._closed = False
 
@@ -102,6 +109,10 @@ class SceneHub:
     @property
     def last_analyzed_capture_ns(self) -> int | None:
         return self._last_analyzed_capture_ns
+
+    @property
+    def capture_scope(self) -> object:
+        return self._capture_scope
 
     @property
     def problems(self) -> tuple[str, ...]:
@@ -153,15 +164,17 @@ class SceneHub:
     def invalidate(self) -> None:
         self._latest = None
         self._last_analyzed_capture_ns = None
+        self._last_frame = None
+        self._capture_scope = object()
 
     def begin_frame(self, frame: RingFrame) -> None:
-        latest = self._latest
-        if latest is None:
-            return
-        if not _continues_capture(latest.frame, frame):
-            self.invalidate()
-        elif latest.frame.pixels != frame.pixels:
-            self._latest = None
+        previous = self._last_frame
+        if previous is not None:
+            if not _continues_capture(previous, frame):
+                self.invalidate()
+            elif previous.pixels != frame.pixels:
+                self._latest = None
+        self._last_frame = frame
 
     def close(self) -> None:
         self._closed = True
@@ -171,6 +184,9 @@ class SceneHub:
     def publish(self, update: SceneUpdate) -> None:
         if self._closed:
             return
+        if self._last_frame is not update.frame:
+            self.begin_frame(update.frame)
+        update = replace(update, capture_scope=self._capture_scope)
         old = self._latest
         if (
             old is not None
@@ -195,6 +211,7 @@ class SceneHub:
 def _continues_capture(before: RingFrame, current: RingFrame) -> bool:
     return (
         before.frame_number < current.frame_number
+        and before.capture_ns <= current.capture_ns
         and before.transform_version == current.transform_version
         and before.width == current.width
         and before.height == current.height

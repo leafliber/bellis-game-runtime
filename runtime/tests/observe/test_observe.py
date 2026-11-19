@@ -508,7 +508,7 @@ def test_language_results_are_shown_and_logged(
             model="scripted",
         )
         try:
-            result = await service.check_language(blank(5), "title-menu")
+            result = await service.check_language(language_frame(5), "title-menu")
         finally:
             await service.aclose()
         outcome = LanguageResult.MATCH if result.passed else LanguageResult.MISMATCH
@@ -541,10 +541,15 @@ def test_language_results_are_shown_and_logged(
     }
 
 
-def blank(number: int) -> RingFrame:
-    return RingFrame(
-        number, number * SECOND // 10, 1, WIDTH, HEIGHT, WIDTH * 4, bytes(WIDTH * 4 * HEIGHT)
+def language_frame(number: int) -> RingFrame:
+    """给各菜单 ROI 不同像素，避免在相同空白裁片上脚本返回不同文字。"""
+    pixels = bytes(
+        channel
+        for y in range(HEIGHT)
+        for x in range(WIDTH)
+        for channel in (x % 256, y % 256, 0, 255)
     )
+    return RingFrame(number, number * SECOND // 10, 1, WIDTH, HEIGHT, WIDTH * 4, pixels)
 
 
 # 摘要
@@ -916,8 +921,8 @@ def test_observer_follows_services_and_checks_the_language() -> None:
         scene = Shared.scene
         assert scene is not None
         menu = state(2, Verdict.SCREEN, "title-menu")
-        scene.publish(SceneUpdate(blank(2), menu))
-        scene.publish(SceneUpdate(blank(3), state(3, Verdict.SCREEN, "title-menu")))
+        scene.publish(SceneUpdate(language_frame(2), menu))
+        scene.publish(SceneUpdate(language_frame(3), state(3, Verdict.SCREEN, "title-menu")))
         await until(lambda: hub.language_results or None)
         await kernel.shutdown()
 
