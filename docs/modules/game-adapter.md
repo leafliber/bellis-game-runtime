@@ -127,6 +127,9 @@
 - `risk.returns` 只为限制为返回的画面声明确定的返回目标。每项指定已标定的 `roi` 和明确表示返回、关闭或取消的 `text`。同时满足对应画面签名、ROI 内精确匹配文字、左键白名单和全部其他风险限制时才允许点击。
 - `decisions` 以选择画面的 ID 为键。每项指定选项的 `options` ROI 和可选提问的 `prompt` ROI。计时选择还须指定 `timer`，含剩余时间的文字 ROI 和可选的 `prefix`、`suffix`。读数可为秒或分秒，可带小数秒。选择画面缺少必要标定时不得据此执行选择。
 - `restarts` 以坏结局画面的 ID 为键。每项以 `roi` 和 `text` 指定游戏自带的重来按钮，并用 `success_signature` 指定点击后核验的画面签名。源画面与结果签名都须已标定。授权与输入门禁见[重来入口](step-control.md#重来入口)。
+- `recoveries` 以已标定的坏结局画面 ID 为键。同一画面只声明一种重来入口。`open` 使用重来入口的字段，其结果签名指向已标定的自动存档读取页。`success_signature` 指向已标定的读档后游戏画面。每个 `slots` 项提供唯一的 `label`、`label_roi` 和 `click_roi`。`timestamp_format` 用 `strptime` 表达完整日期和时分秒，`empty_text` 声明可核验的空槽标记。
+
+`game_runtime.step_control.recovery.newest_auto_save` 从当前 `scene@1` 观察范围内的已签名读取页调用 `ocr@1`。调用方传入与采集同源的单调时钟和最大帧龄。一次读取核对同一张帧上全部声明槽位的标签及完整时间，仅在存在唯一最新的非空存档时返回槽位和定位证据。
 
 ### 画面签名
 
