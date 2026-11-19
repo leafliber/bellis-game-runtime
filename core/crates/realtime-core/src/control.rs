@@ -15,10 +15,12 @@ use std::time::{Duration, Instant};
 use core_protocol::messages::{
     Accepted, Action, ActionBlock, ActionOutcome, ActionReceiptParams, ActionSubmitResult,
     CaptureState, CoreHealthParams, DropReason, Dropped, Executed, HeldInput, InputPolicy,
-    InputReleasedParams, InputResidualParams, InputVerificationParams, LeaseGrantParams, Producer,
-    ProducerHeartbeatParams, RejectReason, Rejected, ReleaseReason, ReleaseVerification, Uncertain,
-    VerificationResult,
+    InputReleasedParams, InputResidualParams, InputVerificationParams, LeaseGrantParams,
+    MouseButton, Producer, ProducerHeartbeatParams, RejectReason, Rejected, ReleaseReason,
+    ReleaseVerification, Uncertain, VerificationResult,
 };
+
+use game_bridge_protocol::{LocalDialogue, LocalRecovery, LocalRecoveryKind};
 
 use crate::frames::FrameStatus;
 use crate::lease::{Granted, Lease, Refusal};
@@ -279,9 +281,25 @@ impl Plan {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ApprovedFrame {
+    number: u64,
+    transform_version: u32,
+}
+
+struct DialogueLease {
+    scope: String,
+    token: u64,
+    expires_ns: u64,
+    remaining: u32,
+    last_frame: u64,
+    approved_frame: Option<ApprovedFrame>,
+}
+
 struct State {
     ledger: InputLedger,
     lease: Lease,
+    dialogue_lease: Option<DialogueLease>,
     current: Option<Current>,
     revoked_through: Option<u64>,
     stopping: bool,
@@ -312,6 +330,73 @@ enum Step {
 impl State {
     fn input_unavailable(&self) -> bool {
         self.input_fault.is_some() || self.pending_verification.is_some()
+    }
+
+    fn check_dialogue_submission<'a>(
+        &self,
+        block: &ActionBlock,
+        now: u64,
+        frames: &'a FrameStatus,
+        limits: &Limits,
+    ) -> Result<Option<MutexGuard<'a, ()>>, &'static str> {
+        let lease = match (&self.dialogue_lease, &block.local_dialogue) {
+            (None, None) => return Ok(None),
+            (None, Some(_)) => return Err("local-dialogue-lease-missing"),
+            (Some(_), None) => return Err("local-dialogue-scope-missing"),
+            (Some(lease), Some(scope)) if scope == &lease.scope => lease,
+            (Some(_), Some(_)) => return Err("local-dialogue-scope-mismatch"),
+        };
+        if self.lease.check(now).is_err() {
+            return Err("local-dialogue-lease-invalid");
+        }
+        if lease.remaining == 0 {
+            return Err("local-dialogue-budget-exhausted");
+        }
+        if block.base_frame <= lease.last_frame {
+            return Err("local-dialogue-base-frame-reused");
+        }
+        let publication = frames
+            .try_lock_publication()
+            .ok_or("local-dialogue-frame-publishing")?;
+        if lease.approved_frame.is_some_and(|frame| {
+            block.base_frame <= frame.number
+                || !frames.transform_matches(frame.number, frame.transform_version)
+        }) {
+            return Err("local-choice-approved-frame-changed");
+        }
+        if block.start_ns > now {
+            return Err("local-dialogue-start-in-future");
+        }
+        if block.deadline_ns >= lease.expires_ns {
+            return Err("local-dialogue-deadline-outside-scope");
+        }
+        if self.plan.active.is_some() {
+            return Err("local-dialogue-plan-active");
+        }
+        if !frame_is_fresh(frames, now, limits) {
+            return Err("local-dialogue-frame-not-fresh");
+        }
+        check_dialogue_frame(frames, block.base_frame)?;
+        let [step] = block.steps.as_slice() else {
+            return Err("local-dialogue-step-shape");
+        };
+        let [Action::Click(click)] = step.actions.as_slice() else {
+            return Err("local-dialogue-step-shape");
+        };
+        if step.offset_ns != 0 || !step.held.is_empty() || click.button != MouseButton::Left {
+            return Err("local-dialogue-step-shape");
+        }
+        let policy = self
+            .policy
+            .as_ref()
+            .ok_or("local-dialogue-policy-missing")?;
+        let geometry = frames
+            .latest_geometry()
+            .ok_or("local-dialogue-geometry-missing")?;
+        if !policy.point_allowed(click.x, click.y, geometry.width, geometry.height) {
+            return Err("local-dialogue-point-outside-policy");
+        }
+        Ok(Some(publication))
     }
 
     fn current_producer(&self) -> Option<Producer> {
@@ -757,6 +842,19 @@ impl State {
                     revoke: false,
                 };
             }
+            let _publication = if self.dialogue_lease.is_some() {
+                let Some(current_frame) = frames.try_lock_publication() else {
+                    entry.done.push(dropped(&action, DropReason::NotAllowed));
+                    continue;
+                };
+                if check_dialogue_frame(frames, entry.base_frame).is_err() {
+                    entry.done.push(dropped(&action, DropReason::NotAllowed));
+                    continue;
+                }
+                Some(current_frame)
+            } else {
+                None
+            };
             match self.inject(&action, now) {
                 Inject::Done => {
                     entry.done.push(ActionOutcome::Executed(Executed {
@@ -840,6 +938,17 @@ impl State {
             }
             None => self.ledger.act(action),
         }
+    }
+}
+
+fn check_dialogue_frame(frames: &FrameStatus, number: u64) -> Result<(), &'static str> {
+    let (CaptureState::Capturing, Some(frame)) = frames.snapshot() else {
+        return Err("local-dialogue-capture-unavailable");
+    };
+    match number.cmp(&frame.frame_number) {
+        std::cmp::Ordering::Less => Err("local-dialogue-base-frame-behind"),
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err("local-dialogue-base-frame-ahead"),
     }
 }
 
@@ -937,6 +1046,13 @@ pub(crate) fn check_block(block: &ActionBlock) -> Result<(), String> {
     Ok(())
 }
 
+fn has_input(block: &ActionBlock) -> bool {
+    block
+        .steps
+        .iter()
+        .any(|step| !step.held.is_empty() || !step.actions.is_empty())
+}
+
 fn rejected(reason: RejectReason, message: impl Into<String>) -> ActionSubmitResult {
     ActionSubmitResult::Rejected(Rejected {
         reason,
@@ -976,6 +1092,7 @@ impl Control {
             state: Mutex::new(State {
                 ledger: InputLedger::new(backend),
                 lease: Lease::new(has_source),
+                dialogue_lease: None,
                 current: None,
                 revoked_through: None,
                 stopping: false,
@@ -1181,7 +1298,14 @@ impl Control {
         let mut state = self.lock();
         let mut notices = Notices::default();
         state.tick(now, &self.frames, &self.limits, &mut notices);
-        let result = Self::accept(&mut state, block, now, &self.frames, &mut notices);
+        let result = Self::accept(
+            &mut state,
+            block,
+            now,
+            &self.frames,
+            &self.limits,
+            &mut notices,
+        );
         self.done(state);
         (result, notices)
     }
@@ -1191,6 +1315,7 @@ impl Control {
         block: ActionBlock,
         now: u64,
         frames: &FrameStatus,
+        limits: &Limits,
         notices: &mut Notices,
     ) -> ActionSubmitResult {
         if state.stopping {
@@ -1235,6 +1360,10 @@ impl Control {
         if let Err(message) = check_block(&block) {
             return rejected(RejectReason::Invalid, message);
         }
+        let _publication = match state.check_dialogue_submission(&block, now, frames, limits) {
+            Ok(publication) => publication,
+            Err(code) => return rejected(RejectReason::NotAllowed, code),
+        };
         if let Err(message) = Self::check_whitelist(state, &block) {
             return rejected(RejectReason::NotAllowed, message);
         }
@@ -1252,11 +1381,7 @@ impl Control {
                 format!("deadline_ns {} is not after now ({now})", block.deadline_ns),
             );
         }
-        if block
-            .steps
-            .iter()
-            .any(|step| !step.held.is_empty() || !step.actions.is_empty())
-        {
+        if has_input(&block) {
             if state.input_unavailable() {
                 return rejected(
                     RejectReason::NotAllowed,
@@ -1284,6 +1409,10 @@ impl Control {
         if let Some(current) = state.current.as_mut() {
             current.last_block_seq = Some(block.seq);
         }
+        if let Some(lease) = &mut state.dialogue_lease {
+            lease.remaining -= 1;
+            lease.last_frame = block.base_frame;
+        }
         let producer = producer.clone();
         let mut superseded = Outcomes::default();
         state.plan.install(block, &mut superseded);
@@ -1300,6 +1429,109 @@ impl Control {
         let mut state = self.lock();
         let mut notices = Notices::default();
         let result = state.grant_lease(grant, read_clock, &mut notices);
+        self.done(state);
+        (result, notices)
+    }
+
+    /// Bellis 的独立对白许可。一个核实例只消费一个范围，续租沿用原令牌和剩余预算。
+    pub(crate) fn grant_bellis_lease(
+        &self,
+        grant: &LeaseGrantParams,
+        dialogue: Option<&LocalDialogue>,
+        read_clock: impl Fn() -> u64,
+    ) -> (Result<LeaseGrant, Refusal>, Notices) {
+        self.grant_bellis_scoped_lease(
+            grant,
+            dialogue.map(|scope| (scope, scope.action_scope(), None)),
+            read_clock,
+        )
+    }
+
+    pub(crate) fn grant_bellis_recovery_lease(
+        &self,
+        grant: &LeaseGrantParams,
+        recovery: &LocalRecovery,
+        read_clock: impl Fn() -> u64,
+    ) -> (Result<LeaseGrant, Refusal>, Notices) {
+        let approved_frame = match &recovery.kind {
+            LocalRecoveryKind::Named {
+                frame_number,
+                transform_version,
+                ..
+            } => Some(ApprovedFrame {
+                number: frame_number.get(),
+                transform_version: *transform_version,
+            }),
+            _ => None,
+        };
+        self.grant_bellis_scoped_lease(
+            grant,
+            Some((&recovery.scope, recovery.action_scope(), approved_frame)),
+            read_clock,
+        )
+    }
+
+    fn grant_bellis_scoped_lease(
+        &self,
+        grant: &LeaseGrantParams,
+        scoped: Option<(&LocalDialogue, String, Option<ApprovedFrame>)>,
+        read_clock: impl Fn() -> u64,
+    ) -> (Result<LeaseGrant, Refusal>, Notices) {
+        let mut state = self.lock();
+        let mut notices = Notices::default();
+        let result = (|| {
+            let Some((authority, scope, approved_frame)) = scoped else {
+                if state.dialogue_lease.is_some() {
+                    return Err(Refusal::ScopeMismatch);
+                }
+                return state.grant_lease(grant, read_clock, &mut notices);
+            };
+            let now = read_clock();
+            let expires_ns = authority.expires_at_ms.to_ns();
+            if !state.requires_policy
+                || !state
+                    .policy
+                    .as_ref()
+                    .is_some_and(Policy::is_dialogue_click_only)
+                || grant.expires_ns > expires_ns
+                || expires_ns <= now
+                || approved_frame.is_some_and(|frame| {
+                    !self
+                        .frames
+                        .transform_matches(frame.number, frame.transform_version)
+                })
+            {
+                return Err(Refusal::ScopeMismatch);
+            }
+            if let Some(previous) = &state.dialogue_lease {
+                if previous.token != grant.token
+                    || previous.scope != scope
+                    || state.lease.check(now).is_err()
+                {
+                    return Err(Refusal::ScopeMismatch);
+                }
+                return state.grant_lease(grant, read_clock, &mut notices);
+            }
+            if state.lease.active_token().is_some()
+                || state.plan.active.is_some()
+                || state.pending_verification_id().is_some()
+            {
+                return Err(Refusal::ScopeMismatch);
+            }
+            let result = state.grant_lease(grant, read_clock, &mut notices)?;
+            if !matches!(result, LeaseGrant::Applied) {
+                return Err(Refusal::ScopeMismatch);
+            }
+            state.dialogue_lease = Some(DialogueLease {
+                scope,
+                token: grant.token,
+                expires_ns,
+                remaining: authority.max_actions,
+                last_frame: 0,
+                approved_frame,
+            });
+            Ok(result)
+        })();
         self.done(state);
         (result, notices)
     }
@@ -1406,16 +1638,8 @@ impl Control {
                 }
                 Ok(())
             }
-            None if state.requires_policy => {
-                let has_input = block
-                    .steps
-                    .iter()
-                    .any(|step| !step.held.is_empty() || !step.actions.is_empty());
-                if has_input {
-                    Err("the real input backend has no input policy yet".into())
-                } else {
-                    Ok(())
-                }
+            None if state.requires_policy && has_input(block) => {
+                Err("the real input backend has no input policy yet".into())
             }
             None => Ok(()),
         }

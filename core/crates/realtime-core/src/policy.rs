@@ -112,6 +112,15 @@ impl Policy {
         })
     }
 
+    pub(crate) fn is_dialogue_click_only(&self) -> bool {
+        self.click_buttons.len() == 1
+            && self.click_buttons.contains(&MouseButton::Left)
+            && self.press_keys.is_empty()
+            && !self.scroll
+            && self.hold_keys.is_empty()
+            && self.hold_buttons.is_empty()
+    }
+
     /// 点击与短按的按住时长。
     pub(crate) fn press_duration(&self) -> Duration {
         self.press_duration

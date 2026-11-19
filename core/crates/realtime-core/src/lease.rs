@@ -39,17 +39,29 @@ pub(crate) enum Granted {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// 令牌小于当前令牌。
-    Stale { token: u64, current: u64 },
+    Stale {
+        token: u64,
+        current: u64,
+    },
     /// 令牌已被吊销。
-    Revoked { token: u64, through: u64 },
+    Revoked {
+        token: u64,
+        through: u64,
+    },
     /// 这个令牌的许可已经过期，过期的许可不能续约。
-    Lapsed { token: u64 },
+    Lapsed {
+        token: u64,
+    },
     /// 到期时刻不晚于现在。
-    PastExpiry { expires_ns: u64, now: u64 },
+    PastExpiry {
+        expires_ns: u64,
+        now: u64,
+    },
     /// 系统单调时钟读数不可用。
     ClockUnavailable,
     /// 没有许可源，或与它的连接已断开。
     NoSource,
+    ScopeMismatch,
     /// 本实例的接管钩子失效。
     HookLost,
     /// 本实例无法可靠地完成输入释放。
@@ -74,6 +86,7 @@ impl fmt::Display for Refusal {
             }
             Self::ClockUnavailable => f.write_str("the system monotonic clock is unavailable"),
             Self::NoSource => f.write_str("there is no lease source"),
+            Self::ScopeMismatch => f.write_str("local dialogue lease scope is invalid or changed"),
             Self::HookLost => f.write_str("the input hook has failed; restart the core"),
             Self::ReleaseFailed => f.write_str("input release failed; restart the core"),
         }

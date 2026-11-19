@@ -335,6 +335,7 @@ Node 不在检查镜像里，生成不属于 `uv run check`；检查只用入库
 | `producer` | 产出者身份与代次；实时核拒绝其它产出者和旧代次的动作块 |
 | `seq` | 动作块序号，同一代次内严格递增 |
 | `base_frame` | 产出者做决定时依据的帧。真实后端拒绝基准帧超出本次采集范围的含输入块（`not_allowed`）。坐标按这一帧的客户区解释 |
+| `local_dialogue` | 可选的本机输入范围。值由 `game-bridge-protocol` 的 `LocalDialogue::action_scope` 或 `LocalRecovery::action_scope` 定义，须与[实时核控制连接](game-bridge.md#实时核控制连接)独立接纳的范围一致 |
 | `start_ns` | 起始时刻，与帧环同一时钟 |
 | `deadline_ns` | 有效截止时刻：到时还没有新的动作块，实时核即释放 |
 | `steps` | 按时间排列的控制步，至少一步 |

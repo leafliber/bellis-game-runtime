@@ -194,7 +194,31 @@ impl Worker {
                     token: params.token.get(),
                     expires_ns: params.expires_at_ms.to_ns(),
                 };
-                let (result, notices) = self.control.grant_lease(&grant, mono_clock::now_ns);
+                let scope = params.local_dialogue.as_ref().or_else(|| {
+                    params
+                        .local_recovery
+                        .as_ref()
+                        .map(|recovery| &recovery.scope)
+                });
+                if let Some(scope) = scope
+                    && (scope.session_id != self.session.id
+                        || scope.runtime_id != self.launch.runtime_id
+                        || self.launch.source.is_test())
+                {
+                    return Err(protocol_error(
+                        "local input lease is for another Runtime session",
+                    ));
+                }
+                let (result, notices) = if let Some(recovery) = &params.local_recovery {
+                    self.control
+                        .grant_bellis_recovery_lease(&grant, recovery, mono_clock::now_ns)
+                } else {
+                    self.control.grant_bellis_lease(
+                        &grant,
+                        params.local_dialogue.as_ref(),
+                        mono_clock::now_ns,
+                    )
+                };
                 (self.post)(notices);
                 let result = match result {
                     Ok(LeaseGrant::Applied) => Ok(()),

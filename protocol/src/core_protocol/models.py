@@ -1431,6 +1431,10 @@ class ActionBlock(BaseModel):
     """
     基准帧号：产出者做决定时依据的帧，坐标按这一帧的客户区解释。
     """
+    local_dialogue: str | None = None
+    """
+    Bellis R-30 的原授权范围，须与实时核直收的许可完全相符。
+    """
     start_ns: Annotated[int, Field(ge=0, le=18446744073709551615)]
     """
     起始时刻。

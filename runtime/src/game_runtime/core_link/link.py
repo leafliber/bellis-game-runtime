@@ -1144,6 +1144,8 @@ async def shutdown_runtime(kernel: Kernel, link: CoreLink) -> StopResult:
 
 
 def _dump(model: BaseModel) -> dict[str, Any]:
+    if isinstance(model, models.ActionBlock) and model.local_dialogue is None:
+        return model.model_dump(mode="json", exclude={"local_dialogue"})
     return model.model_dump(mode="json")
 
 

@@ -410,6 +410,8 @@ class BellisSession:
             raise _refuse("目标已过期、已使用或缺少内容")
         if request.mode == "manual":
             raise _refuse("人工接管须经操作员入口")
+        if {"localDialogue", "localRecovery"} & request.model_fields_set:
+            raise _refuse("本机范围目标尚不支持")
         controller = self.signals.controller
         if request.mode != "paused" and (not self.ready() or controller is None):
             raise _refuse("逐步控制尚未就绪")
@@ -473,6 +475,9 @@ class BellisSession:
     def _accept_choice(
         self, request: v1.GameDecisionResolveParams, parent: str | None
     ) -> v1.GameAck:
+        source = request.source
+        if source == "operator" or "localRecovery" in request.model_fields_set:
+            raise _refuse("本机范围决定尚不支持")
         point = self._point
         controller = self.signals.controller
         if (
@@ -482,7 +487,7 @@ class BellisSession:
             or point.latest is None
             or point.opened.id != request.decisionPointId
             or point.resolved
-            or (request.source == "vote" and not self.waiting_for(request.decisionPointId))
+            or (source == "vote" and not self.waiting_for(request.decisionPointId))
         ):
             raise _refuse("决策实例已过期、不匹配或已经接纳决定")
         index = next(
@@ -495,7 +500,7 @@ class BellisSession:
         )
         if index is None or not controller.on_resolved(
             messages.DecisionResolved(id=request.decisionPointId, index=index),
-            source=request.source,
+            source=source,
             traceparent=parent,
         ):
             raise _refuse("选项或决策余量线已经失效")
@@ -588,7 +593,10 @@ class BellisSession:
         if peer is None or not self.live:
             return False
         try:
-            peer.notify(method, value.model_dump(mode="json"))
+            peer.notify(
+                method,
+                value.model_dump(mode="json", exclude_unset=isinstance(value, v1.GameMainHealth)),
+            )
         except ChannelError:
             peer.connection.abort()
             return False

@@ -99,7 +99,8 @@ def test_fixture_round_trips(path: Path) -> None:
 
     parsed = model_for(path).model_validate_json(path.read_bytes())
 
-    assert parsed.model_dump(mode="json") == original
+    # Optional fields absent from an older wire payload stay absent on the round trip.
+    assert parsed.model_dump(mode="json", exclude_unset=True) == original
 
 
 @pytest.mark.parametrize("path", FIXTURES, ids=fixture_id)

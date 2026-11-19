@@ -932,6 +932,7 @@ def test_bellis_vote_and_action_fact_follow_authorized_effect(
             assert core is not None
             await ready(r, events)
             gap = delay_decision_effect_frames(r, monkeypatch)
+            assert "localRecovery" not in events.health[-1].model_fields_set
             assert r.run.core.last_health is not None
             assert r.run.core.last_health.lease is not models.LeaseStatus.VALID
             await refused(main, "goal.submit", goal("old", -5))
@@ -950,6 +951,18 @@ def test_bellis_vote_and_action_fact_follow_authorized_effect(
                     == {}
                 )
                 request = goal("navigation", 3_000 if expires_during_vote else 8_000)
+                scope = {
+                    "sessionId": "fixture01",
+                    "runtimeId": "run-02",
+                    "authorizationId": "scope",
+                    "adapterId": "synthetic-fixture",
+                    "maxActions": 2,
+                    "expiresAtMs": request["expiresAtMs"],
+                }
+                await refused(main, "goal.submit", request | {"localDialogue": scope})
+                await refused(
+                    main, "goal.submit", request | {"localRecovery": scope | {"kind": "recover"}}
+                )
                 assert await main.request("goal.submit", request) == {}
                 await until(lambda: next((g for g in r.planner.goals if g is not None), None))
                 await asyncio.sleep(0.35)
@@ -1000,6 +1013,14 @@ def test_bellis_vote_and_action_fact_follow_authorized_effect(
                     "traceparent": _DECISION_TRACE,
                 }
                 await refused(main, "decision.resolve", choice | {"decisionPointId": "older-point"})
+                await refused(main, "decision.resolve", choice | {"source": "operator"})
+                recovery = scope | {
+                    "kind": "prefix",
+                    "maxActions": 1,
+                    "decisionPointId": opened.decisionPointId,
+                    "optionId": "option-0",
+                }
+                await refused(main, "decision.resolve", choice | {"localRecovery": recovery})
                 if expires_during_vote:
                     remaining = cast(int, request["expiresAtMs"]) - now_ms()
                     await asyncio.sleep(max(0, remaining) / 1_000 + 0.05)

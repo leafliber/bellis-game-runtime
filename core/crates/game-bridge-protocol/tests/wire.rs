@@ -212,3 +212,95 @@ fn time_conversion_floors_and_preserves_absolute_deadline() {
     let received_ns = 144_350_000_000;
     assert_eq!(lease.expires_at_ms.to_ns() - received_ns, 150_000_000);
 }
+
+#[test]
+fn local_dialogue_is_a_closed_scope() {
+    let good = r#"{"jsonrpc":"2.0","id":1,"method":"lease.renew","params":{"token":9,"expiresAtMs":1400,"localDialogue":{"sessionId":"s17","runtimeId":"runtime","authorizationId":"scope","adapterId":"synthetic-game","maxActions":2,"expiresAtMs":1500}}}"#;
+    let ControlCall::LeaseRenew(lease) = BellisRequest::decode(good.as_bytes()).unwrap().call
+    else {
+        panic!("expected lease renewal");
+    };
+    assert_eq!(
+        lease.local_dialogue.unwrap().action_scope(),
+        "s17/runtime/scope/synthetic-game/2/1500"
+    );
+    for bad in [
+        good.replace(r#""maxActions":2"#, r#""maxActions":0"#),
+        good.replace(r#""maxActions":2"#, r#""maxActions":21"#),
+        good.replace(r#""maxActions":2"#, r#""maxActions":2.0"#),
+        good.replace(r#""maxActions":2"#, r#""maxActions":2,"extra":1"#),
+        good.replace(r#""sessionId":"s17""#, r#""sessionId":"else/where""#),
+    ] {
+        assert!(BellisRequest::decode(bad.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn local_recovery_scopes_match_the_same_canonical_action_binding() {
+    let fields = r#""sessionId":"s17","runtimeId":"runtime","authorizationId":"scope","adapterId":"synthetic-game","expiresAtMs":1500"#;
+    let choice = r#""decisionPointId":"fork-1","optionId":"option-0""#;
+    let opening = r#""openAuthorizationId":"original","openAuthorizationSeq":17"#;
+    let digest = "01abcdef".repeat(8);
+    let named =
+        format!(r#"{choice},"optionsDigest":"{digest}","frameNumber":7,"transformVersion":2"#);
+    let named_binding = format!("/fork-1/option-0/{digest}/7/2");
+    let decode = |scope: &str| {
+        BellisRequest::decode(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"lease.renew","params":{{"token":9,"expiresAtMs":1400,{scope}}}}}"#
+            )
+            .as_bytes(),
+        )
+    };
+    for (kind, budget, suffix, binding) in [
+        ("recover", 2, String::new(), ""),
+        ("load", 1, format!(",{opening}"), "/original/17"),
+        ("prefix", 1, format!(",{choice}"), "/fork-1/option-0"),
+        ("untried", 1, format!(",{choice}"), "/fork-1/option-0"),
+        ("named", 1, format!(",{named}"), named_binding.as_str()),
+    ] {
+        let scope = format!(
+            r#""localRecovery":{{"kind":"{kind}","maxActions":{budget},{fields}{suffix}}}"#
+        );
+        let request = decode(&scope).unwrap();
+        let ControlCall::LeaseRenew(lease) = &request.call else {
+            panic!("expected lease renewal");
+        };
+        assert_eq!(
+            lease.local_recovery.as_ref().unwrap().action_scope(),
+            format!("{kind}/s17/runtime/scope/synthetic-game/{budget}/1500{binding}")
+        );
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(BellisRequest::decode(&encoded).unwrap().call, request.call);
+        let ordinary = format!(r#""localDialogue":{{"maxActions":1,{fields}}}"#);
+        assert!(decode(&format!("{scope},{ordinary}")).is_err());
+    }
+    let named_scope =
+        format!(r#""localRecovery":{{"kind":"named","maxActions":1,{fields},{named}}}"#);
+    for scope in [
+        format!(
+            r#""localRecovery":{{"kind":"dialogue-open","maxActions":1,{fields},"route":"direct"}}"#
+        ),
+        format!(r#""localRecovery":{{"kind":"recover","maxActions":1,{fields}}}"#),
+        format!(r#""localRecovery":{{"kind":"recover","maxActions":2,{fields},{choice}}}"#),
+        format!(r#""localRecovery":{{"kind":"prefix","maxActions":1,{fields}}}"#),
+        format!(r#""localRecovery":{{"kind":"load","maxActions":2,{fields},{opening}}}"#),
+        format!(r#""localRecovery":{{"kind":"load","maxActions":1,{fields}}}"#),
+        format!(
+            r#""localRecovery":{{"kind":"load","maxActions":1,{fields},"openAuthorizationId":"scope","openAuthorizationSeq":17}}"#
+        ),
+        format!(r#""localRecovery":{{"kind":"untried","maxActions":2,{fields},{choice}}}"#),
+        format!(
+            r#""localRecovery":{{"kind":"prefix","maxActions":1,{fields},{choice},"extra":1}}"#
+        ),
+        named_scope.replace(r#""maxActions":1"#, r#""maxActions":2"#),
+        named_scope.replace(&digest, &digest.to_uppercase()),
+        named_scope.replace(r#""frameNumber":7"#, r#""frameNumber":0"#),
+        named_scope.replace(
+            r#""transformVersion":2"#,
+            r#""transformVersion":4294967296"#,
+        ),
+    ] {
+        assert!(decode(&scope).is_err());
+    }
+}

@@ -7,9 +7,12 @@ use super::{Control, Limits, Notices, Rejection, check_block};
 use crate::frames::{FrameStatus, Geometry};
 use crate::ledger::tests::{Recorder, axis, key};
 use core_protocol::messages::{
-    Action, ActionBlock, ActionOutcome, ActionSubmitResult, Click, ControlStep, HeldInput,
-    HeldMouseButton, KeyPress, LatestFrame, LeaseGrantParams, LeaseStatus, MouseButton, Producer,
-    ProducerHeartbeatParams, RejectReason, ReleaseReason, Scroll,
+    Action, ActionBlock, ActionOutcome, ActionSubmitResult, CaptureState, Click, ControlStep,
+    HeldInput, HeldMouseButton, KeyPress, LatestFrame, LeaseGrantParams, LeaseStatus, MouseButton,
+    Producer, ProducerHeartbeatParams, RejectReason, ReleaseReason, Scroll,
+};
+use game_bridge_protocol::{
+    LeaseToken, LocalDialogue, LocalRecovery, LocalRecoveryKind, MonotonicMs, RuntimeId,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -80,6 +83,7 @@ fn block(seq: u64, start: u64, valid_ms: u64, steps: Vec<ControlStep>) -> Action
         producer: producer("a", 1),
         seq,
         base_frame: 1,
+        local_dialogue: None,
         start_ns: start,
         deadline_ns: start + valid_ms * MS,
         steps,
@@ -154,12 +158,23 @@ impl Armed {
     }
 
     fn frame(&self, frame_number: u64, capture_ns: u64, geometry: Geometry) {
+        self.frame_with_transform(frame_number, capture_ns, geometry, 1);
+    }
+
+    fn frame_with_transform(
+        &self,
+        frame_number: u64,
+        capture_ns: u64,
+        geometry: Geometry,
+        version: u64,
+    ) {
         self.frames.record(
             LatestFrame {
                 frame_number,
                 capture_ns,
             },
             geometry,
+            version,
             None,
         );
     }
@@ -838,14 +853,11 @@ fn every_authority_condition_gates_every_input() {
     // 从未授予许可（含没有后端、没有许可源）。
     for backend in [Recorder::default().backend(), None] {
         let frames = Arc::new(FrameStatus::default());
-        frames.record(
-            LatestFrame {
-                frame_number: 1,
-                capture_ns: T0,
-            },
-            GEOMETRY,
-            None,
-        );
+        let frame = LatestFrame {
+            frame_number: 1,
+            capture_ns: T0,
+        };
+        frames.record(frame, GEOMETRY, 1, None);
         let control = Control::new(limits(), frames, backend, false);
         control.heartbeat(&beat("a", 1, 1), T0).unwrap();
         control.submit(block(1, T0, 100, vec![step(0, vec![], vec![click(1)])]), T0);
@@ -1131,6 +1143,7 @@ fn the_scheduler_runs_steps_and_timers_in_real_time() {
             capture_ns: now,
         },
         GEOMETRY,
+        1,
         None,
     );
     let (result, _) = control.grant_lease(
@@ -1168,6 +1181,7 @@ fn releasing_never_waits_for_the_capture_side() {
             capture_ns: T0,
         },
         GEOMETRY,
+        1,
         None,
     );
     let backend = Recorder::default();
@@ -1549,4 +1563,471 @@ fn regression_core_start_marks_unchecked_physical_release_as_unverified() {
     let armed = Armed::new_real();
     let released = serde_json::to_value(armed.control.release_on_start().params).unwrap();
     assert_eq!(released["verification"], "unverified");
+}
+
+fn dialogue_fixture() -> (Armed, LocalDialogue, LeaseGrantParams, ActionBlock) {
+    let frames = Arc::new(FrameStatus::default());
+    let backend = Recorder::default();
+    let control = Control::new(limits(), Arc::clone(&frames), backend.backend(), true);
+    let armed = Armed {
+        control,
+        frames,
+        backend,
+    };
+    armed.frames.set_state(CaptureState::Capturing);
+    armed.frame(1, T0, GEOMETRY);
+    armed.control.heartbeat(&beat("a", 1, 1), T0).unwrap();
+    let mut policy = input_policy();
+    policy.press_keys.clear();
+    policy.hold_keys.clear();
+    policy.max_hold_ms = None;
+    policy.scroll = false;
+    policy.click_regions[0].right = 0.5;
+    assert_eq!(armed.configure(&policy), Configured::Accepted);
+    let scope = LocalDialogue {
+        session_id: "s1".into(),
+        runtime_id: RuntimeId::new("runtime".into()).unwrap(),
+        authorization_id: RuntimeId::new("scope".into()).unwrap(),
+        adapter_id: "synthetic-game".into(),
+        max_actions: 2,
+        expires_at_ms: MonotonicMs::from_ns(T0 + 400 * MS),
+    };
+    let lease = LeaseGrantParams {
+        token: 4,
+        expires_ns: T0 + 200 * MS,
+    };
+    let mut scoped = block(1, T0, 80, vec![step(0, vec![], vec![click(1)])]);
+    scoped.local_dialogue = Some(scope.action_scope());
+    (armed, scope, lease, scoped)
+}
+
+fn assert_dialogue_rejection(result: ActionSubmitResult, code: &str) {
+    let ActionSubmitResult::Rejected(rejected) = result else {
+        panic!("expected rejection: {code}");
+    };
+    assert_eq!(rejected.reason, RejectReason::NotAllowed);
+    assert_eq!(rejected.message, code);
+}
+
+#[test]
+fn dialogue_submission_reports_fixed_rejection_codes() {
+    let (armed, scope, lease, scoped) = dialogue_fixture();
+    assert_dialogue_rejection(
+        armed.submit(scoped.clone(), T0).0,
+        "local-dialogue-lease-missing",
+    );
+    let (result, _) = armed
+        .control
+        .grant_bellis_lease(&lease, Some(&scope), || T0);
+    assert_eq!(result.unwrap(), super::LeaseGrant::Applied);
+
+    for (invalid, code) in [
+        (
+            ActionBlock {
+                local_dialogue: None,
+                ..scoped.clone()
+            },
+            "local-dialogue-scope-missing",
+        ),
+        (
+            ActionBlock {
+                local_dialogue: Some("wrong".into()),
+                ..scoped.clone()
+            },
+            "local-dialogue-scope-mismatch",
+        ),
+        (
+            ActionBlock {
+                steps: vec![step(0, vec![], vec![click_at(1, 300, 20)])],
+                ..scoped.clone()
+            },
+            "local-dialogue-point-outside-policy",
+        ),
+        (
+            ActionBlock {
+                steps: vec![step(0, vec![], vec![press(1, 0x39)])],
+                ..scoped.clone()
+            },
+            "local-dialogue-step-shape",
+        ),
+        (
+            ActionBlock {
+                deadline_ns: T0 + 400 * MS,
+                ..scoped.clone()
+            },
+            "local-dialogue-deadline-outside-scope",
+        ),
+        (
+            ActionBlock {
+                start_ns: T0 + MS,
+                ..scoped.clone()
+            },
+            "local-dialogue-start-in-future",
+        ),
+        (
+            ActionBlock {
+                base_frame: 2,
+                ..scoped.clone()
+            },
+            "local-dialogue-base-frame-ahead",
+        ),
+    ] {
+        assert_dialogue_rejection(armed.submit(invalid, T0).0, code);
+    }
+    armed.frame(1, T0 - MAX_FRAME_AGE - MS, GEOMETRY);
+    assert_dialogue_rejection(
+        armed.submit(scoped.clone(), T0).0,
+        "local-dialogue-frame-not-fresh",
+    );
+    armed.frame(1, T0, GEOMETRY);
+    armed.frames.set_state(CaptureState::Idle);
+    assert_dialogue_rejection(
+        armed.submit(scoped.clone(), T0).0,
+        "local-dialogue-capture-unavailable",
+    );
+    armed.frames.set_state(CaptureState::Capturing);
+    armed.frame(2, T0 + MS, GEOMETRY);
+    assert_dialogue_rejection(
+        armed.submit(scoped.clone(), T0 + MS).0,
+        "local-dialogue-base-frame-behind",
+    );
+    assert_eq!(armed.inputs(), [] as [String; 0]);
+}
+
+#[test]
+fn dialogue_scope_binds_budget_deadline_and_latest_frame() {
+    let (armed, scope, lease, mut scoped) = dialogue_fixture();
+    let (result, _) = armed
+        .control
+        .grant_bellis_lease(&lease, Some(&scope), || T0);
+    assert_eq!(result.unwrap(), super::LeaseGrant::Applied);
+    armed.frame(2, T0 + MS, GEOMETRY);
+    scoped.base_frame = 2;
+    assert!(accepted(&armed.submit(scoped.clone(), T0 + MS).0));
+
+    // 受理之后、物理执行之前换帧，仍不注入。
+    armed.frame(3, T0 + 2 * MS, GEOMETRY);
+    assert_eq!(
+        receipts(&armed.control.tick(T0 + 2 * MS)),
+        vec![(1, vec!["dropped 1 NotAllowed".to_owned()])]
+    );
+    assert_eq!(armed.inputs(), [] as [String; 0]);
+    let mut overlapping = ActionBlock {
+        seq: 2,
+        ..scoped.clone()
+    };
+    assert_dialogue_rejection(
+        armed.submit(overlapping.clone(), T0 + 2 * MS).0,
+        "local-dialogue-base-frame-reused",
+    );
+    overlapping.base_frame = 3;
+    assert_dialogue_rejection(
+        armed.submit(overlapping, T0 + 2 * MS).0,
+        "local-dialogue-plan-active",
+    );
+
+    let changed = LocalDialogue {
+        max_actions: 3,
+        ..scope.clone()
+    };
+    assert!(
+        armed
+            .control
+            .grant_bellis_lease(&lease, Some(&changed), || T0 + 3 * MS)
+            .0
+            .is_err()
+    );
+    assert!(
+        armed
+            .control
+            .grant_bellis_lease(&lease, None, || T0 + 3 * MS)
+            .0
+            .is_err()
+    );
+    armed
+        .control
+        .grant_bellis_lease(&lease, Some(&scope), || T0 + 3 * MS)
+        .0
+        .unwrap();
+    let second_at = T0 + 85 * MS;
+    armed.frame(4, second_at, GEOMETRY);
+    let second = ActionBlock {
+        seq: 2,
+        base_frame: 4,
+        start_ns: second_at,
+        deadline_ns: second_at + 80 * MS,
+        steps: vec![step(0, vec![], vec![click(2)])],
+        ..scoped.clone()
+    };
+    assert!(accepted(&armed.submit(second, second_at).0));
+    assert_eq!(
+        receipts(&armed.control.tick(second_at + MS)),
+        vec![(2, vec!["executed 2".to_owned()])]
+    );
+    assert_eq!(
+        armed.inputs().last().map(String::as_str),
+        Some("begin click Left at 10,20")
+    );
+
+    let later = T0 + 170 * MS;
+    armed.frame(5, later, GEOMETRY);
+    let third = ActionBlock {
+        seq: 3,
+        base_frame: 5,
+        start_ns: later,
+        deadline_ns: later + 80 * MS,
+        steps: vec![step(0, vec![], vec![click(3)])],
+        ..scoped
+    };
+    assert_dialogue_rejection(
+        armed.submit(third.clone(), later).0,
+        "local-dialogue-budget-exhausted",
+    );
+    armed.control.stop_bellis_input(lease.token, || later);
+    assert_dialogue_rejection(armed.submit(third, later).0, "local-dialogue-lease-invalid");
+    assert!(
+        armed
+            .control
+            .grant_bellis_lease(&lease, Some(&scope), || later)
+            .0
+            .is_err()
+    );
+}
+
+#[test]
+fn scoped_action_rejects_frame_publication_at_submit_and_drops_it_at_injection() {
+    let (armed, mut scope, lease, mut scoped) = dialogue_fixture();
+    scope.max_actions = 1;
+    scoped.local_dialogue = Some(scope.action_scope());
+    let (result, _) = armed
+        .control
+        .grant_bellis_lease(&lease, Some(&scope), || T0);
+    assert_eq!(result.unwrap(), super::LeaseGrant::Applied);
+
+    let publication = armed.frames.try_lock_publication().unwrap();
+    assert_dialogue_rejection(
+        armed.submit(scoped.clone(), T0).0,
+        "local-dialogue-frame-publishing",
+    );
+    drop(publication);
+    assert!(accepted(&armed.submit(scoped.clone(), T0).0));
+
+    let publication = armed.frames.try_lock_publication().unwrap();
+    assert_eq!(
+        receipts(&armed.control.tick(T0 + MS)),
+        vec![(1, vec!["dropped 1 NotAllowed".to_owned()])]
+    );
+    assert_eq!(armed.inputs(), Vec::<String>::new());
+    drop(publication);
+    assert_dialogue_rejection(
+        armed.submit(scoped, T0 + 2 * MS).0,
+        "local-dialogue-budget-exhausted",
+    );
+}
+
+#[test]
+fn local_recovery_selection_cannot_renew_as_dialogue_or_select_twice() {
+    let (armed, mut scope, lease, mut scoped) = dialogue_fixture();
+    scope.max_actions = 1;
+    let decision_point_id = RuntimeId::new("fork-1".into()).unwrap();
+    let option_id = RuntimeId::new("option-0".into()).unwrap();
+    let prefix = LocalRecovery {
+        scope: scope.clone(),
+        kind: LocalRecoveryKind::Prefix {
+            decision_point_id: decision_point_id.clone(),
+            option_id: option_id.clone(),
+        },
+    };
+    let untried = LocalRecovery {
+        scope: scope.clone(),
+        kind: LocalRecoveryKind::Untried {
+            decision_point_id,
+            option_id,
+        },
+    };
+    assert_eq!(
+        armed
+            .control
+            .grant_bellis_recovery_lease(&lease, &prefix, || T0)
+            .0
+            .unwrap(),
+        super::LeaseGrant::Applied,
+    );
+    assert!(
+        armed
+            .control
+            .grant_bellis_lease(&lease, Some(&scope), || T0)
+            .0
+            .is_err()
+    );
+    assert!(
+        armed
+            .control
+            .grant_bellis_recovery_lease(&lease, &untried, || T0)
+            .0
+            .is_err()
+    );
+    scoped.local_dialogue = Some(untried.action_scope());
+    assert_dialogue_rejection(
+        armed.submit(scoped.clone(), T0).0,
+        "local-dialogue-scope-mismatch",
+    );
+    scoped.local_dialogue = Some(prefix.action_scope());
+    assert!(accepted(&armed.submit(scoped.clone(), T0).0));
+    assert_eq!(
+        receipts(&armed.control.tick(T0 + MS)),
+        vec![(1, vec!["executed 1".to_owned()])]
+    );
+
+    let second_at = T0 + 85 * MS;
+    armed.frame(2, second_at, GEOMETRY);
+    armed
+        .control
+        .grant_bellis_recovery_lease(&lease, &prefix, || second_at)
+        .0
+        .unwrap();
+    let second = ActionBlock {
+        seq: 2,
+        base_frame: 2,
+        start_ns: second_at,
+        deadline_ns: second_at + 80 * MS,
+        steps: vec![step(0, vec![], vec![click(2)])],
+        ..scoped
+    };
+    assert_dialogue_rejection(
+        armed.submit(second, second_at).0,
+        "local-dialogue-budget-exhausted",
+    );
+}
+
+#[test]
+fn named_choice_requires_a_newer_frame_in_the_approved_transform() {
+    let (armed, mut scope, lease, mut block) = dialogue_fixture();
+    scope.max_actions = 1;
+    let mut named = LocalRecovery {
+        scope,
+        kind: LocalRecoveryKind::Named {
+            decision_point_id: RuntimeId::new("fork-1".into()).unwrap(),
+            option_id: RuntimeId::new("option-1".into()).unwrap(),
+            options_digest: "a".repeat(64),
+            frame_number: LeaseToken::new(2).unwrap(),
+            transform_version: 3,
+        },
+    };
+    assert!(
+        armed
+            .control
+            .grant_bellis_recovery_lease(&lease, &named, || T0)
+            .0
+            .is_err()
+    );
+    let LocalRecoveryKind::Named { frame_number, .. } = &mut named.kind else {
+        unreachable!();
+    };
+    *frame_number = LeaseToken::new(1).unwrap();
+    assert!(
+        armed
+            .control
+            .grant_bellis_recovery_lease(&lease, &named, || T0)
+            .0
+            .is_err()
+    );
+    let LocalRecoveryKind::Named {
+        transform_version, ..
+    } = &mut named.kind
+    else {
+        unreachable!();
+    };
+    *transform_version = 1;
+    armed
+        .control
+        .grant_bellis_recovery_lease(&lease, &named, || T0)
+        .0
+        .unwrap();
+    block.local_dialogue = Some(named.action_scope());
+    assert_dialogue_rejection(
+        armed.submit(block.clone(), T0).0,
+        "local-choice-approved-frame-changed",
+    );
+    armed.frame(2, T0 + MS, GEOMETRY);
+    block.base_frame = 2;
+    assert!(accepted(&armed.submit(block.clone(), T0 + MS).0));
+    assert_eq!(
+        receipts(&armed.control.tick(T0 + 2 * MS)),
+        vec![(1, vec!["executed 1".to_owned()])]
+    );
+    armed.frame(3, T0 + 95 * MS, GEOMETRY);
+    block.seq = 2;
+    block.base_frame = 3;
+    block.start_ns = T0 + 95 * MS;
+    block.deadline_ns = block.start_ns + 80 * MS;
+    assert_dialogue_rejection(
+        armed.submit(block, T0 + 95 * MS).0,
+        "local-dialogue-budget-exhausted",
+    );
+    // 即使尺寸和 DPI 相同，移到新的窗口变换也使原批准失效。
+    armed.frame_with_transform(4, T0 + 96 * MS, GEOMETRY, 2);
+    assert!(
+        armed
+            .control
+            .grant_bellis_recovery_lease(&lease, &named, || T0 + 96 * MS)
+            .0
+            .is_err()
+    );
+}
+
+#[test]
+fn load_continuation_cannot_reuse_the_original_recovery_lease() {
+    let (armed, scope, lease, mut block) = dialogue_fixture();
+    let open = LocalRecovery {
+        scope: scope.clone(),
+        kind: LocalRecoveryKind::Recover,
+    };
+    let load = LocalRecovery {
+        scope: LocalDialogue {
+            authorization_id: RuntimeId::new("load-authority".into()).unwrap(),
+            max_actions: 1,
+            ..scope.clone()
+        },
+        kind: LocalRecoveryKind::Load {
+            open_authorization_id: scope.authorization_id,
+            open_authorization_seq: LeaseToken::new(1).unwrap(),
+        },
+    };
+    armed
+        .control
+        .grant_bellis_recovery_lease(&lease, &open, || T0)
+        .0
+        .unwrap();
+    block.local_dialogue = Some(load.action_scope());
+    assert_dialogue_rejection(
+        armed.submit(block.clone(), T0).0,
+        "local-dialogue-scope-mismatch",
+    );
+    block.local_dialogue = Some(open.action_scope());
+    assert!(accepted(&armed.submit(block.clone(), T0).0));
+    let later = T0 + 85 * MS;
+    armed.control.tick(T0 + MS);
+    armed.frame(2, later, GEOMETRY);
+    block.seq = 2;
+    block.base_frame = 2;
+    block.start_ns = later;
+    block.deadline_ns = later + 80 * MS;
+    block.local_dialogue = Some(load.action_scope());
+    assert_dialogue_rejection(
+        armed.submit(block, later).0,
+        "local-dialogue-scope-mismatch",
+    );
+    armed.control.stop_bellis_input(lease.token, || later);
+    let new_lease = LeaseGrantParams {
+        token: lease.token + 1,
+        ..lease
+    };
+    assert!(
+        armed
+            .control
+            .grant_bellis_recovery_lease(&new_lease, &load, || later)
+            .0
+            .is_err()
+    );
 }

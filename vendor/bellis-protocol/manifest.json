@@ -1,19 +1,19 @@
 {
   "format": 1,
   "repository": "https://github.com/leafliber/bellis",
-  "commit": "9f5e553b50757b2edf25e6a879f06885410955bc",
+  "commit": "423c80549a71f77c783b98c3b6b8c5677dd51109",
   "files": {
     "schemas/game-bridge.schema.json": {
       "source": "packages/protocol/schemas/game-bridge.schema.json",
-      "sha256": "b5fc98be20a385d827bf87c6a613544d4c712e876dcee88c97e0fb5dbd1677cc"
+      "sha256": "a28952aacf889042667f074cc16254a4e6c722ae9478f42a91fc9b1f2174404e"
     },
     "models/game_bridge.py": {
       "source": "packages/protocol/models/game_bridge.py",
-      "sha256": "9d124cb6e67c111772a9ecccba42d07f2d303c13dc4fc1aca0d73d677d04eeb8"
+      "sha256": "8d32e6f93b5dae00b496080849f499563d97aba0c6cb470b48bec8a3d24ba276"
     },
     "fixtures/game-control.json": {
       "source": "packages/protocol/test/fixtures/game-control.json",
-      "sha256": "4a43aa0c960fdac73e74ee5b6f43e52637beadeaa2bacc2351d759dfdcf3ea65"
+      "sha256": "5601cb63e4a3adccd1c1ac2f8ca91651743134add668517988647c5314782f0f"
     },
     "schemas/game-bridge-v2.schema.json": {
       "source": "packages/protocol/schemas/game-bridge-v2.schema.json",
