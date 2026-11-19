@@ -738,6 +738,7 @@ fn regression_rejected_key_up_is_reported() {
             height: 180,
             dpi: 96,
         },
+        1,
         None,
     );
     let control = Control::new(
@@ -776,6 +777,7 @@ fn regression_rejected_key_up_is_reported() {
         producer,
         seq: 1,
         base_frame: 1,
+        local_dialogue: None,
         start_ns: 100,
         deadline_ns: 400,
         steps: vec![ControlStep {
@@ -813,17 +815,15 @@ fn regression_rejected_key_up_is_reported() {
         serde_json::to_value(&released.params).unwrap()["verification"],
         "up_failed"
     );
+    let (replacement, _) = control.grant_lease(
+        &LeaseGrantParams {
+            token: 2,
+            expires_ns: 600,
+        },
+        || 200,
+    );
     assert!(
-        control
-            .grant_lease(
-                &LeaseGrantParams {
-                    token: 2,
-                    expires_ns: 600
-                },
-                || 200
-            )
-            .0
-            .is_err(),
+        replacement.is_err(),
         "the same instance cannot accept a new lease after a rejected up"
     );
 }
@@ -869,6 +869,7 @@ fn verifying_control(
             height: 180,
             dpi: 96,
         },
+        1,
         None,
     );
     let control = Control::new(
@@ -1120,6 +1121,7 @@ fn an_old_check_never_opens_a_new_release_gate() {
         producer,
         seq: 1,
         base_frame: 1,
+        local_dialogue: None,
         start_ns: 100,
         deadline_ns: 400,
         steps: vec![ControlStep {
@@ -1196,6 +1198,7 @@ fn regression_a_replacement_producer_cannot_press_before_release_verification() 
         producer: new.clone(),
         seq: 1,
         base_frame: 1,
+        local_dialogue: None,
         start_ns: 200,
         deadline_ns: 400,
         steps: vec![ControlStep {

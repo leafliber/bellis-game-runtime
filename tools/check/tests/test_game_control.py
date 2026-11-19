@@ -125,6 +125,9 @@ def _schema_accepts(schema: Schema, value: object) -> bool:
     if "enum" in schema:
         assert set(schema) == {"enum"}
         return value in cast(list[str], schema["enum"])
+    if "const" in schema:
+        assert set(schema) == {"type", "const"}
+        return not isinstance(value, bool) and bool(value == schema["const"])
     match schema["type"]:
         case "object":
             assert set(schema) <= {"type", "properties", "required", "additionalProperties"}
@@ -214,7 +217,7 @@ def _python_encode(contract: Contract, case: Case) -> JsonObject | None:
             ):
                 return None
         model = cast(type[BaseModel], getattr(contract.models, name))
-        data = model.model_validate(message.get(field)).model_dump(mode="json")
+        data = model.model_validate(message.get(field)).model_dump(mode="json", exclude_unset=True)
     except ValueError:
         return None
     assert data == message[field], case.name
@@ -266,6 +269,53 @@ def test_locked_control_fixtures_roundtrip(contract: Contract) -> None:
     _roundtrip(contract, contract.fixtures)
 
 
+def test_local_recovery_lease_scopes_roundtrip(contract: Contract) -> None:
+    authority = {
+        "sessionId": "fixture01",
+        "runtimeId": "run-02",
+        "authorizationId": "scope",
+        "adapterId": "synthetic-fixture",
+        "maxActions": 1,
+        "expiresAtMs": 145000,
+    }
+    choice = {"decisionPointId": "fork-1", "optionId": "option-0"}
+    variants = (
+        {"kind": "recover", "maxActions": 2},
+        {"kind": "load", "openAuthorizationId": "original", "openAuthorizationSeq": 7},
+        {"kind": "prefix", **choice},
+        {"kind": "untried", **choice},
+        {
+            "kind": "named",
+            **choice,
+            "optionsDigest": "01abcdef" * 8,
+            "frameNumber": 12,
+            "transformVersion": 2,
+        },
+    )
+    cases = [
+        Case(
+            f"local recovery {variant['kind']}",
+            "bellis",
+            _dump(
+                {
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "lease.renew",
+                    "params": {
+                        "token": 9,
+                        "expiresAtMs": 144500,
+                        "localRecovery": authority | variant,
+                    },
+                }
+            ),
+            True,
+            None,
+        )
+        for index, variant in enumerate(variants, start=1)
+    ]
+    _roundtrip(contract, cases)
+
+
 def _boundary_values(rule: Schema) -> Iterator[object]:
     if "anyOf" in rule:
         for part in cast(list[Schema], rule["anyOf"]):
@@ -286,6 +336,8 @@ def _boundary_values(rule: Schema) -> Iterator[object]:
                 yield from ("", "A_.:-", "a" * 64, "a" * 65, "-id", "x\n", "非ASCII")
             case "null":
                 yield None
+            case "object":
+                yield from ({}, [])
             case _:
                 pytest.fail(f"Unsupported control field schema: {rule!r}")
 

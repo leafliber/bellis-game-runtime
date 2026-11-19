@@ -11,8 +11,9 @@ use serde_json::value::RawValue;
 
 pub use payload::{
     Ack, CoreDescription, CoreHealth, DescribeParams, InputReleased, InputStopParams,
-    LeaseRenewParams, LeaseState, LeaseToken, MAX_MONOTONIC_MS, MAX_TOKEN, MonotonicMs,
-    ReleaseReason, ReleaseVerification, RuntimeId, StopReason, ThroughToken,
+    LeaseRenewParams, LeaseState, LeaseToken, LocalDialogue, LocalRecovery, LocalRecoveryKind,
+    MAX_MONOTONIC_MS, MAX_TOKEN, MonotonicMs, ReleaseReason, ReleaseVerification, RuntimeId,
+    StopReason, ThroughToken,
 };
 pub use wire::{DecodeError, RequestId};
 use wire::{Object, is_safe_integer};

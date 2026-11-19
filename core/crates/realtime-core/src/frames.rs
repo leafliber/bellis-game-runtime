@@ -5,7 +5,8 @@
 //! - 采集线程独占写入方与采集源：帧环在实时核里只有这一个写方；WGC 采集源不是 `Send`，在采集线程上
 //!   创建并使用。
 //! - 采集状态、本实例最近写进帧环的一帧与客户区几何的变化放在 [`FrameStatus`] 里，它有自己的锁；最近
-//!   一帧的采集时刻另存一份原子量。取帧、写帧都不持锁。换目标或丢弃采集源时，由控制侧一次作废帧与产出者代次。
+//!   一帧的采集时刻另存一份原子量。写进帧环并更新状态时持发布锁，供本机范围点击核对基帧。
+//!   换目标或丢弃采集源时，由控制侧一次作废帧与产出者代次。
 //!   释放全部输入只用控制状态的锁，帧龄检查只读原子量，所以释放不等采集线程，也不依赖写帧成功。
 
 use std::collections::VecDeque;
@@ -47,6 +48,7 @@ pub(crate) struct Geometry {
 #[derive(Debug)]
 pub(crate) struct FrameStatus {
     inner: Mutex<StatusInner>,
+    publication: Mutex<()>,
     has_latest: AtomicBool,
     latest_capture_ns: AtomicU64,
 }
@@ -57,6 +59,8 @@ struct StatusInner {
     latest: Option<LatestFrame>,
     first_frame: Option<u64>,
     window: Option<WindowIdentity>,
+    /// 当前窗口变换及连续使用该变换的起始帧。
+    transform: Option<(u64, u64)>,
     /// 客户区几何的变化点：（从这一帧起，几何），按帧号递增，至多 [`GEOMETRY_HISTORY`] 个。
     geometry: VecDeque<(u64, Geometry)>,
 }
@@ -69,8 +73,10 @@ impl Default for FrameStatus {
                 latest: None,
                 first_frame: None,
                 window: None,
+                transform: None,
                 geometry: VecDeque::new(),
             }),
+            publication: Mutex::new(()),
             has_latest: AtomicBool::new(false),
             latest_capture_ns: AtomicU64::new(0),
         }
@@ -80,6 +86,11 @@ impl Default for FrameStatus {
 impl FrameStatus {
     fn lock(&self) -> MutexGuard<'_, StatusInner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 本机范围输入只在发布空闲时检查及使用当前帧，控制线程不等写帧。
+    pub(crate) fn try_lock_publication(&self) -> Option<MutexGuard<'_, ()>> {
+        self.publication.try_lock().ok()
     }
 
     /// 采集状态，以及本实例最近写进帧环的一帧（帧号与采集时刻），是判断帧龄的依据。
@@ -136,8 +147,18 @@ impl FrameStatus {
         containing != Some(inner.geometry.len() - 1)
     }
 
+    pub(crate) fn transform_matches(&self, frame: u64, version: u32) -> bool {
+        let inner = self.lock();
+        inner
+            .transform
+            .is_some_and(|(start, current)| start <= frame && current == u64::from(version))
+            && inner
+                .latest
+                .is_some_and(|latest| frame <= latest.frame_number)
+    }
+
     /// 改变采集状态，返回原来的状态。
-    fn set_state(&self, state: CaptureState) -> CaptureState {
+    pub(crate) fn set_state(&self, state: CaptureState) -> CaptureState {
         std::mem::replace(&mut self.lock().state, state)
     }
 
@@ -148,6 +169,7 @@ impl FrameStatus {
         inner.latest = None;
         inner.first_frame = None;
         inner.window = None;
+        inner.transform = None;
         inner.geometry.clear();
     }
 
@@ -156,11 +178,18 @@ impl FrameStatus {
         &self,
         latest: LatestFrame,
         geometry: Geometry,
+        transform_version: u64,
         window: Option<WindowIdentity>,
     ) {
         let mut inner = self.lock();
         inner.first_frame.get_or_insert(latest.frame_number);
         inner.window = window;
+        if inner
+            .transform
+            .is_none_or(|(_, version)| version != transform_version)
+        {
+            inner.transform = Some((latest.frame_number, transform_version));
+        }
         if inner
             .geometry
             .back()
@@ -580,9 +609,13 @@ impl Pipeline {
         let Some(sink) = self.sink.as_mut() else {
             return;
         };
-        match sink.write(&self.frame) {
-            Ok(frame_number) => {
-                self.last_frame_number = frame_number;
+        let result = {
+            let _publication = self
+                .status
+                .publication
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            sink.write(&self.frame).inspect(|&frame_number| {
                 let meta = &self.frame.meta;
                 self.status.record(
                     LatestFrame {
@@ -594,8 +627,14 @@ impl Pipeline {
                         height: meta.height,
                         dpi: meta.dpi,
                     },
+                    meta.transform_version,
                     window,
                 );
+            })
+        };
+        match result {
+            Ok(frame_number) => {
+                self.last_frame_number = frame_number;
                 if let Some(problem) = self.problem.take() {
                     log!("capture: frames reach the frame ring again (was: {problem})");
                 }
@@ -1048,6 +1087,7 @@ mod tests {
                     height: 10,
                     dpi,
                 },
+                1,
                 None,
             );
         };

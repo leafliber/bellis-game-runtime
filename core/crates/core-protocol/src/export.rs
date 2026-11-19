@@ -355,6 +355,7 @@ pub fn fixtures() -> Vec<Fixture> {
                 producer: step_control(),
                 seq: 7,
                 base_frame: 1200,
+                local_dialogue: None,
                 start_ns: 5_000_000_000,
                 deadline_ns: 5_500_000_000,
                 steps: vec![ControlStep {
@@ -375,6 +376,7 @@ pub fn fixtures() -> Vec<Fixture> {
                 producer: continuous(),
                 seq: 1,
                 base_frame: 1500,
+                local_dialogue: None,
                 start_ns: 6_000_000_000,
                 deadline_ns: 6_100_000_000,
                 steps: vec![

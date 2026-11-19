@@ -256,6 +256,9 @@ pub struct ActionBlock {
     pub seq: u64,
     /// 基准帧号：产出者做决定时依据的帧，坐标按这一帧的客户区解释。
     pub base_frame: u64,
+    /// Bellis R-30 的原授权范围，须与实时核直收的许可完全相符。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_dialogue: Option<String>,
     /// 起始时刻。
     pub start_ns: u64,
     /// 有效截止时刻：到时还没有新的动作块，实时核即释放全部输入。
