@@ -8,7 +8,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
 import pytest
@@ -19,6 +19,8 @@ from game_runtime.adapter import (
     Adapter,
     GameAdapterPlugin,
     Language,
+    PixelRect,
+    ScreenType,
     load_adapter,
 )
 from game_runtime.frame_ring import RingFrame
@@ -72,7 +74,8 @@ from game_runtime.observe import (
     summary,
 )
 from game_runtime.observe.display import Recording
-from game_runtime.ocr import OCR, OcrService, Script, check_script
+from game_runtime.ocr import OCR, OcrResult, OcrService, Script, check_script
+from game_runtime.ocr.engine import RecognizedLine
 from game_runtime.ocr.fake import ScriptedRecognizer, scripted_line
 from game_runtime.recording import NoControl, ResultsHub, narrative_problem
 from game_runtime.scene import (
@@ -81,6 +84,9 @@ from game_runtime.scene import (
     SceneHub,
     SceneState,
     SceneUpdate,
+    ScreenClassification,
+    ScreenSource,
+    ScreenState,
     SignatureResult,
     Stability,
     Verdict,
@@ -846,6 +852,109 @@ class FakeOcr(Plugin[NoConfig]):
         service = OcrService(ctx.service(GAME_ADAPTER), Shared.recognizer, model="scripted")
         ctx.register(service.aclose)
         ctx.provide(OCR, service)
+
+
+@pytest.mark.parametrize("mode", ["current", "stale", "mismatched-frame", "missing-marker", "text"])
+def test_observer_reports_dot_evidence_only_for_the_current_signed_body(
+    mode: str, synthetic: Adapter, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def exercise() -> None:
+        caplog.set_level(logging.INFO, logger="game_runtime.observe.plugin")
+        replies: list[list[RecognizedLine]] = (
+            [[scripted_line("本句")]] if mode == "text" else [[], []]
+        )
+        Shared.recognizer = ScriptedRecognizer(replies=replies)
+        hub = ObserveHub(Collected())
+        kernel = Kernel(
+            catalog=catalog(GameAdapterPlugin, FakeOcr, FakeScene, observer_plugin(hub)),
+            core=NoControl(),
+            options=KernelOptions(retry_delays=()),
+        )
+        kernel.add(
+            [
+                entry("game", "game-adapter", {"game": "synthetic-game"}),
+                entry("ocr", "fake-ocr"),
+                entry("scene", "fake-scene"),
+                entry("observer", "observer"),
+            ]
+        )
+        await kernel.settled()
+        try:
+            scene = Shared.scene
+            assert scene is not None
+            body = synthetic.roi("dialogue").to_pixels(WIDTH, HEIGHT)
+            pixels = bytearray([32, 32, 32, 255]) * (WIDTH * HEIGHT)
+            for dot in range(6):
+                left = body.left + 28 + 14 * dot
+                for y in range(body.top + 12, body.top + 16):
+                    start = (y * WIDTH + left) * 4
+                    pixels[start : start + 16] = bytes([235, 235, 235, 255]) * 4
+            frame = RingFrame(3, SECOND, 1, WIDTH, HEIGHT, WIDTH * 4, bytes(pixels))
+            signed = ScreenState(
+                ScreenClassification(ScreenType.DIALOGUE, ScreenSource.SIGNATURE, 1)
+            )
+            matched = (
+                ("dialogue",) if mode == "missing-marker" else ("dialogue", "dialogue-continue")
+            )
+            returned = asyncio.Event()
+            read = OcrService.recognize_dialogue
+            reads = 0
+
+            async def read_and_check(service: OcrService, frame: RingFrame, roi: str) -> OcrResult:
+                nonlocal reads
+                reads += 1
+                result = await read(service, frame, roi)
+                assert result.roi == roi
+                assert result.rect == body
+                assert result.frame_number == frame.frame_number
+                assert result.transform_version == frame.transform_version
+                if mode == "text":
+                    assert result.text == "本句"
+                    assert result.dot_row is None
+                    returned.set()
+                    return result
+                assert not result.lines
+                assert result.dot_row is not None
+                assert result.dot_row.count == 6
+                assert result.dot_row.dots[0] == PixelRect(
+                    body.left + 28, body.top + 12, body.left + 32, body.top + 16
+                )
+                if mode == "stale":
+                    scene.invalidate()
+                returned.set()
+                return replace(result, frame_number=4) if mode == "mismatched-frame" else result
+
+            monkeypatch.setattr(OcrService, "recognize_dialogue", read_and_check)
+            update = SceneUpdate(
+                frame, state(3, Verdict.SCREEN, "dialogue", at=SECOND, matched=matched), signed
+            )
+            scene.publish(update)
+            if mode == "missing-marker":
+                await asyncio.sleep(0)
+                assert reads == 0
+            else:
+                await asyncio.wait_for(returned.wait(), 2)
+                assert reads == 1
+            evidence = [record for record in caplog.messages if record.startswith("本机点列")]
+            if mode == "current":
+                (message,) = evidence
+                assert "帧 3 变换 1 ROI dialogue 6 点" in message
+                repeated = replace(frame, frame_number=4, capture_ns=SECOND + 1)
+                scene.publish(
+                    replace(
+                        update,
+                        frame=repeated,
+                        state=replace(update.state, frame_number=4, capture_ns=SECOND + 1),
+                    )
+                )
+                await asyncio.sleep(0)
+                assert reads == 1
+            else:
+                assert not evidence
+        finally:
+            await kernel.shutdown()
+
+    asyncio.run(exercise())
 
 
 def entry(entry_id: str, plugin: str, config: dict[str, str] | None = None) -> ResolvedEntry:

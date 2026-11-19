@@ -12,7 +12,7 @@ import logging
 from collections.abc import Callable
 from typing import Any, ClassVar, Final
 
-from game_runtime.adapter import GAME_ADAPTER
+from game_runtime.adapter import GAME_ADAPTER, Adapter, ScreenType
 from game_runtime.frame_ring import RingFrame
 from game_runtime.kernel import (
     Catalog,
@@ -32,9 +32,17 @@ from game_runtime.observe.hub import (
     ObserveHub,
     ScriptWatch,
 )
-from game_runtime.ocr import OCR
+from game_runtime.ocr import OCR, OcrService
 from game_runtime.recording import CatalogFactory, ResultsHub, perception_catalog
-from game_runtime.scene import SCENE, SceneState, SceneUpdate
+from game_runtime.scene import (
+    SCENE,
+    SceneService,
+    SceneState,
+    SceneUpdate,
+    ScreenSource,
+    Stability,
+    Verdict,
+)
 from game_runtime.voice_activity import VOICE_ACTIVITY, VoiceActivityService
 
 logger = logging.getLogger(__name__)
@@ -82,19 +90,36 @@ class ObserverPlugin(Plugin[NoConfig]):
         task = asyncio.get_running_loop().create_task(
             follower.run(), name=f"{ctx.instance_id} 探测"
         )
+        dot_task: asyncio.Task[None] | None = None
+        sampled_scope: object | None = None
 
         async def stop() -> None:
             task.cancel()
+            if dot_task is not None:
+                dot_task.cancel()
+                await asyncio.wait((dot_task,))
             await asyncio.wait((task,))
             follower.release()
 
         ctx.register(stop)
 
         def on_scene(update: SceneUpdate) -> None:
+            nonlocal dot_task, sampled_scope
             hub.on_scene(update.state)
             screen = watch.observe(update.state)
             if screen is not None:
                 checker.submit(update.frame, update.state, screen)
+            if (
+                logger.isEnabledFor(logging.INFO)
+                and sampled_scope is not update.observation_scope
+                and (dot_task is None or dot_task.done())
+                and (roi := _dot_dialogue_roi(adapter, update)) is not None
+                and (ocr := ctx.optional(OCR)) is not None
+            ):
+                sampled_scope = update.observation_scope
+                dot_task = asyncio.create_task(
+                    _report_dot_row(scene, ocr, update, roi), name=f"{ctx.instance_id} 点列取样"
+                )
 
         ctx.register(scene.subscribe(on_scene))
 
@@ -113,6 +138,69 @@ class ObserverPlugin(Plugin[NoConfig]):
 
         # 后登记先撤销：先记下剧情记录此刻的各句，再退订、停探测、取消在途的核对。
         ctx.register(final)
+
+
+def _dot_dialogue_roi(adapter: Adapter, update: SceneUpdate) -> str | None:
+    state, screen = update.state, update.state.screen
+    if (
+        update.capture_scope is None
+        or screen is None
+        or state.verdict is not Verdict.SCREEN
+        or state.stability is not Stability.STABLE
+        or state.playing
+        or update.screen_state.classification.source is not ScreenSource.SIGNATURE
+        or update.screen_state.restrictions != frozenset({ScreenType.DIALOGUE})
+        or screen in adapter.risk.screens
+        or screen in adapter.decisions
+    ):
+        return None
+    signatures = {
+        signature.id
+        for signature in adapter.signatures
+        if signature.screen == screen and signature.calibrated
+    }
+    bodies = {
+        box.text
+        for box in adapter.dialogue_boxes
+        if box.screen in (None, screen)
+        and box.advance == "click-text"
+        and box.continue_signature in signatures
+        and box.continue_signature in state.matched
+        and adapter.rois[box.text].rect is not None
+    }
+    return next(iter(bodies)) if len(bodies) == 1 else None
+
+
+async def _report_dot_row(
+    scene: SceneService, ocr: OcrService, update: SceneUpdate, roi: str
+) -> None:
+    frame = update.frame
+    try:
+        result = await ocr.recognize_dialogue(frame, roi)
+        rect = ocr.adapter.roi(roi).to_pixels(frame.width, frame.height)
+    except Exception:
+        logger.debug("帧 %d 的点列取样失败", frame.frame_number, exc_info=True)
+        return
+    latest = scene.latest
+    if (
+        latest is not None
+        and latest.observation_scope is update.observation_scope
+        and scene.capture_scope is update.capture_scope
+        and result.frame_number == frame.frame_number
+        and result.transform_version == frame.transform_version
+        and result.roi == roi
+        and result.rect == rect
+        and (row := result.dot_row) is not None
+    ):
+        logger.info(
+            "本机点列 帧 %d 变换 %d ROI %s %d 点，行框 %s，点框 %s",
+            frame.frame_number,
+            frame.transform_version,
+            roi,
+            row.count,
+            row.box,
+            row.dots,
+        )
 
 
 class _Follower:
