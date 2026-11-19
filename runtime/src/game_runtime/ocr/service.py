@@ -19,6 +19,7 @@ from numpy.typing import NDArray
 
 from game_runtime._threads import in_thread
 from game_runtime.adapter import Adapter, FixedText, PixelRect
+from game_runtime.ocr.dot_row import DotRow, measure_dot_row
 from game_runtime.ocr.engine import Image, RecognizedLine, Recognizer
 from game_runtime.ocr.script import (
     Script,
@@ -83,6 +84,8 @@ class OcrResult:
     """识别的区域：客户区物理像素。"""
     lines: tuple[OcrLine, ...]
     """从上到下、从左到右。"""
+    dot_row: DotRow | None = None
+    """独立的几何证据，逐点框沿用本结果的坐标系。"""
 
     @property
     def text(self) -> str:
@@ -215,6 +218,22 @@ class OcrService:
         rect = self.adapter.roi(roi).to_pixels(frame.width, frame.height)
         return await self._run(functools.partial(self._recognize, frame, rect, roi))
 
+    async def recognize_dialogue(self, frame: FrameLike, roi: str) -> OcrResult:
+        """读取已通过画面门禁的标定正文，空读数附本机几何证据。"""
+        if roi not in self._dialogue_rois:
+            raise LookupError(f"ROI {roi} 不是对白正文")
+        result = await self.recognize(frame, roi)
+        if result.lines:
+            return result
+
+        def measure() -> DotRow | None:
+            return measure_dot_row(crop_bgr(frame, result.rect))
+
+        row = await self._run(measure)
+        if row is None:
+            return result
+        return replace(result, dot_row=row.translated(result.rect.left, result.rect.top))
+
     async def recognize_cropped_roi(self, frame: FrameLike, roi: str) -> OcrResult:
         """识别已裁出的标定 ROI，坐标仍以裁片为原点。"""
         self.adapter.roi(roi)
@@ -306,7 +325,7 @@ class OcrService:
         await in_thread(functools.partial(self._executor.shutdown, wait=True, cancel_futures=True))
         self._cache.clear()
 
-    async def _run(self, job: Callable[[], OcrResult]) -> OcrResult:
+    async def _run[T](self, job: Callable[[], T]) -> T:
         if self._closed:
             raise OcrClosedError("ocr@1 已停用")
         loop = asyncio.get_running_loop()
