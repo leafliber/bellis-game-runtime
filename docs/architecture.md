@@ -110,7 +110,7 @@ Game Runtime 为 Bellis 提供游戏能力：采集画面与声音、读懂画�
 
 - **统一动作空间**：逐步模式有点击、短按、滚动、等待、开决策点、上报与调用技能，连续模式另有按住、轴与鼠标相对位移。开决策点与上报不产生输入，由主进程处理；调用技能在主进程展开为原子动作后才到实时核（[技能](modules/step-control.md#技能)）。没有输入文字的动作。
 - **适配成本**。每款游戏只须提供[游戏适配包](modules/game-adapter.md)的必需项就能进入逐步模式。快路径可选。计时执行须符合[决策点](modules/step-control.md#决策点)的证据要求。
-- **业务选择**一律经决策点交给 Bellis，智能体不能直接点选；动作按风险分级并由四道防线把关（[逐步控制](modules/step-control.md#动作风险)）。
+- **业务选择**须有当前决策实例。独立监督时由操作员回应，接入 Bellis 时由游戏桥接收授权的选择。逐步控制器核对动作风险与决定的有效性（[逐步控制](modules/step-control.md#动作风险)）。
 - **更换控制产出者**由[模式仲裁](modules/step-control.md#模式仲裁)按确定性规则决定，先释放输入再切换。
 - **策略后端**都按同一份[策略后端契约](modules/step-control.md#策略后端契约)接入，离线回放基准可替换后端对比。
 
@@ -121,7 +121,7 @@ Game Runtime 为 Bellis 提供游戏能力：采集画面与声音、读懂画�
 | 位置 | 用途 | 触发 | 文档 |
 | --- | --- | --- | --- |
 | Bellis 决策模型（主播决策层） | 选择、开投票、解说、交给游戏的目标 | 弹幕、投票结束、冷场、决策点、看点、坏结局与卡住；有计时的决策点优先 | Bellis 决策模型；提案 P-05、P-06 |
-| planner（规划与理解层） | 推理：审判推理与决策候选 | 审判发言、决策点打开、坏结局、收到新目标 | [调用时机](modules/narrative-planner.md#调用时机) |
+| planner（规划与理解层） | 拆解目标、排列决策候选 | 新目标、决策预览或打开、失败状态变化 | [调用时机](modules/narrative-planner.md#调用时机) |
 | planner（规划与理解层） | 摘要：滚动摘要、游戏笔记与看点 | 批量更新（间隔见调用时机），画面事件立即更新 | [调用时机](modules/narrative-planner.md#调用时机) |
 | planner（规划与理解层） | 关键帧：看画面理解局面 | 场景切换、决策点打开 | [游戏笔记](modules/narrative-planner.md#游戏笔记) |
 | 通用视觉智能体（策略后端） | 观察与动作提议 | 稳定帧或动态证据可用，且需要新提议 | [逐步控制](modules/step-control.md#通用视觉智能体) |
@@ -141,16 +141,15 @@ Game Runtime 为 Bellis 提供游戏能力：采集画面与声音、读懂画�
 
 主进程沿用 Bellis 插件内核的概念（[插件内核](modules/plugin-kernel.md)）。
 
-| 扩展类别 | 层 | 剧情游戏（《魔女审判》） | 即时游戏（原神）增加 | 文档 |
-| --- | --- | --- | --- | --- |
-| 游戏适配包 | 关键平面 | 对白推进、选项、计时审判、失败与重来的快路径 | 原神适配包 | [游戏适配包](modules/game-adapter.md) |
-| 感知 | 普通插件 | OCR、画面状态（变化、签名与类型）、配音检测（Bellis D-08：OCR 与 VLM 各为独立插件） | 界面元素检测、更多签名与状态估计 | [感知](modules/perception.md) |
-| 模型接入 | 普通插件 | VLM 与文本模型，按用途配置 | 同左 | [模型接入](modules/models.md) |
-| 理解与规划 | 普通插件 | 剧情记录、剧情与审判推理 | 任务与探索规划 | [剧情记录与规划](modules/narrative-planner.md) |
-| 策略后端 | 关键平面（控制产出者） | 逐步控制器 | 另加 VLA 与反馈控制，由模式仲裁切换 | [逐步控制](modules/step-control.md) |
-| 技能库 | 普通插件 | 无 | 游戏无关的多步过程（GR-34） | [技能](modules/step-control.md#技能) |
-| 离线工具 | 不在直播进程 | 合成游戏夹具；只评测，不训练 | 示范采集与训练 | [离线工具](modules/offline-tools.md) |
-| 远端推理 | 主进程的策略部分迁出 | 无 | 按 GPU 实测决定（Bellis D-22） | 无 |
+| 扩展类别 | 所在位置与职责 |
+| --- | --- |
+| [游戏适配包](modules/game-adapter.md) | 提供当前游戏的窗口、白名单、标定及可选快路径。启动时校验选定的包。 |
+| [感知](modules/perception.md)与[模型接入](modules/models.md) | 主进程内按 profile 加载 OCR、画面状态和所需模型。配音检测可选。 |
+| [剧情记录与规划](modules/narrative-planner.md) | 按需记录剧情。planner 拆解已授权的目标，并消费控制器提供的核验回执。 |
+| [逐步控制](modules/step-control.md)与[技能](modules/step-control.md#技能) | 在当前任务和控制权范围内选动作，由实时核执行，按新帧核验结果。 |
+| [离线工具](modules/offline-tools.md) | 合成夹具、标定、录制与回放评测。 |
+
+连续控制与远端推理的条件见[技术基线](plan/tech-baseline.md)。HSR 适配与实机验证见 [G2](plan/G2.md)。
 
 ## 仓库与目录
 

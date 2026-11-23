@@ -41,4 +41,3 @@ Game Runtime 需要 Bellis 配合的改动，在 Bellis 游戏桥契约冻结（
 这些不是契约改动，但同样须在 Bellis 侧处理：
 
 - **R-17 的 GLM 接入点**：决策模型会收到游戏内容，须在 T1 前核对经 Agent Plan `/api/plan/v3` 调用的 GLM 是否走已启用安全沙箱的接入点，否则换模型（[合规 C-2](../compliance.md#c-2-的依据与条件)）。
-- **合规文档**：Bellis `docs/compliance.md` 中《魔女审判》一行仍是转引，可按官方[配信・二次創作ガイドライン](https://manosaba.com/guidelines)（2026-10-21 版）更新，要点见本仓库[合规](../compliance.md#魔法少女的魔女审判)。
