@@ -239,9 +239,9 @@ def test_a_nonempty_dialogue_read_uses_only_the_original_crop(synthetic_adapter:
     assert len(recognizer.images) == 1
 
 
-def test_an_uncalibrated_roi_is_reported_without_fallback(witch_trial_adapter: Adapter) -> None:
+def test_an_uncalibrated_roi_is_reported_without_fallback(partial_adapter: Adapter) -> None:
     recognizer = ScriptedRecognizer()
-    service = OcrService(witch_trial_adapter, recognizer, model="fake")
+    service = OcrService(partial_adapter, recognizer, model="fake")
 
     async def scenario() -> None:
         try:
@@ -335,12 +335,12 @@ def test_language_check_fails_when_any_item_differs(synthetic_adapter: Adapter) 
 
 
 def test_language_check_needs_items_on_the_screen(
-    synthetic_adapter: Adapter, witch_trial_adapter: Adapter
+    synthetic_adapter: Adapter, partial_adapter: Adapter
 ) -> None:
-    """固定文字为空（《魔女审判》）或这个画面没有声明任何一项都是 LookupError：只做文字系统一层。"""
+    """固定文字为空或这个画面没有声明任何一项都是 LookupError：只做文字系统一层。"""
 
     async def scenario() -> None:
-        uncalibrated = OcrService(witch_trial_adapter, ScriptedRecognizer(), model="fake")
+        uncalibrated = OcrService(partial_adapter, ScriptedRecognizer(), model="fake")
         synthetic = OcrService(synthetic_adapter, ScriptedRecognizer(), model="fake")
         try:
             with pytest.raises(LookupError, match="画面 dialogue 没有语言核对的固定文字"):

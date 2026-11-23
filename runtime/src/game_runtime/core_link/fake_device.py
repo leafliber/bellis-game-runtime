@@ -15,7 +15,9 @@
 
 import asyncio
 import contextlib
+import copy
 import logging
+import math
 import secrets
 import threading
 import time
@@ -26,7 +28,12 @@ from typing import Any
 from pydantic import ValidationError
 
 from core_protocol import models
-from core_protocol.methods import FAKE_INPUT_EVENT, TEST_LEASE_GRANT, TEST_LEASE_REVOKE
+from core_protocol.methods import (
+    FAKE_INPUT_EVENT,
+    FAKE_INPUT_VERIFY_RELEASE,
+    TEST_LEASE_GRANT,
+    TEST_LEASE_REVOKE,
+)
 from game_runtime.channel import (
     ChannelCredentials,
     ChannelError,
@@ -94,7 +101,14 @@ class FakeDevice:
         *,
         on_event: Callable[[DeviceEvent], None] | None = None,
         rpc_timeout: float = 2.0,
+        verify_release: bool = False,
+        drop_lifts: frozenset[Held] = frozenset(),
+        verification_delay: float = 0.0,
     ) -> None:
+        if not math.isfinite(verification_delay) or verification_delay < 0:
+            raise ValueError("核验延迟须为非负有限数")
+        if not verify_release and (drop_lifts or verification_delay):
+            raise ValueError("释放故障只用于显式核验测试")
         self._on_event = on_event
         self._rpc_timeout = rpc_timeout
         self._lock = threading.Lock()
@@ -113,6 +127,15 @@ class FakeDevice:
         self._stop: asyncio.Event | None = None
         self._error: BaseException | None = None
         self._thread: threading.Thread | None = None
+        self._verify_enabled = verify_release
+        self._drop_lifts = set(drop_lifts)
+        self._verification_delay = verification_delay
+        self._verification_invalid = False
+        self._last_seq = 0
+        self._release_seq: int | None = None
+        self._verified_release_id = 0
+        self._verified_through_seq = 0
+        self._verification_records: list[dict[str, Any]] = []
 
     # 启动与关闭
 
@@ -155,6 +178,11 @@ class FakeDevice:
         """到现在为止收到的全部事件。"""
         with self._lock:
             return list(self._events)
+
+    def verifications(self) -> list[dict[str, Any]]:
+        """只读复制独立设备的核验记录；这些是模拟状态，不是物理输入状态。"""
+        with self._lock:
+            return copy.deepcopy(self._verification_records)
 
     @property
     def held(self) -> frozenset[Held]:
@@ -275,11 +303,23 @@ class FakeDevice:
             logger.warning("测试设备拒绝了角色为 %s 的连接", connection.role)
             connection.abort()
             return
+        if self._verify_enabled and self._peer is not None and self._peer.connection.is_open:
+            connection.abort()
+            return
         with self._lock:
             self._connections += 1
             number = self._connections
+            self._last_seq = 0
+            self._release_seq = None
+            self._verified_release_id = 0
+            self._verified_through_seq = 0
         peer = RpcPeer(connection, timeout=self._rpc_timeout)
         peer.on_notification(FAKE_INPUT_EVENT.name, lambda params: self._on_input(number, params))
+        if self._verify_enabled:
+            peer.handle(
+                FAKE_INPUT_VERIFY_RELEASE.name,
+                lambda params: self._verify_release(number, peer, params),
+            )
         self._peer = peer
         logger.info("实时核实例 %d 连上了测试设备", number)
 
@@ -288,10 +328,21 @@ class FakeDevice:
         try:
             message = models.FakeInputEventParams.model_validate(params)
         except ValidationError as error:
+            if self._verify_enabled:
+                with self._lock:
+                    self._verification_invalid = True
             logger.error("测试设备收到不合法的事件：%s", error)
             return
         event = message.event.root
         with self._lock:
+            if self._verify_enabled:
+                if connection != self._connections or message.seq != self._last_seq + 1:
+                    self._verification_invalid = True
+                    return
+                self._last_seq = message.seq
+                self._release_seq = (
+                    message.seq if isinstance(event, models.FakeReleaseAll) else None
+                )
             self._apply(event)
             record = DeviceEvent(
                 connection, message.seq, message.at_ns, received, event, frozenset(self._held)
@@ -324,8 +375,59 @@ class FakeDevice:
         self._held[item] = value
 
     def _lift(self, item: Held) -> None:
+        if item in self._drop_lifts:
+            self._drop_lifts.remove(item)
+            return
         if self._held.pop(item, _MISSING) is _MISSING:
             self._anomalies.append(f"抬起没有按住的 {item}")
+
+    async def _verify_release(
+        self, connection: int, peer: RpcPeer, raw: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            request = models.FakeVerifyReleaseParams.model_validate(raw)
+        except ValidationError as error:
+            raise RpcError(-32602, "无效的假设备核验请求") from error
+        if self._verification_delay:
+            await asyncio.sleep(self._verification_delay)
+        with self._lock:
+            if (
+                not self._verify_enabled
+                or peer is not self._peer
+                or not peer.connection.is_open
+                or connection != self._connections
+                or self._verification_invalid
+                or request.through_seq != self._last_seq
+                or request.through_seq != self._release_seq
+                or request.through_seq <= self._verified_through_seq
+                or request.release_id <= self._verified_release_id
+                or time.perf_counter_ns() >= request.deadline_ns
+            ):
+                raise RpcError(-32000, "假设备释放水位或连续性不可核验")
+            held = self._held_snapshot()
+            self._verified_release_id = request.release_id
+            self._verified_through_seq = request.through_seq
+            result = models.FakeVerifyReleaseResult(
+                release_id=request.release_id, through_seq=request.through_seq, held=held
+            ).model_dump(mode="json")
+            self._verification_records.append(
+                {"connection": connection, "checked_at_ns": time.perf_counter_ns(), **result}
+            )
+            return result
+
+    def _held_snapshot(self) -> list[models.HeldInput]:
+        """从实际接收事件维护的状态构造核验快照；调用方持有锁。"""
+        values: list[models.HeldInput] = []
+        raw: dict[str, Any]
+        for (kind, item), value in self._held.items():
+            if kind == "key":
+                raw = {"type": "key", "scan_code": item}
+            elif kind == "mouse":
+                raw = {"type": "mouse_button", "button": item}
+            else:
+                raw = {"type": "axis", "axis": item, "value": value}
+            values.append(models.HeldInput.model_validate(raw))
+        return values
 
     def _current(self) -> RpcPeer:
         peer = self._peer

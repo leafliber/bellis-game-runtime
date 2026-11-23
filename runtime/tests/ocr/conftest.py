@@ -14,11 +14,6 @@ def synthetic_adapter() -> Adapter:
 
 
 @pytest.fixture(scope="session")
-def witch_trial_adapter() -> Adapter:
-    return load_adapter(GAMES_DIR / "witch-trial")
-
-
-@pytest.fixture(scope="session")
 def real_engine() -> OcrEngine:
     """缺省模型组的真实引擎；本地数据目录里没有模型或摘要不符时跳过。"""
     try:

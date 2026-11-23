@@ -35,14 +35,12 @@ def test_supervise_cli_resolves_patches_in_order(
         '{"name":"disable","ops":[{"op":"disable","id":"voice"}]}', encoding="utf-8"
     )
     executable = tmp_path / "core"
-    store = MemorySecretStore()
 
     async def launched(
         game: str,
         entries: Sequence[ResolvedEntry],
         core: Path,
         data_dir: Path,
-        selected_store: SecretStore,
         *,
         real_input: bool,
         record: bool,
@@ -51,7 +49,6 @@ def test_supervise_cli_resolves_patches_in_order(
         assert game == "synthetic-game"
         assert core == executable
         assert data_dir == tmp_path
-        assert selected_store is store
         assert real_input is enable_input
         assert record is enable_record
         assert name == ("local-run" if enable_record else None)
@@ -61,7 +58,6 @@ def test_supervise_cli_resolves_patches_in_order(
         assert next(entry for entry in entries if entry.id == "narrative").disabled
         return 0
 
-    monkeypatch.setattr(cli, "CredentialManagerStore", lambda: store)
     monkeypatch.setattr(cli, "_run", launched)
     args = [
         "synthetic-game",
@@ -85,7 +81,7 @@ def test_supervise_cli_resolves_patches_in_order(
 
 def test_profile_cannot_change_the_selected_game(tmp_path: Path) -> None:
     entries = resolve_profile(read_profile(EXAMPLE))
-    entries[0] = replace(entries[0], config={"game": "witch-trial"})
+    entries[0] = replace(entries[0], config={"game": "other-game"})
 
     async def scenario() -> None:
         with pytest.raises(ValueError, match="不同的游戏适配包"):
@@ -128,7 +124,6 @@ def test_supervise_cli_explicit_telemetry_directory(
         entries: Sequence[ResolvedEntry],
         core: Path,
         data_dir: Path,
-        store: SecretStore,
         *,
         real_input: bool,
         record: bool,
@@ -145,7 +140,6 @@ def test_supervise_cli_explicit_telemetry_directory(
         assert name is None
         return 0
 
-    monkeypatch.setattr(cli, "CredentialManagerStore", MemorySecretStore)
     monkeypatch.setattr(cli, "_run", launched)
     assert (
         cli.main(
@@ -214,7 +208,6 @@ def test_bellis_cli_passes_selected_configuration_without_touching_ledger(
         entries: Sequence[ResolvedEntry],
         core: Path | None,
         data_dir: Path,
-        selected_store: SecretStore,
         *,
         real_input: bool,
         bellis: BellisConfig,
@@ -223,7 +216,6 @@ def test_bellis_cli_passes_selected_configuration_without_touching_ledger(
     ) -> int:
         assert game == expected.adapter_id
         assert real_input
-        assert selected_store is store
         assert bellis.session_store is store
         assert bellis.confirmed == frozenset({"safe"})
         assert bellis.task_authority == expected
@@ -261,7 +253,7 @@ def test_bellis_cli_passes_selected_configuration_without_touching_ledger(
     ("adapter_id", "message"),
     [
         ("synthetic-game", "GR-38 v2 真实输入 unsupported"),
-        ("witch-trial", "适配包与启动所选游戏不匹配"),
+        ("other-game", "适配包与启动所选游戏不匹配"),
     ],
 )
 def test_task_config_cli_fails_closed_before_launch(
@@ -281,7 +273,6 @@ def test_task_config_cli_fails_closed_before_launch(
         return store
 
     monkeypatch.setattr(cli, "CredentialManagerStore", credential_store)
-    monkeypatch.setattr(cli, "build_realtime_core", forbidden)
     monkeypatch.setattr(cli, "supervise", forbidden)
     assert (
         cli.main(
@@ -301,6 +292,22 @@ def test_task_config_cli_fails_closed_before_launch(
     )
     assert message in capsys.readouterr().err
     assert not (tmp_path / "ledger.sqlite3").exists()
+
+
+def test_missing_adapter_stops_standalone_before_core_build_or_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from game_runtime.recording import cli as recording_cli
+
+    def unexpected_build() -> None:
+        pytest.fail("适配包缺失时不应编译实时核")
+
+    monkeypatch.setattr(recording_cli, "build_realtime_core", unexpected_build)
+    assert cli.main(["missing-game", "--profile", str(EXAMPLE), "--data-dir", str(tmp_path)]) == 2
+    message = capsys.readouterr().err
+    assert "NOT_READY" in message
+    assert "missing-game" in message
+    assert not list(tmp_path.iterdir())
 
 
 def test_direct_supervise_retains_task_real_input_gate(tmp_path: Path) -> None:

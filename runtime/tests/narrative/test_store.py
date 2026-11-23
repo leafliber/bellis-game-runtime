@@ -96,7 +96,7 @@ def test_the_store_lives_in_the_local_data_dir_per_game(data_dir: Path) -> None:
     store.close()
 
     assert store.path == data_dir / "narrative" / "synthetic-game.sqlite3"
-    assert store_path(data_dir, "witch-trial") == data_dir / "narrative" / "witch-trial.sqlite3"
+    assert store_path(data_dir, "sample-game") == data_dir / "narrative" / "sample-game.sqlite3"
     assert store.path.is_file()
     assert user_version(store.path) == SCHEMA_VERSION == 4
 

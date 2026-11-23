@@ -1,29 +1,32 @@
 """从操作员选定的 profile 启动受监督的模型游玩。"""
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import sys
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
-from game_runtime._threads import in_thread
 from game_runtime.adapter import AdapterError
 from game_runtime.adapter.load import describe
 from game_runtime.core_link import CoreLinkOptions
-from game_runtime.game_bridge.session import BellisConfig
-from game_runtime.game_bridge.task_config import read_task_config
 from game_runtime.kernel import ResolvedEntry, State, read_patch, read_profile, resolve_profile
 from game_runtime.local_data import LocalDataError
 from game_runtime.operator import OperatorError
-from game_runtime.recording.cli import build_realtime_core, data_dir_option, setup_output
+from game_runtime.recording.cli import data_dir_option, setup_output
 from game_runtime.recording.layout import check_name
 from game_runtime.recording.retention import QuotaRefusedError
-from game_runtime.secret_store import CredentialManagerStore, SecretStore, SecretStoreError
+from game_runtime.secret_store import CredentialManagerStore, SecretStoreError
 from game_runtime.step_control.host import supervise
 from game_runtime.telemetry import TelemetryConfig, TelemetryPlugin
+
+if TYPE_CHECKING:
+    from game_runtime.game_bridge.session import BellisConfig
 
 
 def _set_telemetry_directory(entries: list[ResolvedEntry], directory: Path) -> None:
@@ -46,7 +49,6 @@ async def _run(
     entries: Sequence[ResolvedEntry],
     core: Path | None,
     data_dir: Path,
-    store: SecretStore,
     *,
     real_input: bool,
     bellis: BellisConfig | None = None,
@@ -55,13 +57,11 @@ async def _run(
 ) -> int:
     if bellis is not None:
         bellis.require_task_backend(real_input=real_input, has_test_device=False)
-    executable = core if core is not None else await in_thread(build_realtime_core)
     async with supervise(
         game,
         None,
-        CoreLinkOptions(executable),
+        CoreLinkOptions(core) if core is not None else None,
         data_dir=data_dir,
-        store=store,
         real_input=real_input,
         profile=entries,
         bellis=bellis,
@@ -133,25 +133,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--name requires --record")
     setup_output(args.verbose)
     try:
-        authority = read_task_config(args.task_config) if args.task_config is not None else None
-        if authority is not None and authority.adapter_id != args.game:
-            raise ValueError("任务配置的适配包与启动所选游戏不匹配")
         profile = resolve_profile(
             read_profile(args.profile), [read_patch(path) for path in args.patch]
         )
         if args.telemetry_dir is not None:
             _set_telemetry_directory(profile, args.telemetry_dir)
         data_dir = data_dir_option(args.data_dir)
-        store = CredentialManagerStore()
         core = args.core
         if args.bellis:
+            from game_runtime.game_bridge.session import BellisConfig
+            from game_runtime.game_bridge.task_config import read_task_config
+
+            authority = read_task_config(args.task_config) if args.task_config is not None else None
+            if authority is not None and authority.adapter_id != args.game:
+                raise ValueError("任务配置的适配包与启动所选游戏不匹配")
             return asyncio.run(
                 _run(
                     args.game,
                     profile,
                     core,
                     data_dir,
-                    store,
                     real_input=args.real_input,
                     bellis=BellisConfig(
                         CredentialManagerStore("bellis"),
@@ -168,7 +169,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 profile,
                 core,
                 data_dir,
-                store,
                 real_input=args.real_input,
                 record=args.record,
                 name=args.name,
@@ -179,8 +179,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValidationError as error:
         for problem in describe(error):
             print(problem, file=sys.stderr)
+    except AdapterError as error:
+        print(f"适配包 NOT_READY。{error}", file=sys.stderr)
     except (
-        AdapterError,
         LocalDataError,
         LookupError,
         OperatorError,

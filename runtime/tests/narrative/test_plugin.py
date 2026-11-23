@@ -159,44 +159,21 @@ def test_without_the_permission_it_does_not_activate(data_dir: Path) -> None:
     asyncio.run(scenario())
 
 
-def uncalibrated_witch_trial(games_dir: Path) -> None:
-    """把《魔女审判》的适配包去掉对白框的标定（ROI 的 rect 与继续标记的锚点）写进 `games_dir`。"""
-    source = (GAMES_DIR / "witch-trial" / ADAPTER_FILE).read_text(encoding="utf-8")
-    lines: list[str] = []
-    skipping = False
-    for line in source.splitlines(keepends=True):
-        if skipping:
-            skipping = not line.startswith("]")
-            continue
-        if line.startswith("anchors = ["):
-            skipping = True
-            continue
-        name = line.split(" = ", 1)[0]
-        if name in {"speaker", "dialogue", "continue-marker", "hud-border"} and ", rect = " in line:
-            line = line.split(", rect = ", 1)[0] + " }\n"
-        lines.append(line)
-    package = games_dir / "witch-trial"
-    package.mkdir(parents=True)
-    (package / ADAPTER_FILE).write_text("".join(lines), encoding="utf-8")
-
-
 def test_uncalibrated_dialogue_boxes_fail_activation_and_name_every_item(
-    root: Path, data_dir: Path
+    fixture_games: Path, data_dir: Path
 ) -> None:
-    """对白框引用的 ROI 与签名尚未标定（《魔女审判》在第 9 步标定前就是这样）：激活失败，原因
-    列出全部尚未标定的项，不猜坐标。"""
-    uncalibrated_witch_trial(root / "games")
+    """所有缺失的标定项都应出现在激活失败原因中。"""
 
     async def scenario() -> None:
-        kernel = await settle(profile(data_dir, game="witch-trial", games_dir=root / "games"))
+        kernel = await settle(profile(data_dir, game="partial-sample", games_dir=fixture_games))
         assert kernel.status("scene").state is State.ACTIVE
         status = kernel.status("narrative")
         assert status.state is State.FAILED
         [reason] = status.reasons
         assert reason.code is ReasonCode.RETRIES_EXHAUSTED
         assert (
-            "适配包 witch-trial 的对白框的ROI speaker（名字栏）、ROI dialogue（对白框）、"
-            "继续标记的签名 dialogue-continue尚未标定"
+            "适配包 partial-sample 的对白框的ROI speaker（名字栏）、ROI dialogue（对白框）、"
+            "继续标记的签名 marker尚未标定"
         ) in reason.message
         await kernel.shutdown()
 

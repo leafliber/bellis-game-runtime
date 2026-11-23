@@ -66,6 +66,8 @@ pub struct Options {
     pub emergency_hotkey: Option<Combo>,
     /// 选择 Bellis 控制连接，同时指定同一次 Runtime 在两条游戏桥连接中使用的编号。
     pub bellis_runtime_id: Option<RuntimeId>,
+    /// 只在隔离 Bellis 假设备联调中读取独立设备的释放证明。
+    pub fake_verify_release: bool,
 }
 
 impl Default for Options {
@@ -77,6 +79,7 @@ impl Default for Options {
             input_backend: None,
             emergency_hotkey: None,
             bellis_runtime_id: None,
+            fake_verify_release: false,
         }
     }
 }
@@ -85,7 +88,7 @@ impl Default for Options {
 pub const USAGE: &str = "usage: realtime-core [--heartbeat-timeout-ms <ms>] \
                          [--health-interval-ms <ms>] [--max-frame-age-ms <ms>] \
                          [--input-backend fake|sendinput] [--emergency-hotkey <combo>] \
-                         [--bellis-control <runtimeId>]";
+                         [--bellis-control <runtimeId>] [--fake-verify-release]";
 
 impl Options {
     /// 解析命令行参数（不含程序名）。
@@ -97,6 +100,13 @@ impl Options {
         let mut options = Self::default();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
+            if arg == "--fake-verify-release" {
+                if options.fake_verify_release {
+                    return Err("--fake-verify-release can only be specified once".into());
+                }
+                options.fake_verify_release = true;
+                continue;
+            }
             let value = || format!("{arg} needs a value");
             if arg == "--input-backend" {
                 let name = args.next().ok_or_else(value)?;
@@ -196,6 +206,16 @@ impl Launch {
     /// # Errors
     /// 双源、缺少 Bellis 会话号、测试凭据与真实输入混用或其它后端门禁不成立。
     pub fn select_input(&mut self, options: &Options) -> Result<InputSetup, String> {
+        if options.fake_verify_release
+            && (options.input_backend != Some(InputBackendKind::Fake)
+                || options.bellis_runtime_id.is_none()
+                || self.test_device.is_none()
+                || self.test_bellis_session.is_none())
+        {
+            return Err(
+                "--fake-verify-release requires an isolated Bellis fake-device session".into(),
+            );
+        }
         if self.test_bellis_session.is_some()
             && (options.input_backend != Some(InputBackendKind::Fake)
                 || options.bellis_runtime_id.is_none()
@@ -227,12 +247,16 @@ impl Launch {
             }
             (None, None) => None,
         };
-        InputSetup::select(
+        let mut input = InputSetup::select(
             options.input_backend,
             self.test_device.take(),
             source,
             options.emergency_hotkey.clone(),
-        )
+        )?;
+        if let InputSetup::Fake { verify_release, .. } = &mut input {
+            *verify_release = options.fake_verify_release;
+        }
+        Ok(input)
     }
 }
 
@@ -275,6 +299,8 @@ pub enum InputSetup {
         test_device: ChannelCredentials,
         /// 许可从哪里来。
         permit: FakePermit,
+        /// 默认 false，只允许隔离 Bellis 测试会话启用。
+        verify_release: bool,
     },
     /// 真实后端（SendInput），只在 Windows 上，只与生产许可源一起。
     Real {
@@ -326,6 +352,7 @@ impl InputSetup {
             (Some(InputBackendKind::Fake), Some(test_device), source) => Ok(Self::Fake {
                 test_device,
                 permit: source.map_or(FakePermit::TestLease, FakePermit::Source),
+                verify_release: false,
             }),
             (Some(InputBackendKind::SendInput), _, _) if !cfg!(windows) => Err(
                 "the real input backend (--input-backend sendinput) is only available on Windows"
@@ -514,6 +541,7 @@ mod tests {
             Ok(InputSetup::Fake {
                 test_device,
                 permit: FakePermit::TestLease,
+                verify_release: false,
             }) => assert_eq!(test_device.path, "device-path"),
             other => panic!("{other:?}"),
         }
@@ -540,6 +568,7 @@ mod tests {
             InputSetup::Fake {
                 test_device,
                 permit: FakePermit::Source(PermitSource::Operator(operator)),
+                verify_release: false,
             } => {
                 assert_eq!(test_device.path, "device-path");
                 assert_eq!(operator.path, "operator-path");
@@ -636,6 +665,65 @@ mod tests {
         env.insert(ENV_TEST_DEVICE_KEY, "bad".to_owned());
         let error = Launch::from_env(|name| env.get(name).cloned()).unwrap_err();
         assert!(error.contains(ENV_TEST_DEVICE_KEY), "{error}");
+    }
+
+    #[test]
+    fn fake_verification_is_opt_in_and_requires_all_isolation_conditions() {
+        assert!(!Options::default().fake_verify_release);
+        assert!(Options::parse(args(&["--fake-verify-release", "--fake-verify-release"])).is_err());
+        let key = encode_session_key(&create_session_key());
+        let baseline = HashMap::from([
+            (ENV_CHANNEL_PATH, "core-path".to_owned()),
+            (ENV_CHANNEL_KEY, key.clone()),
+            (ENV_ROLE, "game-runtime.core".to_owned()),
+            (ENV_TEST_DEVICE_PATH, "device-path".to_owned()),
+            (ENV_TEST_DEVICE_KEY, key),
+            (ENV_BELLIS_SESSION_ID, "sess01".to_owned()),
+            (
+                ENV_TEST_BELLIS_SESSION_FILE,
+                "isolated-session.json".to_owned(),
+            ),
+        ]);
+        let options = Options::parse(args(&[
+            "--input-backend",
+            "fake",
+            "--bellis-control",
+            "run-1",
+            "--fake-verify-release",
+        ]))
+        .unwrap();
+        let select = |env: &HashMap<&str, String>, opt: &Options| {
+            Launch::from_env(|name| env.get(name).cloned())
+                .unwrap()
+                .select_input(opt)
+        };
+        assert!(matches!(
+            select(&baseline, &options).unwrap(),
+            InputSetup::Fake {
+                verify_release: true,
+                ..
+            }
+        ));
+        for missing in [
+            ENV_TEST_BELLIS_SESSION_FILE,
+            ENV_BELLIS_SESSION_ID,
+            ENV_TEST_DEVICE_PATH,
+        ] {
+            let mut env = baseline.clone();
+            env.remove(missing);
+            if missing == ENV_TEST_DEVICE_PATH {
+                env.remove(ENV_TEST_DEVICE_KEY);
+            }
+            assert!(select(&env, &options).is_err());
+        }
+        let mut no_bellis = options.clone();
+        no_bellis.bellis_runtime_id = None;
+        assert!(select(&baseline, &no_bellis).is_err());
+        for backend in [None, Some(InputBackendKind::SendInput)] {
+            let mut wrong = options.clone();
+            wrong.input_backend = backend;
+            assert!(select(&baseline, &wrong).is_err());
+        }
     }
 
     #[test]

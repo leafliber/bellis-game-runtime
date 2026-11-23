@@ -1,0 +1,63 @@
+# 测试专用。画面标定不完整，模板文件缺失。
+id = "partial-sample"
+name = "标定样例"
+version = "1"
+
+[window]
+process_name = "sample.exe"
+title = "Test Window"
+
+[resolution]
+width = 320
+height = 180
+
+[language]
+tag = "zh-Hans"
+fixed_texts = []
+
+[compliance]
+basis = "合成测试数据"
+text_source = "screen"
+training = false
+demonstrations = false
+recording_quota_gb = 0
+models = []
+
+[whitelist]
+click_buttons = []
+press_keys = []
+scroll = false
+click_regions = []
+press_duration = 0.05
+max_rate = 1
+hold_keys = []
+hold_buttons = []
+
+[risk]
+
+[[screens]]
+id = "dialogue"
+title = "对话"
+type = "对话"
+
+[rois]
+speaker = { title = "名字栏" }
+dialogue = { title = "对白框" }
+choices = { title = "选项" }
+icon = { title = "图标", rect = [0.0, 0.0, 0.25, 0.25] }
+
+[[signatures]]
+id = "marker"
+screen = "dialogue"
+
+[[signatures]]
+id = "icon"
+screen = "dialogue"
+anchors = [
+    { roi = "icon", template_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", min_score = 0.9 },
+]
+
+[[dialogue_boxes]]
+speaker = "speaker"
+text = "dialogue"
+continue_signature = "marker"

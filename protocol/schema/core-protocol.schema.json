@@ -194,6 +194,15 @@
         "$ref": "#/$defs/FakeInputEventParams"
       },
       "result": null
+    },
+    "fake_input.verify_release": {
+      "direction": "core_to_test",
+      "params": {
+        "$ref": "#/$defs/FakeVerifyReleaseParams"
+      },
+      "result": {
+        "$ref": "#/$defs/FakeVerifyReleaseResult"
+      }
     }
   },
   "x-error-codes": {
@@ -2196,6 +2205,74 @@
       "discriminator": {
         "propertyName": "type"
       }
+    },
+    "FakeVerifyReleaseParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "release_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "description": "本核实例的释放编号。",
+          "maximum": 18446744073709551615
+        },
+        "through_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "description": "本次 `release_all` 事件的序号。",
+          "maximum": 18446744073709551615
+        },
+        "deadline_ns": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "description": "入队时固定的绝对截止。",
+          "maximum": 18446744073709551615
+        }
+      },
+      "required": [
+        "release_id",
+        "through_seq",
+        "deadline_ns"
+      ],
+      "title": "FakeVerifyReleaseParams",
+      "description": "显式假设备模式的释放核验请求；与输入事件共用有序连接。"
+    },
+    "FakeVerifyReleaseResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "release_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "description": "精确回显原释放编号。",
+          "maximum": 18446744073709551615
+        },
+        "through_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "description": "精确回显原事件水位。",
+          "maximum": 18446744073709551615
+        },
+        "held": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HeldInput"
+          },
+          "description": "实际收到并应用的事件之后仍按住的项。"
+        }
+      },
+      "required": [
+        "release_id",
+        "through_seq",
+        "held"
+      ],
+      "title": "FakeVerifyReleaseResult",
+      "description": "假设备独立维护的按住状态；空列表须有完整连续事件账目支持。"
     }
   }
 }

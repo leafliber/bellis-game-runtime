@@ -1087,6 +1087,50 @@ class FakeInputEvent(
     """
 
 
+class FakeVerifyReleaseParams(BaseModel):
+    """
+    显式假设备模式的释放核验请求；与输入事件共用有序连接。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    release_id: Annotated[int, Field(ge=1, le=18446744073709551615)]
+    """
+    本核实例的释放编号。
+    """
+    through_seq: Annotated[int, Field(ge=1, le=18446744073709551615)]
+    """
+    本次 `release_all` 事件的序号。
+    """
+    deadline_ns: Annotated[int, Field(ge=1, le=18446744073709551615)]
+    """
+    入队时固定的绝对截止。
+    """
+
+
+class FakeVerifyReleaseResult(BaseModel):
+    """
+    假设备独立维护的按住状态；空列表须有完整连续事件账目支持。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    release_id: Annotated[int, Field(ge=1, le=18446744073709551615)]
+    """
+    精确回显原释放编号。
+    """
+    through_seq: Annotated[int, Field(ge=1, le=18446744073709551615)]
+    """
+    精确回显原事件水位。
+    """
+    held: list[HeldInput]
+    """
+    实际收到并应用的事件之后仍按住的项。
+    """
+
+
 class CaptureSetTargetParams(BaseModel):
     """
     `capture.set_target` 的 params。

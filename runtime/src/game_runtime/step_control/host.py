@@ -60,7 +60,7 @@ from game_runtime.recording.retention import QuotaKeeper, QuotaRefusedError, quo
 from game_runtime.recording.session import AUDIO_POLL_INTERVAL, audio_config, capture_config
 from game_runtime.recording.writer import RecordingWriter
 from game_runtime.scene import ScenePlugin
-from game_runtime.secret_store import SecretStore
+from game_runtime.secret_store import CredentialManagerStore, SecretStore
 from game_runtime.step_control.contracts import Policy
 from game_runtime.step_control.controller import StepConfig, StepController
 from game_runtime.step_control.plugin import SessionSignals, step_plugin_for
@@ -255,10 +255,10 @@ async def _wait_shutdown(task: asyncio.Task[None]) -> None:
 async def supervise(
     game: str,
     policy: Policy | None,
-    link_options: CoreLinkOptions,
+    link_options: CoreLinkOptions | None,
     *,
     data_dir: Path,
-    store: SecretStore,
+    store: SecretStore | None = None,
     games_dir: Path = GAMES_DIR,
     real_input: bool = False,
     step: StepConfig | None = None,
@@ -273,11 +273,6 @@ async def supervise(
     name: str | None = None,
 ) -> AsyncGenerator[SupervisedRun]:
     """用模型 profile 或调用方的单独策略启动监督会话。"""
-    if bellis is not None:
-        bellis.require_task_backend(
-            real_input=real_input or link_options.real_input,
-            has_test_device=link_options.test_device is not None,
-        )
     if name is not None:
         if not record:
             raise ValueError("录制名称只用于启用录制的会话")
@@ -285,6 +280,15 @@ async def supervise(
     games_dir, data_dir = games_dir.resolve(), data_dir.resolve()
     game_config = GameAdapterConfig(game=game, games_dir=games_dir)
     adapter = load_adapter(games_dir / game_config.game)
+    if bellis is not None:
+        bellis.require_task_backend(
+            real_input=real_input or (link_options is not None and link_options.real_input),
+            has_test_device=link_options is not None and link_options.test_device is not None,
+        )
+    if link_options is None:
+        from game_runtime.recording.cli import build_realtime_core
+
+        link_options = CoreLinkOptions(await in_thread(build_realtime_core))
     frame_age = link_options.max_frame_age
     configured_plugins: tuple[type[Plugin[Any]], ...] = ()
     audio = link_options.audio
@@ -353,7 +357,7 @@ async def supervise(
         if bellis is None:
             client = OperatorClient(
                 adapter,
-                store=store,
+                store=store if store is not None else CredentialManagerStore(),
                 on_session=signals.session,
                 on_ended=signals.on_end,
                 on_decision_resolved=signals.resolved,

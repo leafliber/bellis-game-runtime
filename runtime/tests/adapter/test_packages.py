@@ -1,8 +1,4 @@
-"""本仓库的适配包：都通过校验；合成游戏的声明与它的实现一致；《魔女审判》写了必需部分与对白框。
-
-合成游戏见 `docs/modules/offline-tools.md` 的“合成游戏”，《魔女审判》见
-`docs/games/witch-trial.md` 的“适配包”。
-"""
+"""逐个校验随仓适配包，并核对合成游戏声明与其渲染和输入。"""
 
 import pytest
 
@@ -11,9 +7,6 @@ from game_runtime.adapter import (
     GAMES_DIR,
     GENERIC_NAMES,
     Adapter,
-    NormalizedRect,
-    NotCalibratedError,
-    c2_allows,
     load_adapter,
 )
 from game_runtime.adapter.check import check_games_dir, check_package, package_dirs
@@ -33,15 +26,10 @@ def synthetic() -> Adapter:
     return load_adapter(GAMES_DIR / "synthetic-game")
 
 
-@pytest.fixture(scope="module")
-def witch_trial() -> Adapter:
-    return load_adapter(GAMES_DIR / "witch-trial")
-
-
 def test_every_package_in_the_repository_passes_the_check() -> None:
     directories = package_dirs(GAMES_DIR)
 
-    assert {directory.name for directory in directories} >= {"synthetic-game", "witch-trial"}
+    assert GAMES_DIR / "synthetic-game" in directories
     assert check_games_dir(GAMES_DIR) == []
     for directory in directories:
         assert check_package(directory).id == directory.name
@@ -172,91 +160,3 @@ def test_synthetic_whitelist_covers_the_inputs_the_game_handles(synthetic: Adapt
     assert whitelist.click_buttons == (MouseButton.LEFT,)
     assert whitelist.scroll
     assert not whitelist.allows_hold
-
-
-# 《魔女审判》
-
-
-def test_witch_trial_required_parts(witch_trial: Adapter) -> None:
-    assert witch_trial.window_rule() == WindowRule(
-        process_name="manosaba.exe", window_class="UnityWndClass", title="manosaba"
-    )
-    assert (witch_trial.resolution.width, witch_trial.resolution.height) == (2560, 1440)
-    assert witch_trial.language.tag == "zh-Hans"
-    assert {screen.id: screen.type for screen in witch_trial.screens} == {
-        "dialogue": "对话",
-        "choice": "选择",
-        "trial": "计时选择",
-        "settings": "设置",
-        "save-load": "存读档",
-        "bad-ending": "坏结局",
-    }
-    assert [note.title for note in witch_trial.notes] == [
-        "角色表",
-        "证据与证词本",
-        "尚未解决的疑点与矛盾",
-    ]
-
-
-def test_witch_trial_compliance(witch_trial: Adapter) -> None:
-    compliance = witch_trial.compliance
-
-    assert compliance.text_source == "screen"
-    assert not compliance.training
-    assert not compliance.demonstrations
-    assert compliance.recording_quota_gb == 50
-    assert compliance.models
-    assert all(c2_allows(entry.vendor, entry.model) for entry in compliance.models)
-
-
-def test_witch_trial_whitelist_has_no_long_press_scroll_or_keys(witch_trial: Adapter) -> None:
-    whitelist = witch_trial.whitelist
-
-    assert whitelist.click_buttons == (MouseButton.LEFT,)
-    assert whitelist.press_keys == ()
-    assert not whitelist.scroll
-    assert not whitelist.allows_hold
-    assert whitelist.max_hold is None
-
-
-def test_witch_trial_calibrates_only_what_read_only_perception_needs(
-    witch_trial: Adapter,
-) -> None:
-    """G1 只标定对白框（名字栏、对白文字、继续标记）；其余留到 G2，不写猜测的坐标。"""
-    assert witch_trial.roi("client") == NormalizedRect(0.0, 0.0, 1.0, 1.0)
-    calibrated = {name for name, roi in witch_trial.rois.items() if roi.rect is not None}
-    assert calibrated == {"client", "speaker", "dialogue", "continue-marker", "hud-border"}
-    assert witch_trial.uncalibrated() == (
-        "ROI choices（选项）",
-        "ROI trial-statement（审判发言区）",
-        "签名 dialogue",
-        "签名 choice",
-        "签名 trial",
-        "签名 bad-ending",
-    )
-    with pytest.raises(NotCalibratedError):
-        witch_trial.roi("choices")
-    # 固定文字与阅读节奏不是标定项：没有固定文字即只做文字系统一层，没有阅读节奏即用通用缺省。
-    assert witch_trial.language.fixed_texts == ()
-    assert witch_trial.pacing is None
-    assert script_of(witch_trial.language.tag) is Script.HAN
-
-
-def test_witch_trial_dialogue_box_reads_without_a_screen(witch_trial: Adapter) -> None:
-    """对白画面没有稳定的签名，对白框不写 screen，按通用缺省读；继续标记的签名两个锚点。"""
-    [box] = witch_trial.require_dialogue_boxes()
-    assert (box.screen, box.speaker, box.text, box.continue_signature) == (
-        None,
-        "speaker",
-        "dialogue",
-        "dialogue-continue",
-    )
-    [signature] = [s for s in witch_trial.signatures if s.id == "dialogue-continue"]
-    assert signature.screen == "dialogue"
-    assert [(anchor.roi, anchor.min_score) for anchor in signature.anchors] == [
-        ("continue-marker", 0.6),
-        ("hud-border", 0.8),
-    ]
-    # 对白文字的 ROI 止于继续标记之前。
-    dialogue, marker = witch_trial.roi("dialogue"), witch_trial.roi("continue-marker")
-    assert dialogue.right <= marker.left

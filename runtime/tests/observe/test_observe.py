@@ -103,26 +103,6 @@ def synthetic() -> Adapter:
     return load_adapter(GAMES_DIR / "synthetic-game")
 
 
-@pytest.fixture(scope="module")
-def witch_trial() -> Adapter:
-    return load_adapter(GAMES_DIR / "witch-trial")
-
-
-@pytest.fixture(scope="module")
-def uncalibrated(witch_trial: Adapter) -> Adapter:
-    """《魔女审判》去掉对白框的标定（第 9 步之前的样子）：剧情记录不运行。"""
-    names = {"speaker", "dialogue", "continue-marker", "hud-border"}
-    rois = {
-        name: roi.model_copy(update={"rect": None}) if name in names else roi
-        for name, roi in witch_trial.rois.items()
-    }
-    signatures = tuple(
-        s.model_copy(update={"anchors": ()}) if s.id == "dialogue-continue" else s
-        for s in witch_trial.signatures
-    )
-    return witch_trial.model_copy(update={"rois": rois, "signatures": signatures})
-
-
 def state(
     frame: int,
     verdict: Verdict,
@@ -338,13 +318,13 @@ def test_language_is_checked_on_the_first_stable_frame_of_each_appearance(
         assert watch.observe(scene) == expected, scene.frame_number
 
 
-def test_the_witch_trial_checks_only_the_script(witch_trial: Adapter) -> None:
-    """《魔女审判》没有声明固定文字：不做固定文字一层，文字系统一层照常（不用标定）。"""
-    watch = LanguageWatch(witch_trial)
+def test_without_fixed_texts_only_the_script_is_checked(partial_adapter: Adapter) -> None:
+    """没有声明固定文字时仍核对文字系统。"""
+    watch = LanguageWatch(partial_adapter)
     assert watch.items == ()
     assert watch.screens == ()
     assert watch.observe(state(1, Verdict.SCREEN, "dialogue")) is None
-    script = ScriptWatch(witch_trial)
+    script = ScriptWatch(partial_adapter)
     assert (script.script, script.problem) == (Script.HAN, None)
     assert script.wants(closed(1, CHINESE[0]))
 
@@ -637,19 +617,19 @@ def test_the_summary_gives_the_script_result(
     assert f"  语言核对（文字系统）：{expected}" in lines
 
 
-def test_summary_without_narrative_voice_or_checks(uncalibrated: Adapter) -> None:
-    hub, _, formatter = make_hub(uncalibrated)
+def test_summary_without_narrative_voice_or_checks(partial_adapter: Adapter) -> None:
+    hub, _, formatter = make_hub(partial_adapter)
     hub.end_ns = SECOND
-    lines = summary(formatter, narrative_problem=narrative_problem(uncalibrated))
-    assert lines[1].startswith("  剧情记录：不运行，适配包 witch-trial 的")
+    lines = summary(formatter, narrative_problem=narrative_problem(partial_adapter))
+    assert lines[1].startswith("  剧情记录：不运行，适配包 partial-sample 的")
     assert lines[2] == "  画面判别：没有处理过任何帧"
     assert lines[3] == "  配音：voice-activity@1 没有激活"
     assert lines[4] == "  语言核对（文字系统）：不核对，不运行剧情记录"
     assert lines[5] == "  语言核对（固定文字）：适配包没有声明，没有核对"
 
 
-def test_banner_lists_plugins_and_what_is_not_calibrated(uncalibrated: Adapter) -> None:
-    _hub, _, formatter = make_hub(uncalibrated)
+def test_banner_lists_plugins_and_what_is_not_calibrated(partial_adapter: Adapter) -> None:
+    _hub, _, formatter = make_hub(partial_adapter)
     plugins = [
         EntryStatus("game", "game-adapter", "1", Tier.CRITICAL, State.ACTIVE, (), "i1", True, 0),
         EntryStatus(
@@ -666,17 +646,17 @@ def test_banner_lists_plugins_and_what_is_not_calibrated(uncalibrated: Adapter) 
     ]
     lines = banner(
         formatter,
-        uncalibrated,
+        partial_adapter,
         frame_size=(2560, 1440),
         recording=None,
         plugins=plugins,
-        narrative_problem=narrative_problem(uncalibrated),
+        narrative_problem=narrative_problem(partial_adapter),
     )
-    assert lines[0] == "只读运行 witch-trial（魔法少女的魔女审判 0.1.0）：不发任何输入，不连 Bellis"
+    assert lines[0] == "只读运行 partial-sample（标定样例 1）：不发任何输入，不连 Bellis"
     assert lines[1] == "帧环 2560×1440；不录制"
     assert lines[2] == "插件：game active、ocr failed"
     assert lines[3] == "  ocr failed（activation-failed：模型制品不在）"
-    assert lines[4].startswith("剧情记录：不运行，适配包 witch-trial 的")
+    assert lines[4].startswith("剧情记录：不运行，适配包 partial-sample 的")
     assert lines[5].startswith("尚未标定：ROI speaker（名字栏）")
     assert "固定文字" not in lines[5]
     assert "阅读节奏" not in lines[5]
@@ -686,7 +666,7 @@ def test_banner_lists_plugins_and_what_is_not_calibrated(uncalibrated: Adapter) 
     recording = Recording(GAMES_DIR / "x", 50 * 10**9, 1_200_000)
     with_recording = banner(
         formatter,
-        uncalibrated,
+        partial_adapter,
         frame_size=(2560, 1440),
         recording=recording,
         plugins=plugins,

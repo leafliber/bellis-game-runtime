@@ -140,4 +140,3 @@ def test_without_arguments_every_package_in_the_repository_is_checked(
 
     out = capsys.readouterr().out
     assert "ok   synthetic-game" in out
-    assert "ok   witch-trial" in out

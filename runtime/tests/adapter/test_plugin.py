@@ -168,7 +168,7 @@ def test_an_unknown_game_fails_activation(tmp_path: Path) -> None:
     "config",
     [
         pytest.param({}, id="no game"),
-        pytest.param({"game": "Witch Trial"}, id="bad id"),
+        pytest.param({"game": "Invalid ID"}, id="bad id"),
         pytest.param({"game": "synthetic-game", "games_dir": "games"}, id="relative games_dir"),
         pytest.param({"game": "synthetic-game", "path": "/x"}, id="unknown field"),
     ],
@@ -187,10 +187,20 @@ def test_invalid_config_fails_without_retrying(config: dict[str, Any]) -> None:
     asyncio.run(scenario())
 
 
-def test_uncalibrated_items_are_logged_on_activation(caplog: pytest.LogCaptureFixture) -> None:
+def test_uncalibrated_items_are_logged_on_activation(
+    caplog: pytest.LogCaptureFixture, fixture_games: Path
+) -> None:
     async def scenario() -> None:
         k = kernel()
-        k.add([entry("game", "game-adapter", {"game": "witch-trial"})])
+        k.add(
+            [
+                entry(
+                    "game",
+                    "game-adapter",
+                    {"game": "partial-sample", "games_dir": str(fixture_games)},
+                )
+            ]
+        )
         await k.settled()
         assert k.status("game").state is State.ACTIVE
         await k.shutdown()
@@ -199,7 +209,7 @@ def test_uncalibrated_items_are_logged_on_activation(caplog: pytest.LogCaptureFi
         asyncio.run(scenario())
 
     messages = [record.getMessage() for record in caplog.records]
-    assert "适配包 witch-trial 的ROI choices（选项）尚未标定" in messages
+    assert "适配包 partial-sample 的ROI choices（选项）尚未标定" in messages
     assert not any("阅读节奏" in message or "固定文字" in message for message in messages)
 
 
