@@ -10,7 +10,7 @@ Bellis 的游戏运行时：负责游戏画面采集、感知（OCR、VLM 等）
 
 ## 当前状态
 
-独立运行与 HSR 的验收顺序见 [G2 任务卡](docs/plan/G2.md)。总体架构、管理模型、阶段划分与各模块的技术路线都已批准，见[技术基线](docs/plan/tech-baseline.md)；部分细节待[真机探针](docs/plan/spikes.md)实测后确定，需要 Bellis 配合的改动见 [Bellis P3 契约提案](docs/plan/bellis-p3-proposals.md)。
+独立运行与 HSR 的验收顺序见 [G2 任务卡](docs/plan/G2.md)，与 Bellis 的桥接联调见 [G3 任务卡](docs/plan/G3.md)。总体架构、管理模型、阶段划分与各模块的技术路线都已批准，见[技术基线](docs/plan/tech-baseline.md)；部分细节待[真机探针](docs/plan/spikes.md)实测后确定，需要 Bellis 配合的改动见 [Bellis P3 契约提案](docs/plan/bellis-p3-proposals.md)。
 
 ## 文档
 
