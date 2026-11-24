@@ -14,7 +14,7 @@
 | [合规](compliance.md) | 条款要点、维护者的合规确认（C-x）及其条件 | 实现方式 |
 | [技术基线](plan/tech-baseline.md) | 登记处：每个决策与路线选了什么、为什么、何时批准，指向写细节的文档；待审核的候选 | 设计细节 |
 | [路线图](plan/roadmap.md) | 阶段、每个阶段用到的路线与探针、出口 | 模块设计 |
-| 任务卡（如 [G1](plan/G1.md)） | 当前阶段的目标、步骤与出口 | 进度、测试计数、本机路径 |
+| 任务卡（如 [G2](plan/G2.md)、[G3](plan/G3.md)） | 当前阶段的目标、步骤与出口 | 进度、测试计数、本机路径 |
 | [真机探针](plan/spikes.md) | 需要在 Windows 真机上验证的假设、方法与影响 | 结果（写入不入库的报告） |
 | [Bellis P3 契约提案](plan/bellis-p3-proposals.md) | 要 Bellis 改什么、为什么 | Game Runtime 侧的行为 |
 | [inherited/](inherited/README.md) | 从 Bellis v0.8 移交的旧设计，只读参考 | 不作为规范，不直接引用 |

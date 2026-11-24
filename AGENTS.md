@@ -2,7 +2,7 @@
 
 本文件是 agent 的唯一规则入口；其它 README 只做介绍和索引。
 
-当前阶段是 [G2 受监督的自动游玩](docs/plan/G2.md)。
+当前阶段是 [G2 独立运行与 HSR 验证](docs/plan/G2.md)（配套游戏桥联调见 [G3](docs/plan/G3.md)）。
 
 ## 常用命令
 
